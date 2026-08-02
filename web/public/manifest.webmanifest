@@ -1,0 +1,19 @@
+{
+  "name": "Verification Hub",
+  "short_name": "Verify",
+  "description": "ID document forensics, MRZ + PDF417 data checks, liveness + pulse, and face-to-document matching.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0f14",
+  "theme_color": "#0a0f14",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

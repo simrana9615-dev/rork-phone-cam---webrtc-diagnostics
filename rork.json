@@ -1,0 +1,13 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "Phone Camera Diagnostic Hub",
+      "path": "web",
+      "framework": "web",
+      "settings": {
+        "webSlug": "kyctest"
+      }
+    }
+  ]
+}
