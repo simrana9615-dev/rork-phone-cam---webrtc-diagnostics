@@ -128,13 +128,14 @@ import {
  *    `height: { ideal: 640 }` plus a 16:9 landscape aspect ratio; CSS
  *    object-fit: cover shows the user just the portrait centre slice. Two
  *    declines fall back to the native front camera (full-EXIF selfie).
- * 4. PASSIVE IDENTITY CHAIN — every silent capture's face is matched against
- *    BOTH the document portrait and the liveness (or fallback selfie) face.
- *    A quality-gated, high-confidence mismatch means a different person was
- *    holding the phone — that is a FAIL. A silent clip with no face (phone
- *    flat on a table while photographing the doc) is ignored silently.
- *    Everything fuses into one PASS/REVIEW/FAIL summary with every image,
- *    clip, and report downloadable.
+ * 4. PASSIVE IDENTITY CHAIN — silent front-camera clips are always voluntary.
+ *    They run before each native page (licence front + back, or passport page).
+ *    Missing face, partial face, denied camera, or failed clip never blocks the
+ *    flow. Across every sampled frame from every silent clip, the session keeps
+ *    ONE best still: largest + clearest usable face; if none, any one random snap
+ *    for the evidence trail only. That single best face (when usable) is matched
+ *    against BOTH the document portrait and the liveness face. A quality-gated,
+ *    high-confidence mismatch fails the session; no-face / partial is ignored.
  */
 
 export type EyeDeeKitVariant = "licence" | "passport";
@@ -372,14 +373,21 @@ function motionFinding(motion: SilentMotion): Finding {
   };
 }
 
-// ── Silent passive capture (one per document page) ───────────────────────────
+// ── Silent passive capture (one per document page; session keeps best face) ──
 
 /** Silent passive capture bundle — one recorded before each document page. */
 type SilentCapture = {
   pageId: string;
   pageLabel: string;
   face: FaceDescription | null;
-  /** Best face frame (or mid frame when faceless), encoded to JPEG. */
+  /**
+   * True when the face is large/clear enough for identity matching.
+   * Partial / tiny / weak detections stay on the evidence trail but never chain-match.
+   */
+  faceUsable: boolean;
+  /** Higher = larger + clearer face in this clip's chosen still (0 when faceless). */
+  faceProminence: number;
+  /** Best face frame in this clip (or a random mid frame when faceless), encoded to JPEG. */
   url: string;
   blob: Blob;
   /** The recorded clip when MediaRecorder is available (mp4 on iOS, webm elsewhere). */
@@ -395,11 +403,49 @@ type SilentCapture = {
   pulse: PulseFingerprint | null;
 };
 
-/** Passive identity chain per silent capture: vs document portrait and vs the live face. */
+/**
+ * Scores how much clear face is in a still — used to pick the single best
+ * silent front photo across every clip. Partial / low-quality faces score 0
+ * for identity use (still may rank as evidence snaps via a tiny residual).
+ */
+function silentFaceProminence(face: FaceDescription | null): { usable: boolean; score: number } {
+  if (!face) return { usable: false, score: 0 };
+  const q = face.quality;
+  const box = Math.max(0, q.boxWidth);
+  const det = Math.max(0, Math.min(1, q.detectionScore));
+  const sharp = Math.max(0, Math.min(1, q.sharpness / 80));
+  // Partial: too small, weak detect, or quality gates failed → ignore for identity.
+  const usable = q.ok && box >= 72 && det >= 0.5;
+  if (!usable) {
+    // Tiny residual so a partial can still beat a pure blank if we ever need a tie-break
+    // for evidence display — identity chain still skips non-usable faces.
+    return { usable: false, score: box * det * 0.05 };
+  }
+  // Prefer biggest face first, then detection confidence, then sharpness.
+  const score = box * (0.55 + 0.45 * det) * (0.65 + 0.35 * sharp);
+  return { usable: true, score };
+}
+
+/**
+ * Session-level pick: one silent still from all clips — best usable face, else any snap.
+ */
+function pickBestSilentCapture(caps: SilentCapture[]): SilentCapture | null {
+  if (caps.length === 0) return null;
+  const usable = caps.filter((c) => c.faceUsable && c.face);
+  if (usable.length > 0) {
+    return [...usable].sort((a, b) => b.faceProminence - a.faceProminence)[0] ?? null;
+  }
+  // No usable face anywhere — keep any one snap for the evidence trail (stable: first by page order).
+  return caps[0] ?? null;
+}
+
+/** Passive identity chain on the single best silent face (when usable). */
 type SilentChain = {
   cap: SilentCapture;
   vsPortrait: FaceCompare | null;
   vsLive: FaceCompare | null;
+  /** True when this is the session's chosen best still across all silent clips. */
+  isSessionBest: boolean;
 };
 
 /** Live hardware readout for the (hidden) silent stream: resolution + measured fps. */
@@ -1147,31 +1193,67 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
           `${name}: micro-motion ${MOTION_LABEL[motion.verdict]} — mean delta ${motion.meanDelta}, peak ${motion.maxDelta} over ${motion.frames} frames / ${motion.durationMs}ms`
         );
 
-        // Best face frame: try the middle frame, then the last, then the first.
+        // Best face in THIS clip: score every sampled frame; pick largest+clearest
+        // usable face. Partial / no face → keep a random mid snap and continue
+        // (silent is voluntary — never blocks the document handoff).
         await loadFaceModels((m) => pushLog("debug", `${name}: ${m}`));
-        const midIdx = Math.min(2, frames.length - 1);
-        const tryOrder = [...new Set([midIdx, frames.length - 1, 0])].filter((i) => i >= 0 && i < frames.length);
+        const midIdx = frames.length > 0 ? Math.min(Math.floor(frames.length / 2), frames.length - 1) : 0;
         let faceDesc: FaceDescription | null = null;
-        let chosen = frames[midIdx];
-        for (const i of tryOrder) {
-          const d = await describeFaceRobust(frames[i]);
-          if (d) {
-            faceDesc = d;
-            chosen = frames[i];
-            break;
+        let faceUsable = false;
+        let faceProminence = 0;
+        let chosen = frames[midIdx] ?? frames[0];
+        let chosenIdx = midIdx;
+        if (frames.length > 0) {
+          let bestScore = -1;
+          for (let i = 0; i < frames.length; i++) {
+            try {
+              const d = await describeFaceRobust(frames[i]);
+              const rank = silentFaceProminence(d);
+              // Prefer usable faces; among non-usable, still track the highest residual
+              // so a partial edge-of-frame beat a pure blank for the still if needed.
+              const tier = rank.usable ? 1_000_000 + rank.score : rank.score;
+              if (d && tier > bestScore) {
+                bestScore = tier;
+                faceDesc = d;
+                faceUsable = rank.usable;
+                faceProminence = rank.score;
+                chosen = frames[i];
+                chosenIdx = i;
+              }
+            } catch {
+              // single-frame describe failure is fine — try the rest
+            }
+          }
+          // No face on any frame → any one snap (stable mid) for the evidence trail.
+          if (!faceDesc) {
+            chosen = frames[midIdx] ?? frames[0];
+            chosenIdx = frames.indexOf(chosen);
+            faceProminence = 0;
+            faceUsable = false;
+          } else if (!faceUsable) {
+            // Partial only — keep the still for evidence, drop face from identity use.
+            pushLog(
+              "info",
+              `${name}: partial/weak face only (${faceDesc.quality.boxWidth}px, det ${faceDesc.quality.detectionScore}) — ignored for identity; flow continues.`
+            );
+            faceDesc = null;
+            faceProminence = 0;
           }
         }
-        const facesDetected = await countFaces(chosen);
+        const facesDetected = chosen ? await countFaces(chosen) : 0;
         pushLog(
-          faceDesc ? (faceDesc.quality.ok ? "success" : "warn") : "info",
-          faceDesc
-            ? `${name}: face captured · ${faceDesc.quality.boxWidth}px · detection ${faceDesc.quality.detectionScore}${faceDesc.quality.ok ? "" : ` · ${faceDesc.quality.issues.length} quality issue(s) — chain match will be quality-gated`}`
-            : `${name}: no face in the silent clip — normal while photographing a document; ignored (evidence-trail note only).`
+          faceDesc ? (faceUsable ? "success" : "info") : "info",
+          faceDesc && faceUsable
+            ? `${name}: best face in clip · ${faceDesc.quality.boxWidth}px · det ${faceDesc.quality.detectionScore} · sharp ${faceDesc.quality.sharpness} · prominence ${Math.round(faceProminence)} (session will keep the single best across all silent clips)`
+            : `${name}: no usable face in this silent clip — voluntary; ignored (evidence-trail note only). Flow continues.`
         );
-        if (facesDetected > 1) pushLog("warn", `${name}: ${facesDetected} faces in frame — coaching/coercion review signal`);
+        if (facesDetected > 1) pushLog("info", `${name}: ${facesDetected} faces in frame — noted; not a hard fail (coaching review only if this still is session-best).`);
 
+        if (!chosen) {
+          pushLog("info", `${name}: no frames captured — voluntary skip; document flow continues.`);
+          return;
+        }
         const blob = await canvasToBlob(chosen, 0.95);
-        const chosenIdx = frames.indexOf(chosen);
         if (chosenIdx >= 0 && frameIds[chosenIdx]) ledgerFrameEncoded(frameIds[chosenIdx], "image/jpeg", 0.95, blob.size);
         const report = await analyzeImageFraud(blob, `${cfg.filePrefix}-silent-${pageId}-${Date.now()}.jpg`, {
           captureSource: "live-frame",
@@ -1190,10 +1272,9 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
           revokeIfBlobUrl(videoUrl);
           return;
         }
-        // Pulse fingerprint: short silent windows rarely lock a full BPM — store
-        // whatever estimate we got when a face was present for cross-feed continuity.
+        // Pulse fingerprint: only when a usable face was present long enough.
         let pulse: PulseFingerprint | null = null;
-        if (faceDesc && ppgSamples.length >= 4) {
+        if (faceDesc && faceUsable && ppgSamples.length >= 4) {
           const est = estimatePulse(ppgSamples);
           pulse = pulseFingerprint(`silent-${pageId}`, est);
           pushLog(
@@ -1205,6 +1286,8 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
           pageId,
           pageLabel,
           face: faceDesc,
+          faceUsable,
+          faceProminence,
           url,
           blob,
           videoBlob,
@@ -1546,6 +1629,9 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
     [cfg.nativePages, silents]
   );
 
+  /** Single best silent still across every clip (largest+clearest face, else any snap). */
+  const bestSilent: SilentCapture | null = useMemo(() => pickBestSilentCapture(orderedSilents), [orderedSilents]);
+
   const aiVerdicts: SessionAiVerdicts = useMemo(() => {
     const out: SessionAiVerdicts = {};
     for (const [k, v] of Object.entries(aiState)) out[k] = v.verdict;
@@ -1559,26 +1645,30 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   }, [face, orderedPages]);
 
   /**
-   * Passive identity chain: every silent capture's face vs BOTH the document
-   * portrait and the live face. compareFaces() quality-gates a mismatch when
-   * either side is low quality, so a surviving mismatch means both captures
-   * passed quality gates — the person holding the phone is a different person.
+   * Passive identity chain uses ONLY the session's single best silent face
+   * (usable face only). Partial / missing faces never chain-match. Other clips
+   * stay on the evidence trail but do not produce identity FAILs.
    */
   const chains: SilentChain[] = useMemo(() => {
     const portrait = orderedPages.find((p) => p.page.portrait && p.portrait)?.portrait ?? null;
-    return orderedSilents.map((cap) => ({
-      cap,
-      vsPortrait: cap.face && portrait ? compareFaces(portrait, cap.face) : null,
-      vsLive: cap.face && face?.face ? compareFaces(face.face, cap.face) : null,
-    }));
-  }, [face, orderedPages, orderedSilents]);
+    return orderedSilents.map((cap) => {
+      const isSessionBest = bestSilent != null && cap.pageId === bestSilent.pageId;
+      const useForIdentity = isSessionBest && cap.faceUsable && cap.face != null;
+      return {
+        cap,
+        vsPortrait: useForIdentity && portrait ? compareFaces(portrait, cap.face!) : null,
+        vsLive: useForIdentity && face?.face ? compareFaces(face.face, cap.face!) : null,
+        isSessionBest,
+      };
+    });
+  }, [bestSilent, face, orderedPages, orderedSilents]);
 
   /**
    * Base template fusion + passive-chain adjustments. FAIL comes from hard
-   * capture-channel invariants, a manipulated/AI-generated silent frame, or a
-   * quality-gated different-person chain mismatch. A faceless silent clip is
-   * ignored (normal while photographing a document); static micro-motion and
-   * multi-face frames are REVIEW-grade corroboration.
+   * capture-channel invariants on any silent clip, a manipulated/AI-generated
+   * session-best still, or a quality-gated different-person match on the single
+   * best usable silent face. Missing/partial faces never penalize. Static
+   * micro-motion and multi-face are REVIEW only on the session-best usable face.
    */
   const overall: OverallResult = useMemo(() => {
     const base = computeOverall(template, orderedPages, face, compare, aiVerdicts);
@@ -1605,16 +1695,15 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         ? pulseFingerprint("liveness", face.liveness.pulse)
         : null;
     if (livePulse && silentPulses.length > 0) {
-      // Prefer the silent leg with the strongest coherence for comparison.
-      const bestSilent = [...silentPulses].sort((a, b) => b.coherence - a.coherence)[0];
-      const cont = comparePulseContinuity(bestSilent, livePulse);
+      const bestPulse = [...silentPulses].sort((a, b) => b.coherence - a.coherence)[0];
+      const cont = comparePulseContinuity(bestPulse, livePulse);
       if (cont.mismatch) {
         review.push(cont.detail);
         corrective.push("Repeat the full flow in one sitting without switching people or pre-recorded video between steps.");
       }
     }
 
-    if (chains.length === 0) {
+    if (orderedSilents.length === 0) {
       if (fail.length === 0 && review.length === 0) return base;
       const verdict: OverallResult["verdict"] = fail.length > 0 ? "fail" : base.verdict === "fail" ? "fail" : "review";
       const baseReasons = base.verdict === "pass" ? [] : base.reasons;
@@ -1624,7 +1713,9 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         correctiveActions: [...new Set([...base.correctiveActions, ...corrective])],
       };
     }
-    for (const { cap, vsPortrait, vsLive } of chains) {
+
+    // Channel / synthetic-media: still inspect every silent clip (injection is not face-dependent).
+    for (const cap of orderedSilents) {
       const name = `Silent check (before ${cap.pageLabel.toLowerCase()})`;
       const r = cap.report;
       const injected = r.findings
@@ -1633,22 +1724,26 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       if (injected.length > 0) fail.push(`${name}: capture channel compromised — ${injected.join("; ")}`);
       if (r.verdict === "manipulated" || r.verdict === "ai-generated") {
         fail.push(`${name}: ${r.verdictLabel} (score ${r.score}/100, confidence ${r.confidence}%)`);
-      } else if (r.verdict === "suspicious") {
+      } else if (r.verdict === "suspicious" && bestSilent?.pageId === cap.pageId) {
+        // Soft suspicious only escalates when it is the session-chosen still.
         review.push(`${name}: ${r.verdictLabel} (score ${r.score}/100)`);
-        corrective.push(`Repeat the ${cap.pageLabel.toLowerCase()} step so a fresh silent check is captured.`);
+        corrective.push("Restart the flow so a fresh silent front-camera check can run — it is voluntary and never blocks document capture.");
       }
+    }
+
+    // Identity + face-context REVIEW only on the single best usable silent face.
+    const chain = chains.find((c) => c.isSessionBest) ?? null;
+    if (chain && chain.cap.faceUsable && chain.cap.face) {
+      const { cap, vsPortrait, vsLive } = chain;
+      const name = `Best silent front face (from check before ${cap.pageLabel.toLowerCase()})`;
       if (cap.facesDetected != null && cap.facesDetected > 1) {
         review.push(`${name}: multiple faces (${cap.facesDetected}) in frame — coaching/coercion review signal`);
         corrective.push("Repeat the flow alone — only your own face should be visible while the documents are captured.");
       }
-      // Static micro-motion is corroboration only, and only when a face was
-      // present (a phone flat on a table is static AND faceless — genuine).
-      if (cap.motion.verdict === "static" && cap.face) {
+      if (cap.motion.verdict === "static") {
         review.push(`${name}: no natural micro-motion in the silent clip (mean delta ${cap.motion.meanDelta}) — a static injected feed cannot be ruled out`);
         corrective.push("Repeat the flow holding the phone in your hand — natural hand movement is part of the passive check.");
       }
-      // Passive identity chain — a surviving (non-gated) mismatch means both
-      // sides passed quality gates: a different person was holding the phone.
       if (vsPortrait && vsPortrait.outcome.verdict === "mismatch" && !vsPortrait.gated) {
         fail.push(
           `${name}: the person holding the phone does not match the document portrait (distance ${vsPortrait.outcome.distance}, quality gates passed)`
@@ -1662,20 +1757,19 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       const silentAi = aiVerdicts[`silent-${cap.pageId}`];
       if (silentAi && (silentAi.verdict === "ai-generated" || silentAi.verdict === "manipulated") && silentAi.confidence >= 60) {
         review.push(`${name}: AI vision verdict "${silentAi.verdict}" at ${silentAi.confidence}% confidence`);
-        corrective.push("Restart the flow to capture fresh silent checks and re-run the AI verdict.");
+        corrective.push("Restart the flow to capture a fresh silent check and re-run the AI verdict.");
       }
     }
+
     if (fail.length === 0 && review.length === 0) return base;
     const verdict: OverallResult["verdict"] = fail.length > 0 ? "fail" : base.verdict === "fail" ? "fail" : "review";
-    // The base "pass" reasons ("all pages passed…") no longer hold once the
-    // passive chain escalates the session — drop them and keep the evidence.
     const baseReasons = base.verdict === "pass" ? [] : base.reasons;
     return {
       verdict,
       reasons: [...baseReasons, ...fail, ...review],
       correctiveActions: [...new Set([...base.correctiveActions, ...corrective])],
     };
-  }, [aiVerdicts, chains, compare, face, orderedPages, orderedSilents, template]);
+  }, [aiVerdicts, bestSilent, chains, compare, face, orderedPages, orderedSilents, template]);
 
   const crossFindings = useMemo(() => licenceCrossFindings(orderedPages), [orderedPages]);
 
@@ -1756,17 +1850,30 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   const exportText = useCallback(() => {
     const base = buildSessionReportText(template, orderedPages, face, compare, overall, aiVerdicts, aiVerdictAvailable());
     const lines: string[] = [base.replace(/\n=== END OF REPORT ===$/, "")];
-    for (const { cap, vsPortrait, vsLive } of chains) {
+    lines.push(
+      "",
+      "━━━ PASSIVE SILENT FRONT CAMERA (VOLUNTARY) ━━━",
+      "Silent front-camera clips run before each document page. Missing face, partial face, or denied camera never blocks the flow.",
+      bestSilent
+        ? bestSilent.faceUsable && bestSilent.face
+          ? `Session best silent face: from check before ${bestSilent.pageLabel} · ${bestSilent.face.quality.boxWidth}px · det ${bestSilent.face.quality.detectionScore} · prominence ${Math.round(bestSilent.faceProminence)}`
+          : `Session silent still (no usable face across clips): snap from check before ${bestSilent.pageLabel} — evidence trail only`
+        : "No silent clips recorded this session."
+    );
+    for (const { cap, vsPortrait, vsLive, isSessionBest } of chains) {
       lines.push(
         "",
-        `━━━ PASSIVE CHECK — SILENT CLIP BEFORE ${cap.pageLabel.toUpperCase()} ━━━`,
+        `━━━ SILENT CLIP BEFORE ${cap.pageLabel.toUpperCase()}${isSessionBest ? " ★ SESSION BEST STILL" : ""} ━━━`,
         `Micro-motion: ${MOTION_LABEL[cap.motion.verdict]} · ${cap.motion.frames} frames over ${cap.motion.durationMs}ms · mean delta ${cap.motion.meanDelta} · peak ${cap.motion.maxDelta}`,
         `Frame: ${cap.width}×${cap.height}${cap.videoBlob ? ` · clip recorded (${(cap.videoBlob.size / 1024).toFixed(0)} KB, ${cap.videoMime})` : " · clip recording unavailable on this browser"}`,
-        `Verdict: ${cap.report.verdictLabel} · score ${cap.report.score}/100 · confidence ${cap.report.confidence}%`
+        `Verdict: ${cap.report.verdictLabel} · score ${cap.report.score}/100 · confidence ${cap.report.confidence}%`,
+        `Face usable for identity: ${cap.faceUsable ? "yes" : "no"} · prominence ${Math.round(cap.faceProminence)}`
       );
       if (cap.facesDetected != null) lines.push(`Faces in frame: ${cap.facesDetected}`);
-      if (!cap.face) {
-        lines.push("Identity chain: no face in the silent clip — ignored (normal while photographing a document; evidence-trail note only)");
+      if (!isSessionBest) {
+        lines.push("Identity chain: not used (session keeps only the single best silent face across all clips)");
+      } else if (!cap.face || !cap.faceUsable) {
+        lines.push("Identity chain: no usable face in any silent clip — ignored (voluntary; evidence-trail note only)");
       } else {
         lines.push(
           vsPortrait
@@ -1789,17 +1896,27 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
     lines.push("", buildLedgerText());
     lines.push("", "=== END OF REPORT ===");
     return lines.join("\n");
-  }, [aiVerdicts, chains, compare, face, orderedPages, overall, template]);
+  }, [aiVerdicts, bestSilent, chains, compare, face, orderedPages, overall, template]);
 
   const exportJson = useCallback(() => {
     const base = JSON.parse(buildSessionJson(template, orderedPages, face, compare, overall, aiVerdicts, aiVerdictAvailable())) as Record<
       string,
       unknown
     >;
+    base.silentPolicy = {
+      voluntary: true,
+      rule: "Capture silent front before every native document page. Missing/partial face never blocks. Session keeps one best still (largest+clearest usable face across all clips); otherwise any one snap for evidence only.",
+      sessionBestPageId: bestSilent?.pageId ?? null,
+      sessionBestUsableFace: Boolean(bestSilent?.faceUsable && bestSilent?.face),
+    };
     if (chains.length > 0) {
-      base.passiveChain = chains.map(({ cap, vsPortrait, vsLive }) => ({
+      base.passiveChain = chains.map(({ cap, vsPortrait, vsLive, isSessionBest }) => ({
         beforePage: cap.pageId,
         beforePageLabel: cap.pageLabel,
+        isSessionBestStill: isSessionBest,
+        usedForIdentityChain: Boolean(isSessionBest && cap.faceUsable && cap.face),
+        faceUsable: cap.faceUsable,
+        faceProminence: Math.round(cap.faceProminence * 100) / 100,
         verdict: cap.report.verdict,
         verdictLabel: cap.report.verdictLabel,
         score: cap.report.score,
@@ -1828,9 +1945,11 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
           vsLiveFace: vsLive
             ? { verdict: vsLive.outcome.verdict, distance: vsLive.outcome.distance, similarity: vsLive.outcome.similarity, gated: vsLive.gated }
             : null,
-          note: cap.face
-            ? "A quality-gated different-person result on either edge of the chain fails the session."
-            : "No face in the silent clip — ignored (normal while photographing a document).",
+          note: !isSessionBest
+            ? "Not the session-best still — identity chain not applied."
+            : cap.faceUsable && cap.face
+              ? "Session-best usable silent face. A quality-gated different-person result on either edge fails the session."
+              : "No usable face across silent clips — ignored (voluntary; evidence trail only).",
         },
         aiVerdict: aiVerdicts[`silent-${cap.pageId}`]
           ? {
@@ -1850,7 +1969,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
     }
     base.captureFeedLedger = buildLedgerJsonObject();
     return JSON.stringify(base, null, 2);
-  }, [aiVerdicts, chains, compare, face, orderedPages, overall, template]);
+  }, [aiVerdicts, bestSilent, chains, compare, face, orderedPages, overall, template]);
 
   const retakePage = useCallback(
     (pageId: string) => {
@@ -1937,7 +2056,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
     ...cfg.nativePages.flatMap((p) => [
       {
         key: `silent-${p.id}`,
-        label: `Silent passive check (before ${p.label.toLowerCase()})`,
+        label: `Silent front check (optional, before ${p.label.toLowerCase()})`,
         done: silents[p.id] != null,
         active: silentActive === p.id,
         icon: <ScanFace className="h-4 w-4" />,
@@ -2062,22 +2181,22 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
                 <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground">
                   {variant === "licence" ? (
                     <>
-                      Tap start and allow the camera. A short silent check runs from the front camera, then your phone's real camera opens
-                      automatically for the <span className="font-medium text-foreground">licence front</span>. When you return, a second
-                      silent check runs (no new prompt) and the camera opens again for the{" "}
+                      Tap start and allow the camera. An optional silent front-camera check runs, then your phone's real camera opens
+                      automatically for the <span className="font-medium text-foreground">licence front</span>. When you return, another
+                      optional silent check runs and the camera opens again for the{" "}
                       <span className="font-medium text-foreground">licence back</span>. A quick{" "}
-                      <span className="font-medium text-foreground">smile liveness check</span> finishes the session. The silent checks
-                      passively verify that a real person — the person on the ID — is holding the phone the whole way through. Everything is
-                      captured at maximum quality, screened by the full forensic + face-match engine, and downloadable.
+                      <span className="font-medium text-foreground">smile liveness check</span> finishes the session. Silent checks are
+                      voluntary — no face or a partial face is ignored; the session keeps the single clearest face across both clips when
+                      one is available. Everything is captured at maximum quality, screened by the full forensic + face-match engine, and
+                      downloadable.
                     </>
                   ) : (
                     <>
-                      Tap start and allow the camera. A short silent check runs from the front camera, then your phone's real camera opens
+                      Tap start and allow the camera. An optional silent front-camera check runs, then your phone's real camera opens
                       automatically for the <span className="font-medium text-foreground">passport photo page</span> — one single capture
                       with the MRZ code lines visible. A quick <span className="font-medium text-foreground">smile liveness check</span>{" "}
-                      finishes the session. The silent check passively verifies that a real person — the person on the passport — is holding
-                      the phone. Everything is captured at maximum quality, screened by the full forensic + face-match engine, and
-                      downloadable.
+                      finishes the session. The silent check is voluntary — no face or a partial face is ignored. Everything is captured at
+                      maximum quality, screened by the full forensic + face-match engine, and downloadable.
                     </>
                   )}
                 </p>
@@ -2153,16 +2272,16 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
             ) : null}
 
             {Object.entries(silentErrors).map(([pid, msg]) => (
-              <div key={pid} className="flex items-start gap-2 rounded-2xl border border-amber-500/40 bg-amber-500/5 p-3 text-[11px] leading-snug text-amber-200">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+              <div key={pid} className="flex items-start gap-2 rounded-2xl border border-border/60 bg-card p-3 text-[11px] leading-snug text-muted-foreground">
+                <ScanFace className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                 <div>
-                  <p className="font-semibold">
-                    Silent passive check unavailable ({(template.pages.find((p) => p.id === pid)?.label ?? pid).toLowerCase()})
+                  <p className="font-semibold text-foreground/90">
+                    Silent front check skipped ({(template.pages.find((p) => p.id === pid)?.label ?? pid).toLowerCase()}) — optional
                   </p>
                   <p className="mt-0.5">{msg}</p>
-                  <Button variant="secondary" size="sm" className="mt-2 h-9" onClick={() => retakeSilent(pid)}>
+                  <Button variant="ghost" size="sm" className="mt-2 h-9 text-muted-foreground" onClick={() => retakeSilent(pid)}>
                     <RefreshCcw className="mr-1.5 h-3.5 w-3.5" />
-                    Retry silent check
+                    Retry optional silent check
                   </Button>
                 </div>
               </div>
@@ -2478,25 +2597,89 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
               )}
             </section>
 
-            {/* Passive verification chain — silent clips before each document page */}
+            {/* Passive verification chain — voluntary silent clips; one best face */}
             {chains.length > 0 ? (
               <section className="animate-rise space-y-2.5 rounded-2xl border border-amber-500/25 bg-card p-3.5" style={{ animationDelay: "210ms" }}>
                 <h2 className="flex items-center gap-1.5 text-[13px] font-semibold">
                   <ScanFace className="h-4 w-4 text-amber-400" />
-                  Passive Verification Chain — silent front-camera clips
+                  Passive Silent Front — voluntary · best face wins
                 </h2>
                 <p className="text-[10.5px] leading-snug text-muted-foreground">
-                  Recorded invisibly before each document capture. Each clip's best face frame is matched against BOTH the document portrait
-                  and the live face — a quality-gated different-person result fails the session. A clip with no face (phone on a table while
-                  photographing the document) is ignored.
+                  A short front-camera check runs before each document page (licence front <span className="font-medium text-foreground">and</span> back).
+                  It is always voluntary: no face, a partial face, or a skipped clip never blocks the flow. Across every frame from every clip, the
+                  session keeps <span className="font-medium text-foreground">one</span> best still — largest + clearest usable face. If none, any one
+                  snap is kept for the evidence trail only. Identity matching uses that single best face against the document portrait and the live face.
                 </p>
+                {bestSilent ? (
+                  <div className="rounded-xl border border-amber-500/35 bg-amber-500/5 p-2.5">
+                    <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300/90">Session best silent still</div>
+                    <div className="flex items-start gap-2.5">
+                      <img
+                        src={bestSilent.url}
+                        alt="Best silent front still"
+                        className="h-24 w-20 shrink-0 rounded-lg object-cover ring-2 ring-amber-400/50"
+                      />
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="text-[11.5px] font-semibold">
+                          From check before {bestSilent.pageLabel.toLowerCase()}
+                          {bestSilent.faceUsable && bestSilent.face ? " · usable face" : " · no usable face (evidence only)"}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1">
+                          <VerdictMiniChip report={bestSilent.report} />
+                          <span className={cn("inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold", MOTION_CHIP[bestSilent.motion.verdict])}>
+                            <Activity className="h-3 w-3" />
+                            {MOTION_LABEL[bestSilent.motion.verdict]}
+                          </span>
+                        </div>
+                        <p className="mono text-[9.5px] leading-snug text-muted-foreground">
+                          {bestSilent.width}×{bestSilent.height}
+                          {bestSilent.face?.quality
+                            ? ` · face ${bestSilent.face.quality.boxWidth}px · det ${bestSilent.face.quality.detectionScore} · sharp ${bestSilent.face.quality.sharpness}`
+                            : " · no face detected"}
+                          {` · prominence ${Math.round(bestSilent.faceProminence)}`}
+                        </p>
+                        {(() => {
+                          const bestChain = chains.find((c) => c.isSessionBest);
+                          if (!bestChain) return null;
+                          if (!bestSilent.faceUsable || !bestSilent.face) {
+                            return (
+                              <p className="rounded-lg border border-border/60 bg-black/25 p-2 text-[10px] leading-snug text-muted-foreground">
+                                No usable face across silent clips — identity chain skipped; flow continued normally.
+                              </p>
+                            );
+                          }
+                          return (
+                            <div className="flex flex-wrap gap-1 pt-0.5">
+                              <ChainMatchChip label="vs document portrait" cmp={bestChain.vsPortrait} />
+                              <ChainMatchChip label="vs live face" cmp={bestChain.vsLive} />
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
                 <div className="space-y-2">
-                  {chains.map(({ cap, vsPortrait, vsLive }) => (
-                    <div key={cap.pageId} className="space-y-2 rounded-xl border border-border/60 bg-background/40 p-2.5">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">All silent clips (evidence)</div>
+                  {chains.map(({ cap, isSessionBest }) => (
+                    <div
+                      key={cap.pageId}
+                      className={cn(
+                        "space-y-2 rounded-xl border bg-background/40 p-2.5",
+                        isSessionBest ? "border-amber-500/40" : "border-border/60"
+                      )}
+                    >
                       <div className="flex items-start gap-2.5">
-                        <img src={cap.url} alt={`Silent frame before ${cap.pageLabel}`} className="h-20 w-16 shrink-0 rounded-lg object-cover ring-1 ring-border" />
+                        <img src={cap.url} alt={`Silent frame before ${cap.pageLabel}`} className="h-16 w-12 shrink-0 rounded-lg object-cover ring-1 ring-border" />
                         <div className="min-w-0 flex-1 space-y-1">
-                          <div className="text-[11.5px] font-semibold">Before {cap.pageLabel.toLowerCase()}</div>
+                          <div className="flex flex-wrap items-center gap-1.5 text-[11.5px] font-semibold">
+                            <span>Before {cap.pageLabel.toLowerCase()}</span>
+                            {isSessionBest ? (
+                              <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-200">
+                                session best
+                              </span>
+                            ) : null}
+                          </div>
                           <div className="flex flex-wrap items-center gap-1">
                             <VerdictMiniChip report={cap.report} />
                             <span className={cn("inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold", MOTION_CHIP[cap.motion.verdict])}>
@@ -2507,20 +2690,20 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
                           <p className="mono text-[9.5px] leading-snug text-muted-foreground">
                             {cap.width}×{cap.height} · {cap.motion.frames} frames / {cap.motion.durationMs}ms · delta {cap.motion.meanDelta}
                             {cap.facesDetected != null ? ` · ${cap.facesDetected} face${cap.facesDetected === 1 ? "" : "s"}` : ""}
+                            {cap.faceUsable ? " · usable face" : " · no usable face"}
                             {cap.videoBlob ? ` · clip ${(cap.videoBlob.size / 1024).toFixed(0)} KB` : " · no clip (recorder unsupported)"}
                           </p>
+                          {!cap.faceUsable ? (
+                            <p className="text-[10px] leading-snug text-muted-foreground">
+                              Partial or missing face — ignored for identity; flow continued.
+                            </p>
+                          ) : !isSessionBest ? (
+                            <p className="text-[10px] leading-snug text-muted-foreground">
+                              Face present but not the clearest across clips — identity uses the session best only.
+                            </p>
+                          ) : null}
                         </div>
                       </div>
-                      {cap.face ? (
-                        <div className="flex flex-wrap gap-1">
-                          <ChainMatchChip label="vs document portrait" cmp={vsPortrait} />
-                          <ChainMatchChip label="vs live face" cmp={vsLive} />
-                        </div>
-                      ) : (
-                        <p className="rounded-lg border border-border/60 bg-black/25 p-2 text-[10px] leading-snug text-muted-foreground">
-                          No face in this clip — normal while photographing a document; noted in the evidence trail only, never penalized.
-                        </p>
-                      )}
                       <div className="flex gap-1.5">
                         <Button variant="ghost" size="sm" className="h-8 flex-1 px-2 text-[10.5px] text-muted-foreground" onClick={() => retakeSilent(cap.pageId)}>
                           <RefreshCcw className="mr-1 h-3 w-3" />
