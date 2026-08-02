@@ -1,35 +1,38 @@
 /**
- * On-device face detection, description (128-d descriptors), expression scoring,
- * and identity matching via @vladmandic/face-api (TensorFlow.js). Models are
- * lazy-loaded from CDN on first use; nothing leaves the device.
+ * On-device face detection + agency-grade identity matching.
  *
- * Matching pipeline (document portrait vs live face), tuned for the hard case
- * of a small, laminated ID portrait against a phone selfie:
+ * Stack:
+ *  - Detection / landmarks / expressions — @vladmandic/face-api (TF.js)
+ *  - Identity embedder — MobileFaceNet (ArcFace-trained) via ONNX Runtime Web
+ *    → 256-d L2-normalized embedding, cosine distance
  *
- * 1. Detection — SSD MobileNet V1 (much higher recall on still photos) with
- *    TinyFaceDetector fallbacks at two input sizes. A portrait on a full
- *    document photo is tiny relative to the frame and is easily missed by a
- *    single fixed-size detector pass. All candidate faces are ranked and the
- *    MAIN portrait (largest confident face) wins — many IDs (incl. every
- *    Australian licence) carry a smaller ghost/secondary portrait that must
- *    not hijack the identity comparison.
- * 2. Enhancement — the detected face is cropped with margin and upscaled with
- *    high-quality interpolation so the recognition net sees ~280px of face
- *    instead of a 100px thumbnail (the net's aligned input is 150px; feeding
- *    it from a smaller source destroys identity detail).
- * 3. Alignment — in-plane rotation (roll) is corrected using the eye
- *    landmarks before descriptor extraction. Documents photographed at an
- *    angle produce rolled faces, and the recognition net loses accuracy fast
- *    beyond a few degrees of roll.
- * 4. Ensemble — descriptors are computed for the aligned crop, its mirror,
- *    a contrast-normalized variant, and (for soft upscaled crops) an
- *    unsharp-masked variant, then fused. Single-shot descriptors from
- *    small/glossy/laminated ID portraits are noisy; the ensemble cancels
- *    much of that noise and pose/lighting bias.
- * 5. Calibration — thresholds follow the dlib/FaceNet standard (same person
- *    typically < 0.6) adapted for doc-vs-selfie pairs: match ≤ 0.55,
- *    mismatch ≥ 0.68, with the band in between explicitly uncertain.
+ * Matching pipeline (document portrait vs live face):
+ *
+ * 1. Detection — SSD MobileNet V1 with TinyFaceDetector fallbacks; main
+ *    portrait wins (ghost-portrait guard on laminated IDs).
+ * 2. 5-point ArcFace alignment — eyes/nose/mouth → similarity warp to 112×112.
+ * 3. Quality gate (ISO-style) — size, blur, brightness, contrast; refuse
+ *    confident mismatch on bad crops.
+ * 4. MobileFaceNet embed + ensemble (aligned / mirror / contrast-normalized).
+ * 5. Cosine-distance bands: match ≤ 0.42, mismatch ≥ 0.58, band = uncertain.
+ *
+ * Liveness still uses the fast face-api detector/expressions path only.
+ * Nothing leaves the device.
  */
+
+import {
+  COSINE_MATCH_MAX,
+  COSINE_MISMATCH_MIN,
+  cosineDistance,
+  cropBoxTo112,
+  embedAlignedFace,
+  FACE_EMBED_DIM,
+  FACE_ENGINE_ID,
+  loadFaceEmbedder,
+  matchFromCosine,
+  warpAligned112,
+  type Point2,
+} from "./face-embedder";
 
 type FaceApi = typeof import("@vladmandic/face-api");
 
@@ -42,9 +45,13 @@ let ssdPromise: Promise<void> | null = null;
 
 const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
 
-/** Calibrated descriptor-distance thresholds (see module docs). */
-export const MATCH_DISTANCE_MAX = 0.55;
-export const MISMATCH_DISTANCE_MIN = 0.68;
+/**
+ * Cosine-distance thresholds (MobileFaceNet / ArcFace). Kept under the legacy
+ * export names so IdKit / Verify / Face Match UIs keep working unchanged.
+ */
+export const MATCH_DISTANCE_MAX = COSINE_MATCH_MAX;
+export const MISMATCH_DISTANCE_MIN = COSINE_MISMATCH_MIN;
+export { FACE_ENGINE_ID, FACE_EMBED_DIM };
 
 export type FaceBox = { x: number; y: number; width: number; height: number };
 
@@ -63,16 +70,23 @@ export type FaceQuality = {
 };
 
 export type FaceDescription = {
+  /** L2-normalized identity embedding (MobileFaceNet 256-d when robust path ran). */
   descriptor: Float32Array;
   box: FaceBox;
   detectionScore: number;
   quality: FaceQuality;
-  /** Ensemble descriptor variants (enhanced crop / mirror / normalized) when the robust pipeline ran. */
+  /** Ensemble embedding variants (aligned / mirror / normalized) when the robust pipeline ran. */
   variants?: Float32Array[];
   /** Human-readable enhancement steps applied before descriptor extraction. */
   enhancement?: string[];
   /** Which detector located the face (ssd-mobilenet-v1 / tiny-608 / tiny-416). */
   detector?: string;
+  /** Identity engine id (e.g. mobilefacenet-arcface/1.0). */
+  engine?: string;
+  /** Embedding dimensionality. */
+  embedDim?: number;
+  /** Distance metric used for this descriptor (cosine for ArcFace, euclidean for legacy FaceNet). */
+  metric?: "cosine" | "euclidean";
 };
 
 export type FaceExpressionSample = {
@@ -102,20 +116,28 @@ export type EnsembleMatch = MatchOutcome & {
   pairsCompared: number;
 };
 
-/** Loads face-api and its models (detector, landmarks, recognition, expressions). */
+/** Loads face-api detector/landmarks/expressions + MobileFaceNet ONNX embedder. */
 export async function loadFaceModels(onStep?: (msg: string) => void): Promise<void> {
   if (modelsReady) return;
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
-    onStep?.("Loading face analysis engine (TensorFlow.js)…");
+    onStep?.("Loading face analysis engine (detector + landmarks)…");
     api = await import("@vladmandic/face-api");
-    onStep?.("Downloading on-device face models (~6 MB, cached after first load)…");
+    onStep?.("Downloading on-device face models (cached after first load)…");
     await Promise.all([
       api.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
       api.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      // Keep FaceNet as a fallback embedder if MobileFaceNet fails to load.
       api.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       api.nets.faceExpressionNet.loadFromUri(MODEL_URL),
     ]);
+    try {
+      await loadFaceEmbedder(onStep);
+    } catch (err) {
+      onStep?.(
+        `MobileFaceNet unavailable (${err instanceof Error ? err.message : String(err)}) — falling back to FaceNet 128-d.`
+      );
+    }
     modelsReady = true;
     onStep?.("Face models ready.");
   })();
@@ -548,10 +570,65 @@ function normalizeContrast(source: HTMLCanvasElement): HTMLCanvasElement | null 
   return canvas;
 }
 
-type DescribedOn = { descriptor: Float32Array; box: FaceBox; score: number };
+type DescribedOn = { descriptor: Float32Array; box: FaceBox; score: number; engine: string; metric: "cosine" | "euclidean"; embedDim: number };
 
-/** Landmark-aligned descriptor from a prepared canvas (SSD preferred, tiny fallback). */
-async function describeOn(canvas: HTMLCanvasElement, preferSsd: boolean): Promise<DescribedOn | null> {
+/** Mean of equal-length L2 vectors, then re-normalize (for cosine space). */
+function meanDescriptor(list: Float32Array[]): Float32Array {
+  const out = new Float32Array(list[0].length);
+  for (const d of list) {
+    for (let i = 0; i < out.length; i++) out[i] += d[i];
+  }
+  for (let i = 0; i < out.length; i++) out[i] /= list.length;
+  let n = 0;
+  for (let i = 0; i < out.length; i++) n += out[i] * out[i];
+  n = Math.sqrt(n);
+  if (n > 1e-12) for (let i = 0; i < out.length; i++) out[i] /= n;
+  return out;
+}
+
+/** Extract ArcFace 5-point landmarks (eye centres, nose, mouth corners) from 68-pt model. */
+function landmarks5From68(positions: { x: number; y: number }[]): Point2[] | null {
+  if (positions.length < 68) return null;
+  const mean = (from: number, to: number): Point2 => {
+    let x = 0;
+    let y = 0;
+    const n = to - from + 1;
+    for (let i = from; i <= to; i++) {
+      x += positions[i].x;
+      y += positions[i].y;
+    }
+    return { x: x / n, y: y / n };
+  };
+  return [
+    mean(36, 41), // left eye
+    mean(42, 47), // right eye
+    { x: positions[30].x, y: positions[30].y }, // nose tip
+    { x: positions[48].x, y: positions[48].y }, // left mouth
+    { x: positions[54].x, y: positions[54].y }, // right mouth
+  ];
+}
+
+/** Detect face + 68 landmarks on a canvas (SSD preferred). */
+async function detectWithLandmarks(
+  canvas: HTMLCanvasElement,
+  preferSsd: boolean
+): Promise<{ box: FaceBox; score: number; landmarks5: Point2[] | null } | null> {
+  if (!api) return null;
+  const useSsd = preferSsd && (await ensureStillDetector());
+  const opts = useSsd
+    ? new api.SsdMobilenetv1Options({ minConfidence: 0.3 })
+    : new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.2 });
+  const r = await api.detectSingleFace(canvas, opts).withFaceLandmarks();
+  if (!r) return null;
+  return {
+    box: { x: r.detection.box.x, y: r.detection.box.y, width: r.detection.box.width, height: r.detection.box.height },
+    score: r.detection.score,
+    landmarks5: landmarks5From68(r.landmarks.positions),
+  };
+}
+
+/** FaceNet 128-d fallback when MobileFaceNet is unavailable. */
+async function describeOnFaceNet(canvas: HTMLCanvasElement, preferSsd: boolean): Promise<DescribedOn | null> {
   if (!api) return null;
   const useSsd = preferSsd && (await ensureStillDetector());
   const opts = useSsd
@@ -563,23 +640,47 @@ async function describeOn(canvas: HTMLCanvasElement, preferSsd: boolean): Promis
     descriptor: r.descriptor,
     box: { x: r.detection.box.x, y: r.detection.box.y, width: r.detection.box.width, height: r.detection.box.height },
     score: r.detection.score,
+    engine: "facenet-128/legacy",
+    metric: "euclidean",
+    embedDim: 128,
   };
 }
 
-function meanDescriptor(list: Float32Array[]): Float32Array {
-  const out = new Float32Array(list[0].length);
-  for (const d of list) {
-    for (let i = 0; i < out.length; i++) out[i] += d[i];
+/**
+ * MobileFaceNet embed of a prepared face canvas: 5-pt ArcFace align → 112² → ONNX.
+ * Falls back to tight box crop when landmarks fail.
+ */
+async function embedOnCanvas(
+  canvas: HTMLCanvasElement,
+  preferSsd: boolean,
+  known?: { box: FaceBox; score: number; landmarks5: Point2[] | null }
+): Promise<DescribedOn | null> {
+  const det = known ?? (await detectWithLandmarks(canvas, preferSsd));
+  if (!det) return null;
+  let aligned: HTMLCanvasElement | null = null;
+  if (det.landmarks5) {
+    aligned = warpAligned112(canvas, det.landmarks5);
   }
-  for (let i = 0; i < out.length; i++) out[i] /= list.length;
-  return out;
+  if (!aligned) {
+    aligned = cropBoxTo112(canvas, det.box);
+  }
+  if (!aligned) return null;
+  const emb = await embedAlignedFace(aligned);
+  if (!emb) return null;
+  return {
+    descriptor: emb,
+    box: det.box,
+    score: det.score,
+    engine: FACE_ENGINE_ID,
+    metric: "cosine",
+    embedDim: emb.length,
+  };
 }
 
 /**
- * Robust still-photo face description: multi-detector location, enhanced crop
- * (margin + high-quality upscale), and a descriptor ensemble (crop / mirror /
- * contrast-normalized) fused into one identity embedding. Use this for
- * document portraits, selfies, and any single-frame identity evidence.
+ * Robust still-photo face description: multi-detector location, ArcFace 5-point
+ * alignment to 112×112, MobileFaceNet 256-d embedding ensemble (aligned / mirror /
+ * contrast-normalized). Use for document portraits, selfies, and identity evidence.
  */
 export async function describeFaceRobust(
   input: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
@@ -605,85 +706,108 @@ export async function describeFaceRobust(
   const variants: Float32Array[] = [];
   let cropBox: FaceBox | null = null;
   let bestScore = det.score;
+  let engine = FACE_ENGINE_ID;
+  let metric: "cosine" | "euclidean" = "cosine";
+  let embedDim = FACE_EMBED_DIM;
 
   if (det.candidates > 1) enhancement.push(`main portrait selected from ${det.candidates} detected faces (ghost-portrait guard)`);
 
   if (crop) {
     enhancement.push(crop.scale > 1.01 ? `face crop upscaled ${crop.scale.toFixed(1)}× (high-quality interpolation)` : "face crop at native scale");
 
-    // Roll alignment: descriptors degrade fast past a few degrees of in-plane
-    // tilt, common when a document is photographed at an angle. All ensemble
-    // variants derive from the aligned base when alignment succeeds.
+    onStep?.("Aligning face (ArcFace 5-point) and embedding (MobileFaceNet)…");
     let baseCanvas = crop.canvas;
-    const aligned = await alignByEyes(crop.canvas);
-    if (aligned) {
-      baseCanvas = aligned.canvas;
-      enhancement.push(`roll-aligned ${aligned.rollDeg > 0 ? "+" : ""}${aligned.rollDeg}° via eye landmarks`);
+    // Optional roll pre-correct helps landmark stability on steep document tilts.
+    const rolled = await alignByEyes(crop.canvas);
+    if (rolled) {
+      baseCanvas = rolled.canvas;
+      enhancement.push(`roll-prealigned ${rolled.rollDeg > 0 ? "+" : ""}${rolled.rollDeg}° via eye landmarks`);
     }
 
-    onStep?.("Computing identity descriptors (ensemble)…");
-    const primary = await describeOn(baseCanvas, true);
+    const primary = await embedOnCanvas(baseCanvas, true);
     if (primary) {
       variants.push(primary.descriptor);
       cropBox = primary.box;
       bestScore = Math.max(bestScore, primary.score);
-    } else if (aligned) {
-      // Alignment can occasionally push the face outside the detector's
-      // comfort zone — fall back to the unaligned crop as primary.
-      const unaligned = await describeOn(crop.canvas, true);
-      if (unaligned) {
-        baseCanvas = crop.canvas;
-        variants.push(unaligned.descriptor);
-        cropBox = unaligned.box;
-        bestScore = Math.max(bestScore, unaligned.score);
-        enhancement.push("alignment discarded (aligned face not re-detected)");
+      engine = primary.engine;
+      metric = primary.metric;
+      embedDim = primary.embedDim;
+      enhancement.push(`MobileFaceNet ${primary.embedDim}-d ArcFace embedding`);
+    } else {
+      // MobileFaceNet failed — FaceNet legacy path on the same crop.
+      onStep?.("MobileFaceNet unavailable — FaceNet 128-d fallback…");
+      const fn = await describeOnFaceNet(baseCanvas, true);
+      if (fn) {
+        variants.push(fn.descriptor);
+        cropBox = fn.box;
+        bestScore = Math.max(bestScore, fn.score);
+        engine = fn.engine;
+        metric = fn.metric;
+        embedDim = fn.embedDim;
+        enhancement.push("FaceNet 128-d fallback embedding");
       }
     }
-    const mirrored = mirrorCanvas(baseCanvas);
-    if (mirrored) {
-      const mir = await describeOn(mirrored, false);
-      if (mir) {
-        variants.push(mir.descriptor);
-        enhancement.push("mirror variant");
+
+    if (variants.length > 0 && metric === "cosine") {
+      const mirrored = mirrorCanvas(baseCanvas);
+      if (mirrored) {
+        const mir = await embedOnCanvas(mirrored, false);
+        if (mir && mir.descriptor.length === variants[0].length) {
+          variants.push(mir.descriptor);
+          enhancement.push("mirror variant");
+        }
       }
-    }
-    const normalized = normalizeContrast(baseCanvas);
-    if (normalized) {
-      const nrm = await describeOn(normalized, false);
-      if (nrm) {
-        variants.push(nrm.descriptor);
-        enhancement.push("contrast-normalized variant (2–98 percentile stretch)");
+      const normalized = normalizeContrast(baseCanvas);
+      if (normalized) {
+        const nrm = await embedOnCanvas(normalized, false);
+        if (nrm && nrm.descriptor.length === variants[0].length) {
+          variants.push(nrm.descriptor);
+          enhancement.push("contrast-normalized variant (2–98 percentile stretch)");
+        }
       }
-    }
-    // Heavily upscaled crops are soft — an unsharp-masked variant recovers
-    // edge detail the recognition net keys on.
-    if (crop.scale > 1.8) {
-      const sharpened = sharpenCanvas(baseCanvas);
-      if (sharpened) {
-        const shp = await describeOn(sharpened, false);
-        if (shp) {
-          variants.push(shp.descriptor);
-          enhancement.push("unsharp-masked variant (soft upscaled crop)");
+      if (crop.scale > 1.8) {
+        const sharpened = sharpenCanvas(baseCanvas);
+        if (sharpened) {
+          const shp = await embedOnCanvas(sharpened, false);
+          if (shp && shp.descriptor.length === variants[0].length) {
+            variants.push(shp.descriptor);
+            enhancement.push("unsharp-masked variant (soft upscaled crop)");
+          }
+        }
+      }
+    } else if (variants.length > 0 && metric === "euclidean") {
+      // Light ensemble for FaceNet fallback only.
+      const mirrored = mirrorCanvas(baseCanvas);
+      if (mirrored) {
+        const mir = await describeOnFaceNet(mirrored, false);
+        if (mir) {
+          variants.push(mir.descriptor);
+          enhancement.push("mirror variant (FaceNet)");
         }
       }
     }
+
     if (variants.length > 0 && cropBox) {
       const quality = assessQuality(baseCanvas, cropBox, bestScore, sourceBoxWidth);
+      const fused = variants.length > 1 ? meanDescriptor(variants) : variants[0];
       return {
-        descriptor: variants.length > 1 ? meanDescriptor(variants) : variants[0],
+        descriptor: fused,
         box: inputBox,
         detectionScore: Math.round(bestScore * 100) / 100,
         quality,
         variants,
         enhancement,
         detector: det.detector,
+        engine,
+        embedDim,
+        metric,
       };
     }
   }
 
-  // Fallback: descriptor straight off the working frame (crop pipeline failed).
-  onStep?.("Computing identity descriptor (full-frame fallback)…");
-  const full = await describeOn(work.canvas, true);
+  // Fallback: embed straight off the working frame (crop pipeline failed).
+  onStep?.("Computing identity embedding (full-frame fallback)…");
+  const full = (await embedOnCanvas(work.canvas, true)) ?? (await describeOnFaceNet(work.canvas, true));
   if (!full) return null;
   const quality = assessQuality(work.canvas, full.box, full.score, sourceBoxWidth);
   return {
@@ -692,8 +816,11 @@ export async function describeFaceRobust(
     detectionScore: Math.round(full.score * 100) / 100,
     quality,
     variants: [full.descriptor],
-    enhancement: ["full-frame fallback (crop pipeline unavailable)"],
+    enhancement: ["full-frame fallback (crop pipeline unavailable)", full.engine],
     detector: det.detector,
+    engine: full.engine,
+    embedDim: full.embedDim,
+    metric: full.metric,
   };
 }
 
@@ -787,6 +914,7 @@ export async function countFaces(
   return detections.length;
 }
 
+/** Euclidean L2 distance (FaceNet legacy). */
 export function faceDistance(a: Float32Array, b: Float32Array): number {
   let acc = 0;
   for (let i = 0; i < Math.min(a.length, b.length); i++) {
@@ -798,42 +926,69 @@ export function faceDistance(a: Float32Array, b: Float32Array): number {
 
 const round3 = (v: number): number => Math.round(v * 1000) / 1000;
 
+/** FaceNet euclidean bands (legacy fallback only). */
+const FACENET_MATCH_MAX = 0.55;
+const FACENET_MISMATCH_MIN = 0.68;
+
 /**
- * Maps descriptor distance to a match outcome. Calibration follows the
- * dlib/FaceNet standard (same person typically < 0.6) adapted for the
- * document-portrait vs live-selfie case: match ≤ 0.55, mismatch ≥ 0.68,
- * in between = uncertain (request better captures rather than guessing).
- * Similarity uses a logistic curve centred on 0.6 so the percentage tracks
- * actual same-person probability instead of a linear guess.
+ * Maps distance → match outcome. Default assumes MobileFaceNet cosine distance;
+ * pass metric:"euclidean" for FaceNet legacy descriptors.
  */
-export function matchVerdict(distance: number): MatchOutcome {
+export function matchVerdict(distance: number, metric: "cosine" | "euclidean" = "cosine"): MatchOutcome {
+  if (metric === "cosine") {
+    return matchFromCosine(distance);
+  }
   const similarity = Math.round(100 / (1 + Math.exp((distance - 0.6) / 0.09)));
   const d = round3(distance);
-  if (distance <= MATCH_DISTANCE_MAX) return { verdict: "match", distance: d, similarity };
-  if (distance >= MISMATCH_DISTANCE_MIN) return { verdict: "mismatch", distance: d, similarity };
+  if (distance <= FACENET_MATCH_MAX) return { verdict: "match", distance: d, similarity };
+  if (distance >= FACENET_MISMATCH_MIN) return { verdict: "mismatch", distance: d, similarity };
   return { verdict: "uncertain", distance: d, similarity };
 }
 
+function pairDistance(a: Float32Array, b: Float32Array, metric: "cosine" | "euclidean"): number {
+  if (a.length !== b.length) {
+    // Incompatible engines — treat as maximally uncertain/far.
+    return metric === "cosine" ? 1.5 : 2;
+  }
+  return metric === "cosine" ? cosineDistance(a, b) : faceDistance(a, b);
+}
+
 /**
- * Ensemble-aware identity comparison. Distances are computed between the fused
- * descriptors AND across every variant pair; the fused verdict uses
- * min(meanDistance, medianPairwise) — noise from any single bad variant cannot
- * push a genuine pair into mismatch territory, while true mismatches stay far
- * above the threshold on every aggregate.
+ * Ensemble-aware identity comparison. Uses cosine distance for MobileFaceNet
+ * embeddings and euclidean for FaceNet fallback. Fused score =
+ * min(meanDistance, medianPairwise) so one noisy variant cannot force a mismatch.
  */
 export function compareFaceDescriptions(a: FaceDescription, b: FaceDescription): EnsembleMatch {
+  const metric: "cosine" | "euclidean" =
+    a.metric === "euclidean" || b.metric === "euclidean" || a.descriptor.length !== b.descriptor.length
+      ? a.metric === b.metric && a.metric
+        ? a.metric
+        : a.descriptor.length === 128 && b.descriptor.length === 128
+          ? "euclidean"
+          : a.descriptor.length === b.descriptor.length && a.descriptor.length >= 128
+            ? a.metric ?? b.metric ?? "cosine"
+            : "euclidean"
+      : "cosine";
+  // Prefer cosine when both are same-dim MobileFaceNet-style embeddings.
+  const useMetric: "cosine" | "euclidean" =
+    a.descriptor.length === b.descriptor.length && a.descriptor.length !== 128
+      ? "cosine"
+      : a.descriptor.length === 128 && b.descriptor.length === 128
+        ? "euclidean"
+        : metric;
+
   const va = a.variants && a.variants.length > 0 ? a.variants : [a.descriptor];
   const vb = b.variants && b.variants.length > 0 ? b.variants : [b.descriptor];
-  const meanDistance = faceDistance(a.descriptor, b.descriptor);
+  const meanDistance = pairDistance(a.descriptor, b.descriptor, useMetric);
   const pairs: number[] = [];
   for (const x of va) {
-    for (const y of vb) pairs.push(faceDistance(x, y));
+    for (const y of vb) pairs.push(pairDistance(x, y, useMetric));
   }
   pairs.sort((p, q) => p - q);
-  const bestDistance = pairs[0];
-  const medianDistance = pairs[Math.floor(pairs.length / 2)];
+  const bestDistance = pairs[0] ?? meanDistance;
+  const medianDistance = pairs[Math.floor(pairs.length / 2)] ?? meanDistance;
   const fused = Math.min(meanDistance, medianDistance);
-  const outcome = matchVerdict(fused);
+  const outcome = matchVerdict(fused, useMetric);
   return {
     ...outcome,
     meanDistance: round3(meanDistance),

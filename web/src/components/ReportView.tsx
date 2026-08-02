@@ -341,6 +341,9 @@ export default function ReportView({ report, aiVerdict, aiLoading, aiError, onRu
               {report.findings.filter((f) => f.status === "fail").length} failed ·{" "}
               {report.findings.filter((f) => f.status === "warn").length} warnings ·{" "}
               {report.findings.filter((f) => f.status === "pass").length} passed
+              {report.findings.some((f) => f.status === "info")
+                ? ` · ${report.findings.filter((f) => f.status === "info").length} info notes`
+                : ""}
             </p>
           )}
         </div>
@@ -362,11 +365,35 @@ export default function ReportView({ report, aiVerdict, aiLoading, aiError, onRu
 
       <CategoryBars report={report} />
 
-      <div className="max-h-96 space-y-1.5 overflow-y-auto rounded-xl border border-border/70 bg-black/40 p-2">
-        {report.findings.map((f) => (
-          <FindingRow key={f.id} finding={f} />
-        ))}
-      </div>
+      {(() => {
+        const scored = report.findings.filter((f) => f.status === "fail" || f.status === "warn" || f.status === "pass");
+        const notes = report.findings.filter((f) => f.status === "info");
+        return (
+          <>
+            <div className="max-h-96 space-y-1.5 overflow-y-auto rounded-xl border border-border/70 bg-black/40 p-2">
+              {scored.map((f) => (
+                <FindingRow key={f.id} finding={f} />
+              ))}
+            </div>
+            {notes.length > 0 ? (
+              <div className="space-y-1.5 rounded-xl border border-sky-500/20 bg-sky-500/5 p-2.5">
+                <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-sky-300">
+                  <Info className="h-3.5 w-3.5" />
+                  Expected browser mediation · {notes.length} note{notes.length === 1 ? "" : "s"}
+                </div>
+                <p className="text-[10.5px] leading-snug text-muted-foreground">
+                  These are normal phone-browser behaviors (stripped EXIF tags, HEIC→JPEG quirks, privacy wrappers). They never lower the score and are not risk signals.
+                </p>
+                <div className="max-h-48 space-y-1 overflow-y-auto">
+                  {notes.map((f) => (
+                    <FindingRow key={f.id} finding={f} />
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </>
+        );
+      })()}
 
       {report.ela ? (
         <div className="space-y-1.5 rounded-xl border border-border/70 bg-background/40 p-3">

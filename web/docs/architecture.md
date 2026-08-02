@@ -13,7 +13,8 @@ app tests and proves see [`coverage-report.md`](./coverage-report.md).
 - **Vite + React 19 + TypeScript (strict)**, Tailwind CSS, shadcn/ui (Radix primitives),
   `lucide-react` icons, `react-router-dom` v6, TanStack Query.
 - **Forensics/vision dependencies:** `exifreader` (EXIF/XMP/IPTC parsing),
-  `@vladmandic/face-api` (detection, landmarks, expressions, descriptors),
+  `@vladmandic/face-api` (detection, landmarks, expressions),
+  `onnxruntime-web` + bundled MobileFaceNet ONNX (ArcFace identity embeddings),
   `@zxing/browser` + `@zxing/library` (PDF417 fallback decoder).
 - Everything runs **on-device in the browser** except the optional AI verdicts and the
   vision-OCR read, which go through the Rork Toolkit proxy (`google/gemini-3.5-flash`).
@@ -112,12 +113,13 @@ renders the read-only session summary.
 | Module | Responsibility |
 |---|---|
 | `verification-templates.ts` | Template definitions, custom resolver, session result types, `computeOverall` fusion, coverage matrix, text + JSON exports — see `templates.md` |
-| `fraud-detection.ts` | Core forensic engine (`verification-hub-forensics/2.3`): findings, scoring, confidence, verdict rules, capture-path-aware metadata, telemetry, retake advice — see `detection-engine.md` |
+| `fraud-detection.ts` | Core forensic engine (`verification-hub-forensics/2.4`): findings, scoring, confidence, verdict rules, capture-path-aware metadata (trusted native/live = info-only quirks), telemetry, retake advice — see `detection-engine.md` |
 | `device-plausibility.ts` | Session device-norm: iOS/Android/desktop contradictions (GPU, recorder codecs, File System Access) — REVIEW-only |
 | `injection-guard.ts` | Capture-channel integrity: injection audit (definitive/strong/info tiers), native provenance, privacy-browser detection, virtual-camera markers |
 | `lens-enforcement.ts` | Post-capture EXIF lens/zoom policy for native captures |
 | `ai-verdict.ts` | AI vision verdicts + document OCR via the Rork Toolkit proxy (resize ladder, 2.5 MB budget, strict JSON parsing, `aiVerdictAvailable`) |
-| `face-vision.ts` | Face detection/description/matching ensemble, thresholds, quality gates, live box detection |
+| `face-vision.ts` | Face detection, ArcFace alignment orchestration, quality gates, live boxes, ensemble match |
+| `face-embedder.ts` | MobileFaceNet ONNX embedder (256-d), 5-point warp, cosine distance bands |
 | `ppg.ts` | rPPG pulse estimation (POS projection, dual BPM estimators, quality grading) + cross-feed continuity across silent and liveness legs |
 | `pixel-forensics.ts` | Screen-replay detection, noise/texture statistics, document pixel analysis, video frame extraction & temporal comparison |
 | `visual-forensics.ts` | Heat-map/chart renderers for the report visuals |

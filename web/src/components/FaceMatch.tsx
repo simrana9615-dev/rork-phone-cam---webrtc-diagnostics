@@ -229,10 +229,10 @@ export default function FaceMatch({ pushLog }: { pushLog: (level: LogLevel, mess
   return (
     <div className="space-y-3">
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Compare two faces entirely on this device (e.g. an ID portrait vs a fresh selfie). Each photo runs a multi-detector pass,
-        the face is cropped and upscaled, and an ensemble of descriptors (original, mirrored, contrast-normalized) is fused — built
-        for the hard case of a small laminated ID portrait. Models run locally; the photos never leave your phone. Quality gates
-        suppress false mismatches: bad captures trigger a retake request instead.
+        Compare two faces entirely on this device (e.g. an ID portrait vs a fresh selfie). Each photo runs ArcFace 5-point alignment
+        and a MobileFaceNet ONNX embedding (256-d), with multi-detector location and an ensemble (aligned / mirrored /
+        contrast-normalized) fused for the hard case of a small laminated ID portrait. Models run locally; photos never leave your
+        phone. Quality gates suppress false mismatches: bad captures trigger a retake request instead.
       </p>
       <div className="grid grid-cols-2 gap-2">
         <FaceSlot title="Photo 1 — Reference / ID" hint="Upload the ID portrait or reference photo" slot={slotA} busy={busy} captureUser={false} onFile={(f) => void handleFile(f, "A")} />
@@ -261,7 +261,7 @@ export default function FaceMatch({ pushLog }: { pushLog: (level: LogLevel, mess
               {outcome.verdict === "match" ? "SAME PERSON" : outcome.verdict === "mismatch" ? "DIFFERENT PERSON" : "UNCERTAIN — RETAKE"}
             </div>
             <p className="mono text-[10px] text-muted-foreground">
-              fused distance {outcome.distance} · match ≤ {MATCH_DISTANCE_MAX} · mismatch ≥ {MISMATCH_DISTANCE_MIN}
+              cosine distance {outcome.distance} · match ≤ {MATCH_DISTANCE_MAX} · mismatch ≥ {MISMATCH_DISTANCE_MIN}
             </p>
             <p className="mono text-[10px] text-muted-foreground">
               ensemble {outcome.pairsCompared} pairs · best {outcome.bestDistance} · median {outcome.medianDistance} · mean {outcome.meanDistance}

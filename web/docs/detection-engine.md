@@ -1,7 +1,7 @@
 # Detection Engine — Technical Reference
 
 The forensic core of the app (`src/lib/fraud-detection.ts`, engine stamp
-`verification-hub-forensics/2.3`) plus its supporting analyzers. This document covers the
+`verification-hub-forensics/2.4`) plus its supporting analyzers. This document covers the
 scoring model, verdict rules, every signal family, and the calibration policy that keeps
 false positives out.
 
@@ -17,9 +17,12 @@ Two principles govern every check:
    yields `needs-more-info` with concrete retake instructions, never an accusation.
 2. **Browser behaviour is not fraud.** Safari strips EXIF make/model/capture params from
    native captures; privacy browsers (DuckDuckGo, Brave, Firefox Focus) and in-app
-   WebViews legitimately wrap DOM APIs and strip metadata. All such observations are
-   capped at warn/caution weight, collapsed into a single evidence family (so a privacy
-   suite can't "corroborate itself"), and can at worst produce REVIEW — never FAIL.
+   WebViews legitimately wrap DOM APIs and strip metadata. On **trusted native** and
+   **live-frame** paths, expected mediation (thin EXIF, missing Make/Model/MakerNote/
+   optical params/thumbnail, HEIC→JPEG dimension quirks, firmware Software tags) is
+   **info-only, weight 0** — never amber risk and never a score hit. On uploads the same
+   signals stay soft-warn. Privacy wrappers collapse into one evidence family and can at
+   worst produce REVIEW — never FAIL.
 
 ## 2. Report model
 
@@ -57,7 +60,8 @@ Capture-path aware (`captureSource`: `live-frame` | `native-file` | `upload`):
   Authenticity rests on the capture-channel audit + pixel forensics, never on metadata.
 - **Native-file (trusted `<input capture>` / Capacitor)** — mobile browsers (especially
   Safari) routinely strip MakerNote, thumbnail, optical params, and sometimes Make/Model.
-  Thin EXIF becomes a soft warn/info, not a hard fail. Missing identity is info (weight 0).
+  All of that is **info weight 0** (engine 2.4). The report UI groups these under
+  "Expected browser mediation". Score and metadata category bars stay green.
 - **Upload** — full metadata expectations; thin EXIF can fail (weight 14) but metadata-only
   fails still cannot reach `manipulated` (Rule 4).
 
@@ -170,20 +174,27 @@ captions/stats; image data stays in-app.
   hardened for Australian documents. All validation math on the extracted text is local
   and deterministic (see `templates.md` §2.4).
 
-## 9. Face pipeline (`src/lib/face-vision.ts`)
+## 9. Face pipeline (`src/lib/face-vision.ts` + `src/lib/face-embedder.ts`)
+
+Agency-grade on-device stack (nothing leaves the device):
 
 - **Detectors:** SSD MobileNet V1 primary with TinyFaceDetector fallbacks
-  (`@vladmandic/face-api`, models loaded once).
-- **Enhancement:** face crop with 45% margin, upscale to ~280 px, roll alignment via
-  `alignByEyes`.
-- **Ensemble:** descriptors computed across detector/crop variants and fused
-  (`meanDescriptor`); `compareFaceDescriptions` returns best/median/mean distances.
-- **Thresholds:** match ≤ **0.55**, mismatch ≥ **0.68**, between = `uncertain`;
-  similarity mapped through a logistic curve.
-- **Quality gates:** minimum face width 72 px, brightness/sharpness checks; a mismatch
-  from a quality-failing capture is suppressed to `uncertain` (never accuse from a bad
-  photo). Ghost-portrait guard picks the dominant face (`pickMainFace`);
-  `detectFaceBoxes` powers the live multi-face overlay.
+  (`@vladmandic/face-api`, models loaded once). Used for location, 68-pt landmarks,
+  expressions (liveness), and live boxes.
+- **Alignment:** ArcFace 5-point similarity warp (eyes / nose / mouth) to a canonical
+  **112×112** template (`warpAligned112`), with optional roll pre-align and tight-box
+  crop fallback.
+- **Embedder:** **MobileFaceNet** (ArcFace-trained) via **ONNX Runtime Web**
+  (`/models/mobilefacenet.onnx`, ~800 KB) → **256-d L2-normalized** embedding.
+  FaceNet 128-d remains a silent fallback if ONNX fails to load.
+- **Ensemble:** embeddings for aligned / mirror / contrast-normalized (/ unsharp) variants
+  fused with L2 re-normalization; `compareFaceDescriptions` reports best/median/mean.
+- **Metric & thresholds (cosine distance):** match ≤ **0.42**, mismatch ≥ **0.58**,
+  between = `uncertain` (retake rather than guess). Similarity % uses a logistic curve.
+- **Quality gates:** minimum face width 72 px, brightness/sharpness/contrast/unique-levels;
+  a mismatch from a quality-failing capture is suppressed to `uncertain`. Ghost-portrait
+  guard picks the dominant face (`pickMainFace`); `detectFaceBoxes` powers the live overlay.
+- **Engine id:** `mobilefacenet-arcface/1.0` stamped on robust descriptions.
 
 ## 10. Liveness & pulse
 

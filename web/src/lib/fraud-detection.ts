@@ -14,7 +14,7 @@ import { detectPrivacyBrowser } from "./injection-guard";
 export type { ForensicVisual } from "./visual-forensics";
 
 /** Engine identifier stamped into telemetry so exported reports are traceable to detection-logic versions. */
-const FORENSIC_ENGINE = "verification-hub-forensics/2.3";
+const FORENSIC_ENGINE = "verification-hub-forensics/2.4";
 
 const CONFIDENCE_FORMULA =
   "confidence = clamp(base 25 + pixels decoded 25 + pixel forensics ran 10 + tags(\u22658: 25, \u22653: 12) + known format 8 + timestamp 7, 0, 100)";
@@ -1045,12 +1045,22 @@ export async function analyzeImageFraud(
     "Metadata",
     "Meaningful EXIF tags",
     String(meaningfulTagCount),
-    isLiveFrame ? "info" : meaningfulTagCount >= 3 ? "ok" : trustedNativeChannel ? "weak" : "strong",
+    isLiveFrame || trustedNativeChannel
+      ? "info"
+      : meaningfulTagCount >= 3
+        ? "ok"
+        : "strong",
     isLiveFrame
       ? "live-frame path — EXIF never expected"
-      : "\u22653 preferred \u00b7 browser-mediated native captures often carry a thinner set"
+      : trustedNativeChannel
+        ? "trusted native — thin EXIF is expected browser mediation (info only)"
+        : "\u22653 preferred · stripped uploads raise scrutiny"
   );
   pushMetric("Capture path", "Source", captureSource, "info", "live-frame | native-file | upload");
+
+  // Expected browser mediation (live-frame / trusted native / privacy browser) is
+  // always info weight-0 — never amber risk, never a score hit (engine 2.4).
+  const browserMediated = isLiveFrame || trustedNativeChannel;
 
   if (isLiveFrame) {
     // Canvas / WebRTC stills are re-encoded in the page — zero EXIF is the honest baseline.
@@ -1065,16 +1075,17 @@ export async function analyzeImageFraud(
   } else if (!tags || meaningfulTagCount < 3) {
     const pb = detectPrivacyBrowser();
     if (trustedNativeChannel || pb.detected) {
-      // Honest iPhone Safari / privacy-browser camera returns often arrive with thin or
-      // zero EXIF. That is a browser mediation fact, not proof of tampering.
       findings.push({
         id: "exif-presence",
         label: "Metadata presence",
-        status: "warn",
-        weight: trustedNativeChannel ? 4 : 8,
+        status: "info",
+        weight: 0,
+        category: "metadata",
+        observed: `${meaningfulTagCount} meaningful EXIF tags`,
+        expected: "Browser-mediated native captures often arrive thin or empty",
         detail: pb.detected
-          ? `Little or no EXIF (${meaningfulTagCount} tags) after a native capture in ${pb.name}. Privacy browsers and WebViews commonly strip camera metadata — recorded as a soft provenance caution, not fraud.`
-          : `Little or no EXIF (${meaningfulTagCount} tags) on a trusted native-camera return. Mobile browsers (especially Safari) often deliver a JPEG with stripped or reduced metadata even for genuine optical captures. Soft caution only — channel trust and pixel checks carry the authenticity case.`,
+          ? `Little or no EXIF (${meaningfulTagCount} tags) after a native capture in ${pb.name}. Privacy browsers and WebViews commonly strip camera metadata — expected browser mediation, not fraud. Not scored.`
+          : `Little or no EXIF (${meaningfulTagCount} tags) on a trusted native-camera return. Mobile browsers (especially Safari) often deliver a JPEG with stripped or reduced metadata even for genuine optical captures. Expected browser mediation — not scored. Channel trust and pixel checks carry authenticity.`,
       });
     } else {
       findings.push({
@@ -1108,11 +1119,12 @@ export async function analyzeImageFraud(
     findings.push({
       id: "camera-identity",
       label: "Camera make & model",
-      status: "warn",
+      status: browserMediated ? "info" : "warn",
       // Safari regularly keeps DateTime/orientation but drops Make/Model on <input capture>.
-      weight: trustedNativeChannel ? 4 : 10,
-      detail: trustedNativeChannel
-        ? "Metadata exists but camera make/model is missing. Common on browser-mediated phone captures (Safari/WebView strip identity tags) — soft caution, not proof of a fake."
+      weight: browserMediated ? 0 : 10,
+      category: "metadata",
+      detail: browserMediated
+        ? "Metadata exists but camera make/model is missing. Common on browser-mediated phone captures (Safari/WebView strip identity tags) — expected, not scored."
         : "Metadata exists but the camera make/model is missing — real camera files usually identify the device; exports and generators often do not.",
     });
   }
@@ -1132,10 +1144,11 @@ export async function analyzeImageFraud(
       findings.push({
         id: "capture-params",
         label: "Optical capture parameters",
-        status: trustedNativeChannel ? "info" : "warn",
-        weight: trustedNativeChannel ? 0 : 6,
-        detail: trustedNativeChannel
-          ? "Lens/exposure tags mostly absent after browser-mediated native capture — iOS/Android WebViews commonly strip optical EXIF while keeping the JPEG. Not scored."
+        status: browserMediated ? "info" : "warn",
+        weight: browserMediated ? 0 : 6,
+        category: "metadata",
+        detail: browserMediated
+          ? "Lens/exposure tags mostly absent after browser-mediated native capture — iOS/Android WebViews commonly strip optical EXIF while keeping the JPEG. Expected, not scored."
           : "Lens, exposure, ISO and shutter data mostly missing — typical of exported or generated images.",
       });
     }
@@ -1207,9 +1220,10 @@ export async function analyzeImageFraud(
         findings.push({
           id: "timestamp-gap",
           label: "Capture vs file-modified gap",
-          status: "warn",
-          weight: 5,
-          detail: `File was written ${Math.round(gapMs / (24 * 3600 * 1000))} days after the claimed capture — re-saved, exported, or transferred long after capture.`,
+          status: browserMediated ? "info" : "warn",
+          weight: browserMediated ? 0 : 5,
+          category: "metadata",
+          detail: `File was written ${Math.round(gapMs / (24 * 3600 * 1000))} days after the claimed capture — re-saved, exported, or transferred long after capture.${browserMediated ? " Noted on trusted path; not scored alone." : ""}`,
         });
       } else if (gapMs < -6 * 3600 * 1000) {
         // >6h file-before-capture is real inconsistency. Smaller negative gaps are often
@@ -1217,9 +1231,10 @@ export async function analyzeImageFraud(
         findings.push({
           id: "timestamp-gap",
           label: "Capture vs file-modified gap",
-          status: "warn",
-          weight: trustedNativeChannel ? 3 : 6,
-          detail: "File-modified time predates the claimed capture time by more than 6 hours — inconsistent clocks or edited metadata.",
+          status: browserMediated ? "info" : "warn",
+          weight: browserMediated ? 0 : 6,
+          category: "metadata",
+          detail: "File-modified time predates the claimed capture time by more than 6 hours — inconsistent clocks or edited metadata." + (browserMediated ? " Soft note on trusted native path (clock/TZ noise common); not scored." : ""),
         });
       } else {
         findings.push({
@@ -1235,10 +1250,11 @@ export async function analyzeImageFraud(
     findings.push({
       id: "timestamp-missing",
       label: "Capture timestamp",
-      status: trustedNativeChannel ? "info" : "warn",
-      weight: trustedNativeChannel ? 0 : 6,
-      detail: trustedNativeChannel
-        ? "No DateTimeOriginal after browser-mediated native capture — common when the WebView re-encodes the still. Freshness falls back to the file timestamp and press clock."
+      status: browserMediated ? "info" : "warn",
+      weight: browserMediated ? 0 : 6,
+      category: "metadata",
+      detail: browserMediated
+        ? "No DateTimeOriginal after browser-mediated native capture — common when the WebView re-encodes the still. Freshness falls back to the file timestamp and press clock. Not scored."
         : "No DateTimeOriginal — camera originals usually record the capture moment; exports and generators often drop it.",
     });
   }
@@ -1325,9 +1341,10 @@ export async function analyzeImageFraud(
         findings.push({
           id: "dimension-claim",
           label: "Claimed vs actual dimensions",
-          status: trustedNativeChannel ? "warn" : "fail",
-          weight: trustedNativeChannel ? 4 : 12,
-          detail: `Metadata claims ${claimedW}×${claimedH} but the actual pixels are ${actualW}×${actualH} — often a resize/re-save that kept old tags${trustedNativeChannel ? " (soft on trusted native path)" : ""}.`,
+          status: trustedNativeChannel ? "info" : "fail",
+          weight: trustedNativeChannel ? 0 : 12,
+          category: "metadata",
+          detail: `Metadata claims ${claimedW}×${claimedH} but the actual pixels are ${actualW}×${actualH} — often a resize/re-save that kept old tags${trustedNativeChannel ? ". On a trusted native return this is typically HEIC→JPEG / computational crop mediation — noted, not scored." : "."}`,
         });
       }
     }
@@ -1355,9 +1372,10 @@ export async function analyzeImageFraud(
       findings.push({
         id: "makernote",
         label: "Manufacturer maker-note block",
-        status: trustedNativeChannel ? "info" : "warn",
-        weight: trustedNativeChannel ? 0 : 5,
-        detail: trustedNativeChannel
+        status: browserMediated ? "info" : "warn",
+        weight: browserMediated ? 0 : 5,
+        category: "metadata",
+        detail: browserMediated
           ? `Claims ${make} but MakerNote is absent after browser-mediated capture. iOS/Android WebViews routinely strip the proprietary block while keeping Make/Model — expected, not scored.`
           : `Claims ${make} but the proprietary MakerNote block is gone — editors and exporters strip it; full camera originals usually include it.`,
       });
@@ -1374,9 +1392,10 @@ export async function analyzeImageFraud(
       findings.push({
         id: "thumbnail",
         label: "Embedded EXIF thumbnail",
-        status: trustedNativeChannel ? "info" : "warn",
-        weight: trustedNativeChannel ? 0 : 3,
-        detail: trustedNativeChannel
+        status: browserMediated ? "info" : "warn",
+        weight: browserMediated ? 0 : 3,
+        category: "metadata",
+        detail: browserMediated
           ? "No embedded thumbnail after browser-mediated capture — common and not scored."
           : "No embedded thumbnail — camera originals often include one; soft signal only.",
       });
@@ -1403,9 +1422,10 @@ export async function analyzeImageFraud(
     findings.push({
       id: "software-tag",
       label: "Software tag",
-      status: looksLikeFirmware ? "info" : "warn",
-      weight: looksLikeFirmware ? 0 : trustedNativeChannel ? 2 : 6,
-      detail: `Software: "${software}"${looksLikeFirmware ? " (camera firmware / OS imaging pipeline — normal)" : " — unknown processor wrote this file."}`,
+      status: looksLikeFirmware || browserMediated ? "info" : "warn",
+      weight: looksLikeFirmware || browserMediated ? 0 : 6,
+      category: "metadata",
+      detail: `Software: "${software}"${looksLikeFirmware ? " (camera firmware / OS imaging pipeline — normal)" : browserMediated ? " — noted on trusted capture path; not scored without an editor fingerprint." : " — unknown processor wrote this file."}`,
     });
   }
 

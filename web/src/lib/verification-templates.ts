@@ -221,7 +221,7 @@ export type FaceCompare = {
 
 /**
  * Quality-gated face comparison identical to the Fraud Lab Face Match logic:
- * ensemble-aware descriptor fusion (multi-detector, enhanced crop, variant
+ * MobileFaceNet ArcFace embeddings (multi-detector, 5-point align, variant
  * ensemble) with the rule that a mismatch is never asserted from low-quality
  * captures.
  */
@@ -243,7 +243,7 @@ export function compareFaces(portrait: FaceDescription, live: FaceDescription): 
   }
   const reasons =
     raw.verdict === "uncertain"
-      ? [`Similarity landed in the ambiguous band (distance ${MATCH_DISTANCE_MAX}–${MISMATCH_DISTANCE_MIN}). Retake both captures frontal, well-lit, without glasses.`, ...issues]
+      ? [`Similarity landed in the ambiguous cosine band (distance ${MATCH_DISTANCE_MAX}–${MISMATCH_DISTANCE_MIN}). Retake both captures frontal, well-lit, without glasses.`, ...issues]
       : issues;
   return { outcome: raw, gated: false, reasons };
 }
@@ -793,7 +793,7 @@ export function buildSessionReportText(
       "",
       "━━━ FACE MATCH (document portrait vs live face) ━━━",
       `Verdict: ${compare.outcome.verdict.toUpperCase()}${compare.gated ? " (mismatch suppressed by quality gates)" : ""}`,
-      `Fused descriptor distance: ${compare.outcome.distance} (match ≤${MATCH_DISTANCE_MAX} · mismatch ≥${MISMATCH_DISTANCE_MIN})`,
+      `Fused cosine distance: ${compare.outcome.distance} (match ≤${MATCH_DISTANCE_MAX} · mismatch ≥${MISMATCH_DISTANCE_MIN})`,
       ...(em.medianDistance != null
         ? [`Ensemble: ${em.pairsCompared} variant pairs · best ${em.bestDistance} · median ${em.medianDistance} · mean ${em.meanDistance}`]
         : []),

@@ -18,6 +18,10 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  // onnxruntime-web pulls Node-oriented deps; keep the browser build clean.
+  optimizeDeps: {
+    exclude: ["onnxruntime-web"],
+  },
   // Expose both VITE_* (Vite default) and EXPO_PUBLIC_* (Rork's cross-platform
   // public-env convention, written by tools like getOrCreateAuthConfig).
   envPrefix: ["VITE_", "EXPO_PUBLIC_"],
