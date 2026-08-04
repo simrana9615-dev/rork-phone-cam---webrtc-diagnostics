@@ -235,6 +235,46 @@ function TechnicalBreakdown({ telemetry }: { telemetry: ReportTelemetry }) {
         ))}
       </div>
 
+      {telemetry.checks && telemetry.checks.length > 0 ? (
+        <div className="space-y-2 rounded-lg border border-border/50 bg-black/30 p-2.5">
+          <p className="text-[11px] font-semibold text-foreground/90">
+            Check ledger — what was measured, and where each threshold came from
+          </p>
+          <p className="text-[10px] leading-snug text-muted-foreground">
+            {telemetry.calibrated
+              ? "Thresholds marked CALIBRATED were derived from genuine and fraudulent captures taken on this device."
+              : "Checks marked UNCALIBRATED are measured and shown, but contribute zero points — no threshold has been proven to separate genuine captures from fraudulent ones yet. Run calibration to enable them."}
+          </p>
+          <div className="space-y-1.5">
+            {telemetry.checks.map((c) => (
+              <div key={c.id} className="rounded border border-border/40 bg-background/30 p-1.5">
+                <div className="flex items-start gap-1.5">
+                  <span
+                    className={cn(
+                      "mono mt-px w-14 shrink-0 rounded px-1 py-0.5 text-right text-[10px] font-bold",
+                      c.penalty > 0 ? "bg-rose-500/15 text-rose-300" : c.scoring ? "bg-emerald-500/15 text-emerald-300" : "bg-sky-500/15 text-sky-300"
+                    )}
+                  >
+                    {c.penalty > 0 ? `−${c.penalty.toFixed(1)}` : c.scoring ? "0.0" : "n/s"}
+                  </span>
+                  <span className="min-w-0 flex-1 text-[10.5px] leading-snug text-foreground/90">
+                    {c.label}: <span className="mono text-foreground">{c.measured}</span>
+                  </span>
+                </div>
+                <p className="mono mt-0.5 pl-[62px] text-[10px] leading-snug text-muted-foreground">
+                  {c.threshold} · <span className="uppercase">{c.provenance}</span>
+                </p>
+                <p className="mt-0.5 pl-[62px] text-[10px] leading-snug text-muted-foreground/80">{c.provenanceNote}</p>
+              </div>
+            ))}
+          </div>
+          <p className="mono pt-0.5 text-[10px] text-muted-foreground">
+            Ledger total −{telemetry.checks.reduce((a, c) => a + c.penalty, 0).toFixed(1)} of −
+            {telemetry.scoring.totalPenalty.toFixed(1)} overall penalty · “n/s” = measured but not scored
+          </p>
+        </div>
+      ) : null}
+
       {groups.length > 0 ? (
         <div className="space-y-2 rounded-lg border border-border/50 bg-black/30 p-2.5">
           <p className="text-[11px] font-semibold text-foreground/90">Raw signal measurements vs thresholds</p>

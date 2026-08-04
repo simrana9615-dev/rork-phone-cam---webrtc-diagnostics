@@ -3,18 +3,27 @@ import ExifReader, { type Tags as ExifTags } from "exifreader";
 import {
   analyzeDocumentPixels,
   assessScreenReplay,
+  assessScreenReplayFromCanvas,
   compareFrames,
   computePixelMetrics,
-  computePixelMetricsFromCanvas,
   extractFrameCanvases,
 } from "./pixel-forensics";
 import { buildImageVisuals, buildVideoVisuals, type ForensicVisual } from "./visual-forensics";
 import { detectPrivacyBrowser } from "./injection-guard";
+import {
+  addExifProvenance,
+  scanProvenance,
+  type ProvenanceScan,
+  type ProvenanceTier,
+} from "./metadata-provenance";
+import { analyzeRefreshBanding, analyzeScreenLattice } from "./screen-lattice";
+import { calibrationOverrides } from "./calibration";
+import { describeThreshold, resolveThreshold, type ResolvedThreshold } from "./thresholds";
 
 export type { ForensicVisual } from "./visual-forensics";
 
 /** Engine identifier stamped into telemetry so exported reports are traceable to detection-logic versions. */
-const FORENSIC_ENGINE = "verification-hub-forensics/2.4";
+const FORENSIC_ENGINE = "verification-hub-forensics/2.5";
 
 const CONFIDENCE_FORMULA =
   "confidence = clamp(base 25 + pixels decoded 25 + pixel forensics ran 10 + tags(\u22658: 25, \u22653: 12) + known format 8 + timestamp 7, 0, 100)";
@@ -83,6 +92,24 @@ export type ScoreTraceEntry = {
   penalty: number;
 };
 
+/**
+ * One row of the inspectable check ledger: what was measured, the threshold it
+ * was compared against, where that threshold came from, and whether it was
+ * allowed to affect the score.
+ */
+export type CheckLedgerEntry = {
+  id: string;
+  label: string;
+  measured: string;
+  threshold: string;
+  provenance: string;
+  provenanceNote: string;
+  /** False when the check is deliberately unscored (no proven separation). */
+  scoring: boolean;
+  /** Exact points removed by the matching finding, if any. */
+  penalty: number;
+};
+
 /** Maximum-detail technical breakdown attached to every report for debugging detection logic. */
 export type ReportTelemetry = {
   engine: string;
@@ -90,6 +117,10 @@ export type ReportTelemetry = {
   confidence: { parts: { label: string; observed: string; points: number }[]; final: number; formula: string };
   verdictTrace: string[];
   metrics: MetricEntry[];
+  /** Per-criterion ledger with threshold provenance and exact point impact. */
+  checks?: CheckLedgerEntry[];
+  /** True when calibration thresholds from this device are in force. */
+  calibrated?: boolean;
 };
 
 export type MediaFraudReport = {
@@ -188,11 +219,25 @@ export function categoryOf(f: Finding): FindingCategory {
   return "metadata";
 }
 
-/** Exact points this finding removes from the 100-point authenticity score. */
+/**
+ * Exact points this finding removes from the 100-point authenticity score.
+ *
+ * This is the ONE canonical definition. Previously the score was computed from
+ * unrounded values while the report displayed rounded ones, so the deductions a
+ * user could see did not add up to the score they were shown. Everything — the
+ * category bars, the ledger and the final score — now sums these same numbers.
+ */
 export function findingImpact(f: Finding): number {
-  if (f.status === "fail") return f.weight;
+  if (f.status === "fail") return Math.round(f.weight * 10) / 10;
   if (f.status === "warn") return Math.round(f.weight * 0.4 * 10) / 10;
   return 0;
+}
+
+/** Sum of exact per-finding impacts, rounded once at the end. */
+function totalPenalty(findings: Finding[]): number {
+  let penalty = 0;
+  for (const f of findings) penalty += findingImpact(f);
+  return Math.round(penalty * 10) / 10;
 }
 
 function buildCategoryScores(findings: Finding[]): CategoryScore[] {
@@ -414,29 +459,23 @@ function computeConfidence(input: {
 
 /** Full arithmetic ledger of how findings turn into the 0\u2013100 authenticity score. */
 function buildScoreTrace(findings: Finding[]): ReportTelemetry["scoring"] {
-  const entries: ScoreTraceEntry[] = findings.map((f) => {
-    const multiplier = f.status === "fail" ? 1 : f.status === "warn" ? 0.4 : 0;
-    return {
-      id: f.id,
-      label: f.label,
-      category: categoryOf(f),
-      status: f.status,
-      weight: f.weight,
-      multiplier,
-      penalty: Math.round(f.weight * multiplier * 10) / 10,
-    };
-  });
-  let exactPenalty = 0;
-  for (const f of findings) {
-    if (f.status === "fail") exactPenalty += f.weight;
-    else if (f.status === "warn") exactPenalty += f.weight * 0.4;
-  }
+  const entries: ScoreTraceEntry[] = findings.map((f) => ({
+    id: f.id,
+    label: f.label,
+    category: categoryOf(f),
+    status: f.status,
+    weight: f.weight,
+    multiplier: f.status === "fail" ? 1 : f.status === "warn" ? 0.4 : 0,
+    penalty: findingImpact(f),
+  }));
+  const penalty = totalPenalty(findings);
   return {
     base: 100,
     entries,
-    totalPenalty: Math.round(exactPenalty * 10) / 10,
-    finalScore: Math.max(0, Math.min(100, Math.round(100 - exactPenalty))),
-    formula: "score = clamp(100 \u2212 \u03a3(weight \u00d7 multiplier), 0, 100) \u00b7 multiplier: fail = 1.0, warn = 0.4, pass/info = 0",
+    totalPenalty: penalty,
+    finalScore: Math.max(0, Math.min(100, Math.round(100 - penalty))),
+    formula:
+      "score = clamp(100 \u2212 \u03a3 penalty, 0, 100) where penalty = round(weight \u00d7 multiplier, 1dp) \u00b7 multiplier: fail = 1.0, warn = 0.4, pass/info = 0. The displayed per-finding penalties are the exact values summed here \u2014 the ledger reconciles to the score.",
   };
 }
 
@@ -636,6 +675,45 @@ function decodeImage(blob: Blob): Promise<HTMLImageElement | null> {
   });
 }
 
+/** Draws a decoded image into a capped-size canvas for measurements that tolerate downscaling. */
+function toCanvasFromImage(img: HTMLImageElement, maxEdge: number): HTMLCanvasElement | null {
+  if (!img.naturalWidth || !img.naturalHeight) return null;
+  const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(16, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(16, Math.round(img.naturalHeight * scale));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+/**
+ * Builds the inspectable check ledger: measurement, threshold, where the
+ * threshold came from, and the exact points it removed. The penalties here sum
+ * to the same total used for the score.
+ */
+function buildCheckLedger(
+  pending: { id: string; label: string; measured: string; thresholdId: string }[],
+  findings: Finding[],
+  overrides: Map<string, { warnAt: number | null; failAt: number | null; source: string }>
+): CheckLedgerEntry[] {
+  return pending.map((p) => {
+    const threshold = resolveThreshold(p.thresholdId, overrides);
+    const finding = findings.find((f) => f.id === p.id);
+    return {
+      id: p.id,
+      label: p.label,
+      measured: p.measured,
+      threshold: threshold ? describeThreshold(threshold) : "no threshold defined",
+      provenance: threshold?.provenance ?? "undefined",
+      provenanceNote: threshold ? `${threshold.provenanceNote} ${threshold.source}` : "No registry entry for this check.",
+      scoring: threshold?.scoring ?? false,
+      penalty: finding ? findingImpact(finding) : 0,
+    };
+  });
+}
+
 /**
  * Error Level Analysis: re-saves the image at a known JPEG quality and amplifies the
  * per-pixel difference. Regions edited/spliced after the original save re-compress
@@ -729,13 +807,12 @@ export async function computeEla(blob: Blob): Promise<ElaResult | null> {
   };
 }
 
+/**
+ * The authenticity score, computed from the SAME per-finding impacts the report
+ * displays. Any deduction a user can see now sums exactly to this number.
+ */
 function scoreFindings(findings: Finding[]): number {
-  let penalty = 0;
-  for (const f of findings) {
-    if (f.status === "fail") penalty += f.weight;
-    else if (f.status === "warn") penalty += f.weight * 0.4;
-  }
-  return Math.max(0, Math.min(100, Math.round(100 - penalty)));
+  return Math.max(0, Math.min(100, Math.round(100 - totalPenalty(findings))));
 }
 
 /**
@@ -826,31 +903,83 @@ function deriveVerdict(findings: Finding[], score: number, confidence: number): 
 }
 
 /**
- * Marker matcher hardened against binary false positives: the scan text is raw
- * file bytes read as ASCII, so a chance 4-byte sequence like "sora" or "x264"
- * inside compressed pixel data must not trigger an accusation. Short markers
- * (<6 chars) therefore require non-letter boundaries on both sides; long
- * markers are specific enough for plain substring search.
+ * Marker matcher for values pulled from real metadata fields.
+ *
+ * Because the haystack is now a short, structured field value rather than the
+ * whole file read as ASCII, a plain substring test is safe and precise. Short
+ * markers still require non-letter boundaries so "sora" cannot match inside
+ * "sorattino" and "gimp" cannot match inside a longer word.
  */
 function markerHit(text: string, marker: string): boolean {
-  if (marker.length >= 6) return text.includes(marker);
   if (!text.includes(marker)) return false;
+  if (marker.length >= 8) return true;
   const esc = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^a-z])${esc}(?:[^a-z]|$)`).test(text);
+  return new RegExp(`(?:^|[^a-z0-9])${esc}(?:[^a-z0-9]|$)`).test(text);
 }
 
-function markerFindings(ascii: string, kind: "image" | "video"): Finding[] {
-  const findings: Finding[] = [];
+/** Fields that produced a marker hit, so the report can quote its own evidence. */
+function citeHits(scan: ProvenanceScan, tier: ProvenanceTier, markers: { marker: string; name: string }[]): { names: string[]; citations: string[] } {
+  const names = new Set<string>();
+  const citations = new Set<string>();
+  for (const field of scan.fields) {
+    if (field.tier !== tier) continue;
+    const value = field.value.toLowerCase();
+    for (const m of markers) {
+      if (markerHit(value, m.marker)) {
+        names.add(m.name);
+        citations.add(`${field.source} → ${field.key} = "${field.value.slice(0, 120)}"`);
+      }
+    }
+  }
+  for (const generator of scan.c2paGenerators) {
+    const value = generator.toLowerCase();
+    for (const m of markers) {
+      if (markerHit(value, m.marker)) {
+        names.add(m.name);
+        citations.add(`C2PA claim generator = "${generator.slice(0, 120)}"`);
+      }
+    }
+  }
+  return { names: [...names], citations: [...citations] };
+}
 
-  const aiHits = AI_MARKERS.filter((m) => markerHit(ascii, m.marker)).map((m) => m.name);
-  const uniqueAi = [...new Set(aiHits)];
-  if (uniqueAi.length > 0) {
+/**
+ * Builds AI / editor findings from structurally scoped provenance fields.
+ *
+ * An editing accusation requires a WRITER-tier field (EXIF Software, XMP
+ * CreatorTool, xmpMM softwareAgent, IPTC Originating Program, QuickTime
+ * ©swr/©too, Matroska WritingApp, C2PA claim generator) to name the tool.
+ * Container names — the APP13 "Photoshop 3.0" IPTC block every phone writes, ICC
+ * profile names like "Adobe RGB", XMP namespace URLs — are recorded as benign
+ * structure and can never accuse.
+ */
+function markerFindings(scan: ProvenanceScan, kind: "image" | "video"): Finding[] {
+  const findings: Finding[] = [];
+  const scopeNote =
+    scan.fields.length > 0
+      ? `Scanned ${scan.fields.length} provenance field(s) across ${scan.containersParsed.join(", ")}.`
+      : `No provenance fields present (${scan.containersParsed.join(", ") || "no parsable container"}).`;
+  const benignNote =
+    scan.benignContainers.length > 0
+      ? ` Structural containers ignored by design: ${scan.benignContainers.slice(0, 4).join("; ")}.`
+      : "";
+
+  // AI generator names may appear in writer OR content fields (generators write
+  // both "CreatorTool: Midjourney" and prompt captions).
+  const aiWriter = citeHits(scan, "writer", AI_MARKERS);
+  const aiContent = citeHits(scan, "content", AI_MARKERS);
+  const aiNames = [...new Set([...aiWriter.names, ...aiContent.names])];
+  const aiCitations = [...new Set([...aiWriter.citations, ...aiContent.citations])];
+  if (aiNames.length > 0) {
     findings.push({
       id: "ai-signature",
       label: "AI-generator signature",
       status: "fail",
       weight: 35,
-      detail: `Generator name embedded in the file: ${uniqueAi.join(", ")}. This is a direct fingerprint left by the AI tool.`,
+      category: "ai",
+      observed: aiCitations.join(" · "),
+      expected: "No generator name in any metadata field",
+      detail: `A generator names itself in this file's metadata: ${aiNames.join(", ")}. Evidence: ${aiCitations.join(" · ")}. This is the tool's own signature in a provenance field, not a chance byte match.`,
     });
   } else {
     findings.push({
@@ -858,55 +987,67 @@ function markerFindings(ascii: string, kind: "image" | "video"): Finding[] {
       label: "AI-generator signature",
       status: "pass",
       weight: 0,
-      detail: "No known AI tool names (Midjourney, DALL·E, Stable Diffusion, Sora, Veo, Kling, …) found in metadata.",
+      category: "ai",
+      observed: scopeNote,
+      expected: "No generator name in any metadata field",
+      detail: `No AI tool names itself in this file's metadata fields. ${scopeNote}${benignNote}`,
     });
   }
 
-  const synthetic = SYNTHETIC_SOURCE_MARKERS.filter((m) => ascii.includes(m));
+  const synthetic = scan.digitalSourceTypes.filter((v) =>
+    SYNTHETIC_SOURCE_MARKERS.some((m) => v.toLowerCase().includes(m))
+  );
   if (synthetic.length > 0) {
     findings.push({
       id: "ai-source-type",
       label: "Declared synthetic source type",
       status: "fail",
       weight: 35,
-      detail: `IPTC DigitalSourceType declares computer-generated media (${synthetic[0]}). The file itself says it is synthetic.`,
+      category: "ai",
+      observed: synthetic.join(", "),
+      expected: "digitalSourceType absent, or a capture value such as digitalCapture",
+      detail: `The IPTC/XMP DigitalSourceType field declares computer-generated media (${synthetic[0]}). The file states its own synthetic origin — the strongest possible metadata evidence.`,
     });
   }
 
-  if (markerHit(ascii, "c2pa") || ascii.includes("contentauth") || markerHit(ascii, "jumbf")) {
-    // iOS 16+ Camera / Photos can embed Content Credentials on genuine optical
-    // captures. C2PA alone is provenance metadata, not proof of synthesis — only
-    // note it. AI generators still trip explicit ai-signature / source-type fails.
+  if (scan.hasC2pa) {
     findings.push({
       id: "ai-c2pa",
       label: "Content Credentials (C2PA) manifest",
       status: "info",
       weight: 0,
+      category: "ai",
+      observed: scan.c2paGenerators.length > 0 ? scan.c2paGenerators.join(", ") : "manifest present, generator not readable",
       detail:
-        "A C2PA/Content Credentials block is embedded. Modern phone cameras (iOS Camera/Photos) and some editors attach these to genuine photos as well as AI tools — recorded for provenance review, not scored as fraud.",
+        "A C2PA/Content Credentials manifest is embedded. Phone cameras (iOS Camera/Photos) and editors attach these to genuine photos as well as AI tools, so its presence is provenance information rather than evidence of synthesis. The generator string it names is checked against the AI signature list.",
     });
   }
 
-  if (kind === "image" && (ascii.includes('"prompt"') || ascii.includes("negative prompt") || /parameters\x00?steps:/.test(ascii))) {
+  if (kind === "image" && scan.generationParamBlocks.length > 0) {
+    const block = scan.generationParamBlocks[0];
     findings.push({
       id: "ai-parameters",
       label: "Generation parameter block",
       status: "fail",
       weight: 35,
-      detail:
-        "A Stable Diffusion / ComfyUI style parameter or prompt block is embedded in the file — prompts, steps, seeds. Unambiguous AI-generation trace.",
+      category: "ai",
+      observed: `${block.source} → ${block.key} (${block.value.length} chars)`,
+      expected: "No generation parameter chunk",
+      detail: `A dedicated generation-parameter text chunk is embedded (${block.source} → "${block.key}"), the format Stable Diffusion, ComfyUI and InvokeAI use to record prompts, steps and seeds. This chunk exists only because a generator wrote it.`,
     });
   }
 
-  const editorHits = EDITOR_MARKERS.filter((m) => markerHit(ascii, m.marker)).map((m) => m.name);
-  const uniqueEditors = [...new Set(editorHits)];
-  if (uniqueEditors.length > 0) {
+  const editors = citeHits(scan, "writer", EDITOR_MARKERS);
+  if (editors.names.length > 0) {
     findings.push({
       id: "editor-fingerprint",
       label: "Editing/export software fingerprint",
       status: "fail",
       weight: 14,
-      detail: `Processed by: ${uniqueEditors.join(", ")}. The file was re-saved after capture — not a straight-from-camera original.`,
+      category: "metadata",
+      observed: editors.citations.join(" · "),
+      expected: "The writing-software field names camera firmware, or is absent",
+      detail: `A field that records which program wrote this file names an editor: ${editors.names.join(", ")}. Evidence: ${editors.citations.join(" · ")}.`,
     });
   } else {
     findings.push({
@@ -914,7 +1055,10 @@ function markerFindings(ascii: string, kind: "image" | "video"): Finding[] {
       label: "Editing/export software fingerprint",
       status: "pass",
       weight: 0,
-      detail: "No editor or transcode tool names (Photoshop, FFmpeg, CapCut, HandBrake, …) found in the file.",
+      category: "metadata",
+      observed: scopeNote,
+      expected: "The writing-software field names camera firmware, or is absent",
+      detail: `No editor names itself in any field that records the writing program. ${scopeNote}${benignNote} Container names alone are never treated as editing evidence — genuine phone photos carry an APP13 "Photoshop 3.0" IPTC block and ICC profiles named after Adobe colour spaces.`,
     });
   }
 
@@ -959,6 +1103,13 @@ export async function analyzeImageFraud(
   const pushMetric = (group: string, name: string, value: string, state: MetricState, threshold?: string) => {
     metrics.push({ group, name, value, threshold, state });
   };
+  // Calibration derived from this device's own captures. Absent calibration,
+  // uncalibrated thresholds stay unscored rather than guessing.
+  const thresholdOverrides = calibrationOverrides();
+  const pendingChecks: { id: string; label: string; measured: string; thresholdId: string }[] = [];
+  const recordCheck = (id: string, label: string, measured: string, thresholdId: string): void => {
+    pendingChecks.push({ id, label, measured, thresholdId });
+  };
   const step = (m: string) => options?.onStep?.(m);
   const captureSource: CaptureSource =
     options?.captureSource ?? (options?.native ? "native-file" : "upload");
@@ -972,6 +1123,19 @@ export async function analyzeImageFraud(
     options.native.changeIsTrusted !== false &&
     options.native.pressIsTrusted !== false &&
     (options.native.elapsedSincePressMs == null || options.native.elapsedSincePressMs >= 300);
+  // A native-file capture is browser-mediated by definition — the file arrived
+  // through the OS camera/picker and the browser re-encoded it. Requiring the
+  // optional `native` telemetry object before granting that status was a bug:
+  // call sites that pass captureSource "native-file" without telemetry were
+  // still scored under full upload scrutiny, which is where the phantom
+  // deductions for stripped camera identity came from. Mediation is now revoked
+  // only when the channel is actively contradicted.
+  const nativeChannelContradicted =
+    isNativeFile &&
+    options?.native != null &&
+    (options.native.changeIsTrusted === false ||
+      options.native.pressIsTrusted === false ||
+      (options.native.elapsedSincePressMs != null && options.native.elapsedSincePressMs < 300));
   step(`Reading ${Math.round(blob.size / 1024)} KB \u00b7 scanning binary markers and metadata\u2026`);
   const buffer = await blob.arrayBuffer();
   const bytes = new Uint8Array(buffer);
@@ -1059,8 +1223,8 @@ export async function analyzeImageFraud(
   pushMetric("Capture path", "Source", captureSource, "info", "live-frame | native-file | upload");
 
   // Expected browser mediation (live-frame / trusted native / privacy browser) is
-  // always info weight-0 — never amber risk, never a score hit (engine 2.4).
-  const browserMediated = isLiveFrame || trustedNativeChannel;
+  // always info weight-0 — never amber risk, never a score hit (engine 2.5).
+  const browserMediated = isLiveFrame || (isNativeFile && !nativeChannelContradicted);
 
   if (isLiveFrame) {
     // Canvas / WebRTC stills are re-encoded in the page — zero EXIF is the honest baseline.
@@ -1431,7 +1595,33 @@ export async function analyzeImageFraud(
 
   findings.push(...deviceConsistencyFindings(make, model, !!options?.native));
 
-  findings.push(...markerFindings(ascii, "image"));
+  step("Reading provenance fields from container structure…");
+  const provenance = await scanProvenance(bytes);
+  if (tags) addExifProvenance(provenance, (key) => tagText(tags as ExifTags, key));
+  pushMetric(
+    "Provenance",
+    "Containers parsed",
+    provenance.containersParsed.join(" · ") || "none",
+    "info",
+    "structure-scoped: only real provenance fields are matched against tool names"
+  );
+  pushMetric(
+    "Provenance",
+    "Writer-tier fields",
+    String(provenance.fields.filter((f) => f.tier === "writer").length),
+    "info",
+    "fields naming the program that wrote the file — the only source that can prove editing"
+  );
+  if (provenance.benignContainers.length > 0) {
+    pushMetric(
+      "Provenance",
+      "Structural names ignored",
+      provenance.benignContainers.slice(0, 3).join(" · "),
+      "info",
+      'e.g. the APP13 "Photoshop 3.0" IPTC block every phone camera writes — never treated as editing evidence'
+    );
+  }
+  findings.push(...markerFindings(provenance, "image"));
 
   step("Running Error Level Analysis\u2026");
   let ela: ElaResult | undefined;
@@ -1440,30 +1630,31 @@ export async function analyzeImageFraud(
     if (elaResult) {
       ela = elaResult;
       pushMetric("ELA", "Mean re-compression diff", String(elaResult.meanDiff), "info");
+      const elaThreshold = resolveThreshold("ela.blockInconsistency", thresholdOverrides);
       pushMetric(
         "ELA",
         "Block inconsistency (\u03c3/\u03bc of block means)",
         String(elaResult.blockInconsistency),
-        elaResult.blockInconsistency > 1.9 ? "weak" : "ok",
-        ">1.9 = regional splice/edit signal"
+        "info",
+        elaThreshold ? `${describeThreshold(elaThreshold)} \u00b7 ${elaThreshold.provenanceNote}` : undefined
       );
-      if (elaResult.blockInconsistency > 1.9) {
-        findings.push({
-          id: "ela",
-          label: "Error Level Analysis",
-          status: "warn",
-          weight: 10,
-          detail: `High regional compression inconsistency (${elaResult.blockInconsistency}). Some areas were saved at a different compression level — classic splice/local-edit signal. Inspect the heat map.`,
-        });
-      } else {
-        findings.push({
-          id: "ela",
-          label: "Error Level Analysis",
-          status: "pass",
-          weight: 0,
-          detail: `Compression error levels are uniform across the frame (inconsistency ${elaResult.blockInconsistency}, mean ${elaResult.meanDiff}).`,
-        });
-      }
+      recordCheck("ela", "Regional compression inconsistency", String(elaResult.blockInconsistency), "ela.blockInconsistency");
+      const elaWarned =
+        elaThreshold?.scoring === true && elaThreshold.warnAt != null && elaResult.blockInconsistency >= elaThreshold.warnAt;
+      findings.push({
+        id: "ela",
+        label: "Error Level Analysis",
+        status: elaWarned ? "warn" : elaThreshold?.scoring ? "pass" : "info",
+        weight: elaWarned ? 10 : 0,
+        category: "pixel",
+        observed: `Block inconsistency ${elaResult.blockInconsistency} \u00b7 mean recompression diff ${elaResult.meanDiff}`,
+        expected: elaThreshold ? describeThreshold(elaThreshold) : "reference only",
+        detail: elaWarned
+          ? `Regional compression inconsistency is ${elaResult.blockInconsistency}, above the level measured on genuine captures from this device \u2014 some areas were saved at a different compression level, which is a splice or local-edit signal. Inspect the heat map.`
+          : elaThreshold?.scoring
+            ? `Compression error levels are uniform across the frame (${elaResult.blockInconsistency}), within the range measured on genuine captures.`
+            : `Measured at ${elaResult.blockInconsistency}. Not scored: this figure tracks scene content \u2014 busy texture and sharp edges raise it on completely genuine photos \u2014 so no threshold has been shown to separate edited images from clean ones. The heat map is still rendered for visual inspection.`,
+      });
     }
   } else {
     findings.push({
@@ -1500,21 +1691,44 @@ export async function analyzeImageFraud(
           detail: "Image is very small \u2014 moir\u00e9, noise and ELA checks lose reliability at this size. Provide a higher-resolution original.",
         });
       }
-      const replay = assessScreenReplay(pm);
+      // Lattice runs on the ORIGINAL image at native resolution: a display's
+      // pixel pitch is 2–8px there and is destroyed by downscaling.
+      const lattice = analyzeScreenLattice(img);
+      const bandingCanvas = toCanvasFromImage(img, 1440);
+      const banding = bandingCanvas ? analyzeRefreshBanding(bandingCanvas) : null;
+      const replay = assessScreenReplay(lattice, banding, thresholdOverrides);
+      if (lattice) {
+        pushMetric(
+          "Screen replay",
+          "Native-resolution tiles analysed",
+          `${lattice.tilesUsed} used / ${lattice.tilesRejected} rejected of 9`,
+          "info",
+          `tiles come from the ${lattice.nativeWidth}\u00d7${lattice.nativeHeight} original; flat or blown-out tiles are rejected`
+        );
+        pushMetric("Screen replay", "JPEG periods excluded", lattice.excludedPeriods, "info", "ITU-T T.81 8\u00d78 DCT block grid + 4:2:0 16px MCU");
+      }
       for (const s of replay.signals) {
-        pushMetric("Screen replay", s.label, String(s.value), s.triggered === "no" ? "ok" : s.triggered, `weak \u2265${s.threshold}`);
+        pushMetric(
+          "Screen replay",
+          s.label,
+          s.value == null ? "not measurable" : String(s.value),
+          s.triggered === "unassessable" ? "info" : s.triggered === "no" ? "ok" : s.triggered,
+          s.threshold ? `${describeThreshold(s.threshold)} \u00b7 ${s.threshold.provenanceNote}` : "no threshold defined"
+        );
+        recordCheck(s.id, s.label, s.value == null ? "not measurable" : String(s.value), s.thresholdId);
       }
       pushMetric(
         "Screen replay",
-        "Fused replay evidence",
-        `${Math.round(replay.score * 100)}% (${replay.verdict})`,
-        replay.verdict === "likely" ? "strong" : replay.verdict === "weak" ? "weak" : "ok",
-        "likely requires \u22652 strong OR 1 strong + 2 weak signals"
+        "Fused replay verdict",
+        replay.verdict,
+        replay.verdict === "likely" ? "strong" : replay.verdict === "single-signal" ? "weak" : replay.verdict === "unassessable" ? "info" : "ok",
+        "scoring requires two independent signals to agree"
       );
       const signalText = replay.signals
-        .map((s) => `${s.label}: ${s.value}${s.triggered !== "no" ? ` [${s.triggered.toUpperCase()}]` : ""}`)
+        .map((s) => `${s.label}: ${s.value ?? "n/a"}${s.triggered !== "no" && s.triggered !== "unassessable" ? ` [${s.triggered.toUpperCase()}]` : ""}`)
         .join(" \u00b7 ");
-      if (replay.verdict === "likely") {
+      const anyScoring = replay.signals.some((s) => s.threshold?.scoring === true);
+      if (replay.verdict === "likely" && anyScoring) {
         findings.push({
           id: "screen-replay",
           label: "Photo-of-a-screen detection",
@@ -1522,19 +1736,30 @@ export async function analyzeImageFraud(
           weight: 22,
           category: "screen",
           observed: signalText,
-          expected: "No periodic pixel grid, refresh banding, or concentrated panel glare",
-          detail: `Multiple independent recapture signals fired (evidence ${Math.round(replay.score * 100)}%): ${replay.signals.filter((s) => s.triggered !== "no").map((s) => s.detail).join(" ")}`,
+          expected: "No display lattice and no refresh banding",
+          detail: replay.rationale,
         });
-      } else if (replay.verdict === "weak") {
+      } else if (replay.verdict === "unassessable") {
         findings.push({
           id: "screen-replay",
           label: "Photo-of-a-screen detection",
-          status: "warn",
-          weight: 8,
+          status: "info",
+          weight: 0,
           category: "screen",
           observed: signalText,
-          expected: "No recapture signals",
-          detail: `One weak recapture cue present \u2014 not conclusive on its own (single signals also occur in genuine photos of textiles, blinds, or bright windows). ${replay.signals.filter((s) => s.triggered !== "no").map((s) => s.detail).join(" ")}`,
+          expected: "A native-resolution image large enough to resolve a display lattice",
+          detail: replay.rationale,
+        });
+      } else if (replay.verdict === "likely" || replay.verdict === "single-signal") {
+        findings.push({
+          id: "screen-replay",
+          label: "Photo-of-a-screen detection",
+          status: "info",
+          weight: 0,
+          category: "screen",
+          observed: signalText,
+          expected: "No display lattice and no refresh banding",
+          detail: replay.rationale,
         });
       } else {
         findings.push({
@@ -1544,36 +1769,27 @@ export async function analyzeImageFraud(
           weight: 0,
           category: "screen",
           observed: signalText,
-          expected: "No periodic grid, banding, or panel glare",
-          detail: "No moir\u00e9/pixel-grid periodicity, refresh banding, concentrated glare, or display color cast \u2014 no evidence this is a photographed screen.",
+          expected: "No display lattice and no refresh banding",
+          detail: `${replay.rationale} Measured at native resolution with JPEG block periods excluded, so compression and printed detail cannot masquerade as a screen.`,
         });
       }
-      if (pm.noiseStd < 0.5 && pm.flatBlockCount >= 10 && !make) {
-        findings.push({
-          id: "pixel-smooth",
-          label: "Sensor noise floor",
-          status: "warn",
-          weight: 8,
-          category: "pixel",
-          observed: `Flat-region noise ${pm.noiseStd} across ${pm.flatBlockCount} blocks`,
-          expected: "Real sensors leave measurable shot noise (>0.5) in flat regions",
-          detail: "Flat areas are unnaturally clean and no camera identity is present \u2014 consistent with AI rendering or aggressive denoising/beauty filters. Soft signal; corroboration required.",
-        });
-      } else {
-        findings.push({
-          id: "pixel-noise",
-          label: "Sensor noise floor",
-          status: "pass",
-          weight: 0,
-          category: "pixel",
-          observed: `Flat-region noise ${pm.noiseStd} (${pm.flatBlockCount} flat blocks) \u00b7 edge density ${pm.edgeDensity}`,
-          expected: "Measurable, uniform sensor noise",
-          detail:
-            pm.noiseStd < 0.5
-              ? "Flat regions are heavily denoised, but a camera identity is present \u2014 consistent with modern computational photography (night mode, HDR stacking), not synthesis."
-              : "Natural sensor noise texture present in flat regions.",
-        });
-      }
+      // Noise floor is a corroborating measurement only: night mode and HDR
+      // stacking flatten genuine captures, so it cannot accuse on its own.
+      const noiseThreshold = resolveThreshold("pixel.noiseFloor", thresholdOverrides);
+      recordCheck("pixel-noise", "Sensor noise floor", String(pm.noiseStd), "pixel.noiseFloor");
+      findings.push({
+        id: "pixel-noise",
+        label: "Sensor noise floor",
+        status: noiseThreshold?.scoring && pm.noiseStd < (noiseThreshold.warnAt ?? -1) && pm.flatBlockCount >= 10 && !make ? "warn" : "pass",
+        weight: noiseThreshold?.scoring && pm.noiseStd < (noiseThreshold.warnAt ?? -1) && pm.flatBlockCount >= 10 && !make ? 8 : 0,
+        category: "pixel",
+        observed: `Flat-region noise ${pm.noiseStd} across ${pm.flatBlockCount} flat blocks \u00b7 edge density ${pm.edgeDensity}`,
+        expected: "Measurable shot noise in flat regions",
+        detail:
+          pm.noiseStd < 0.5
+            ? `Flat regions are heavily denoised (${pm.noiseStd}). ${make ? "A camera identity is present, consistent with computational photography (night mode, HDR stacking)." : "No camera identity is present either."} ${noiseThreshold?.scoring ? "" : "This measurement is not scored: denoising by modern phone pipelines overlaps with synthetic imagery, so no threshold separates them until calibrated."}`
+            : `Natural sensor noise texture present in flat regions (${pm.noiseStd}).`,
+      });
     }
   }
 
@@ -1581,111 +1797,165 @@ export async function analyzeImageFraud(
     step("Analyzing document structure (paper, text regions, tamper)\u2026");
     const doc = img ? await analyzeDocumentPixels(blob) : null;
     if (doc) {
-      pushMetric("Document pixels", "Paper coverage", `${(doc.paperFraction * 100).toFixed(0)}%`, doc.looksLikeDocument ? "ok" : "weak", "\u226535% to qualify as a flat document");
-      pushMetric("Document pixels", "Text / background blocks", `${doc.textBlockCount} / ${doc.backgroundBlockCount}`, "info", "\u22656 of each required for the tamper ratio");
+      const loc = doc.location;
+      pushMetric(
+        "Document geometry",
+        "Document located",
+        loc.found ? "yes" : "no",
+        loc.found ? "ok" : "weak",
+        "largest rectangular object segmented from the frame border's own colour statistics"
+      );
+      if (loc.quad) {
+        pushMetric("Document geometry", "Size & rotation", `${loc.quad.widthPx}\u00d7${loc.quad.heightPx}px at ${loc.quad.angleDeg}\u00b0`, "info");
+        pushMetric(
+          "Document geometry",
+          "Frame coverage",
+          `${(loc.quad.fillFraction * 100).toFixed(0)}%`,
+          loc.quad.fillFraction >= 0.12 ? "ok" : "weak",
+          "\u226512% of the frame"
+        );
+        pushMetric(
+          "Document geometry",
+          "Rectangularity",
+          String(loc.quad.rectangularity),
+          loc.quad.rectangularity >= 0.78 ? "ok" : "weak",
+          "\u22650.78 \u2014 share of its own bounding rectangle the object fills"
+        );
+        pushMetric(
+          "Document geometry",
+          "Proportions",
+          `${loc.quad.aspect}:1${loc.matchedStandard ? ` \u2014 ${loc.matchedStandard.label}` : ""}`,
+          loc.aspectPlausible ? "ok" : "weak",
+          "1.12\u20132.10 (ISO/IEC 7810 ID-1 1.586:1, ICAO TD3 1.42:1, A4 1.414:1, \u00b125% perspective)"
+        );
+      }
+      pushMetric("Document pixels", "Analysed region", `${doc.cropWidth}\u00d7${doc.cropHeight}px ${loc.found ? "(document crop)" : "(whole frame \u2014 no document located)"}`, "info");
+      pushMetric("Document pixels", "Bright-pixel share inside document", `${(doc.brightFraction * 100).toFixed(0)}%`, "info", "descriptive only \u2014 coloured cards and dark backgrounds are normal");
+      pushMetric("Document pixels", "Text / blank blocks", `${doc.textBlockCount} / ${doc.backgroundBlockCount}`, "info", "\u22656 of each required before a tamper ratio is computed");
+      const tamperThreshold = resolveThreshold("doc.textTamperRatio", thresholdOverrides);
       pushMetric(
         "Document pixels",
-        "Text ELA tamper ratio",
-        doc.textTamperRatio != null ? `${doc.textTamperRatio}\u00d7` : "n/a",
-        doc.textTamperRatio == null ? "info" : doc.textTamperRatio > 2.6 ? "strong" : doc.textTamperRatio > 1.9 ? "weak" : "ok",
-        "warn >1.9\u00d7 \u00b7 fail >2.6\u00d7"
+        "Text vs paper compression ratio",
+        doc.textTamperRatio != null ? `${doc.textTamperRatio}\u00d7` : "not measurable",
+        doc.textTamperRatio == null ? "info" : "ok",
+        tamperThreshold ? `${describeThreshold(tamperThreshold)} \u00b7 ${tamperThreshold.provenanceNote}` : undefined
       );
-      pushMetric("Document pixels", "Background ELA uniformity", String(doc.backgroundUniformity), doc.backgroundUniformity > 9 ? "weak" : "ok", "\u22649 = untouched paper");
-      pushMetric("Document pixels", "Halftone periodicity", String(doc.halftonePeriodicity), doc.halftonePeriodicity > 0.3 ? "weak" : "ok", ">0.3 = printed-copy ink pattern");
+      recordCheck("doc-text-tamper", "Text vs paper compression", doc.textTamperRatio != null ? `${doc.textTamperRatio}\u00d7` : "not measurable", "doc.textTamperRatio");
+      const bgThreshold = resolveThreshold("doc.backgroundUniformity", thresholdOverrides);
+      pushMetric(
+        "Document pixels",
+        "Paper compression uniformity",
+        String(doc.backgroundUniformity),
+        "info",
+        bgThreshold ? `${describeThreshold(bgThreshold)} \u00b7 ${bgThreshold.provenanceNote}` : undefined
+      );
+      recordCheck("doc-background", "Paper compression uniformity", String(doc.backgroundUniformity), "doc.backgroundUniformity");
+      const halftoneThreshold = resolveThreshold("doc.halftone.prominence", thresholdOverrides);
+      pushMetric(
+        "Document pixels",
+        "Periodic ink/panel pattern",
+        doc.periodic ? `${doc.periodic.prominence}\u00d7 noise floor at ${doc.periodic.periodPx ?? "?"}px` : "not measurable",
+        "info",
+        halftoneThreshold ? `${describeThreshold(halftoneThreshold)} \u00b7 ${halftoneThreshold.provenanceNote}` : undefined
+      );
+      recordCheck("doc-halftone", "Periodic ink/panel pattern", doc.periodic ? String(doc.periodic.prominence) : "not measurable", "doc.halftone.prominence");
       pushMetric(
         "Document pixels",
         "Colorfulness (Hasler\u2013S\u00fcsstrunk)",
         String(doc.colorfulness),
-        doc.looksLikeDocument && doc.colorfulness < 6 ? "weak" : "ok",
-        "<6 = near-monochrome / photocopy cue"
+        "info",
+        "<6 = near-monochrome \u00b7 reported, never scored"
       );
     }
     if (!doc) {
       findings.push({
         id: "doc-structure",
         label: "Document structure",
-        status: "warn",
-        weight: 6,
-        detail: "Document pixel analysis unavailable \u2014 the browser could not decode this format. Export as JPEG and re-run.",
+        status: "info",
+        weight: 0,
+        category: "document",
+        detail: "The browser could not decode this format for pixel analysis (common for HEIC), so document geometry could not be measured. Metadata and channel checks still apply. Export as JPEG to enable it.",
       });
     } else {
+      const loc = doc.location;
       findings.push({
         id: "doc-structure",
         label: "Document structure",
-        status: doc.looksLikeDocument ? "pass" : "warn",
-        weight: doc.looksLikeDocument ? 0 : 8,
-        observed: `Paper coverage ${(doc.paperFraction * 100).toFixed(0)}% \u00b7 ${doc.textBlockCount} text blocks \u00b7 ${doc.backgroundBlockCount} background blocks`,
-        expected: "\u226535% bright paper background with distinct text regions",
-        detail: doc.looksLikeDocument
-          ? "Frame is dominated by a bright, uniform paper background with distinct text regions \u2014 consistent with a flat document capture."
-          : "Frame does not look like a flat document (low paper coverage). Recapture the document flat, filling most of the frame.",
+        status: loc.found ? "pass" : "warn",
+        weight: loc.found ? 0 : 8,
+        category: "document",
+        observed: loc.quad
+          ? `${loc.quad.widthPx}\u00d7${loc.quad.heightPx}px rectangle at ${loc.quad.angleDeg}\u00b0 \u00b7 ${(loc.quad.fillFraction * 100).toFixed(0)}% of frame \u00b7 ${loc.quad.aspect}:1 \u00b7 rectangularity ${loc.quad.rectangularity}`
+          : `No document-shaped object (foreground ${(loc.foregroundFraction * 100).toFixed(0)}% of frame)`,
+        expected: "A rectangular object covering \u226512% of the frame with document proportions (1.12\u20132.10:1)",
+        detail: loc.found
+          ? `${loc.reason} Text and tamper analysis was run inside this rectangle only, so the surface behind the document does not affect the result.`
+          : `${loc.reason} Reposition so the whole document is inside the frame against a contrasting surface.`,
       });
       if (doc.textTamperRatio != null) {
-        if (doc.textTamperRatio > 2.6) {
-          findings.push({
-            id: "doc-text-tamper",
-            label: "Text-region tamper analysis",
-            status: "fail",
-            weight: 20,
-            observed: `Text ELA energy ${doc.textTamperRatio}\u00d7 the background`,
-            expected: "\u22641.9\u00d7 (single-save documents compress text and paper together)",
-            detail: `Text regions carry ${doc.textTamperRatio}\u00d7 the compression error of the paper background \u2014 strong indicator that text was pasted, retyped, or re-rendered after the original save.`,
-          });
-        } else if (doc.textTamperRatio > 1.9) {
-          findings.push({
-            id: "doc-text-tamper",
-            label: "Text-region tamper analysis",
-            status: "warn",
-            weight: 10,
-            observed: `Text ELA energy ${doc.textTamperRatio}\u00d7 the background`,
-            expected: "\u22641.9\u00d7",
-            detail: `Text regions re-compress moderately differently from the paper (${doc.textTamperRatio}\u00d7). Can indicate edited text \u2014 or just heavy sharpening. Inspect the ELA heat map around suspicious fields.`,
-          });
-        } else {
-          findings.push({
-            id: "doc-text-tamper",
-            label: "Text-region tamper analysis",
-            status: "pass",
-            weight: 0,
-            observed: `Text ELA energy ${doc.textTamperRatio}\u00d7 the background`,
-            expected: "\u22641.9\u00d7",
-            detail: "Text and paper share the same compression history \u2014 no sign of pasted or retyped text.",
-          });
-        }
+        const t = resolveThreshold("doc.textTamperRatio", thresholdOverrides);
+        const failed = t?.scoring === true && t.failAt != null && doc.textTamperRatio >= t.failAt;
+        const warned = t?.scoring === true && !failed && t.warnAt != null && doc.textTamperRatio >= t.warnAt;
+        findings.push({
+          id: "doc-text-tamper",
+          label: "Text-region tamper analysis",
+          status: failed ? "fail" : warned ? "warn" : t?.scoring ? "pass" : "info",
+          weight: failed ? 20 : warned ? 10 : 0,
+          category: "document",
+          observed: `Text regions recompress ${doc.textTamperRatio}\u00d7 the blank paper, measured inside the document across ${doc.textBlockCount} text and ${doc.backgroundBlockCount} blank blocks`,
+          expected: t ? describeThreshold(t) : "reference only",
+          detail: failed || warned
+            ? `Text regions carry ${doc.textTamperRatio}\u00d7 the recompression error of the blank paper \u2014 above the level measured on genuine captures from this device. Text may have been pasted, retyped or re-rendered after the original save. Inspect the ELA heat map.`
+            : t?.scoring
+              ? `Text and paper share a consistent compression history (${doc.textTamperRatio}\u00d7), within the range measured on genuine captures.`
+              : `Measured at ${doc.textTamperRatio}\u00d7. Not scored: this ratio also rises with sharpening, JPEG quality and capture distance, and no threshold has been shown to separate genuine documents from edited ones on this device. Run calibration to enable scoring.`,
+        });
       } else {
         findings.push({
           id: "doc-text-tamper",
           label: "Text-region tamper analysis",
           status: "info",
           weight: 0,
-          detail: "Not enough text/background contrast to compare compression histories \u2014 capture the document sharper and closer.",
+          category: "document",
+          observed: `${doc.textBlockCount} text blocks / ${doc.backgroundBlockCount} blank blocks found inside the document`,
+          detail: "Not enough separable text and blank areas inside the document to compare compression histories. Capture closer and sharper if this check matters.",
         });
       }
       if (doc.backgroundBlockCount >= 6) {
+        const t = resolveThreshold("doc.backgroundUniformity", thresholdOverrides);
+        const warned = t?.scoring === true && t.warnAt != null && doc.backgroundUniformity >= t.warnAt;
         findings.push({
           id: "doc-background",
           label: "Paper background uniformity",
-          status: doc.backgroundUniformity > 9 ? "warn" : "pass",
-          weight: doc.backgroundUniformity > 9 ? 8 : 0,
-          observed: `Background ELA variation ${doc.backgroundUniformity}`,
-          expected: "\u22649 (untouched paper compresses uniformly)",
-          detail:
-            doc.backgroundUniformity > 9
-              ? "The paper background compresses inconsistently across regions \u2014 patches may have been cloned or whitened to cover content."
-              : "Paper background is uniform \u2014 no cloned/whitened patches detected.",
+          status: warned ? "warn" : t?.scoring ? "pass" : "info",
+          weight: warned ? 8 : 0,
+          category: "document",
+          observed: `Recompression spread ${doc.backgroundUniformity} across ${doc.backgroundBlockCount} blank blocks inside the document`,
+          expected: t ? describeThreshold(t) : "reference only",
+          detail: warned
+            ? "Blank areas of the document compress inconsistently \u2014 patches may have been cloned or whitened to cover content."
+            : t?.scoring
+              ? "Blank areas of the document compress uniformly \u2014 no cloned or whitened patches."
+              : `Measured at ${doc.backgroundUniformity}. Not scored: lighting gradients and lamination glare move this number as much as tampering does, so no honest threshold exists yet.`,
         });
       }
-      if (doc.halftonePeriodicity > 0.3) {
+      if (doc.periodic) {
+        const t = resolveThreshold("doc.halftone.prominence", thresholdOverrides);
+        const warned = t?.scoring === true && t.warnAt != null && doc.periodic.prominence >= t.warnAt;
         findings.push({
           id: "doc-halftone",
-          label: "Print halftone pattern",
-          status: "info",
-          weight: 0,
-          observed: `Halftone periodicity ${doc.halftonePeriodicity}`,
-          detail: "A fine periodic ink pattern suggests this is a photo/scan of a printed copy rather than an original digital document \u2014 not fraud by itself, but provenance is one generation removed.",
+          label: "Print halftone / panel pattern",
+          status: warned ? "warn" : "info",
+          weight: warned ? 6 : 0,
+          category: "document",
+          observed: `Periodic pattern ${doc.periodic.prominence}\u00d7 above the noise floor at a ${doc.periodic.periodPx ?? "?"}px period, measured at the document's native resolution`,
+          expected: t ? describeThreshold(t) : "reference only",
+          detail: warned
+            ? "A regular screening pattern inside the document indicates a photo of a printed reproduction rather than the original card \u2014 provenance is one generation removed."
+            : `A regular pattern was measured at ${doc.periodic.prominence}\u00d7 the noise floor. Not scored: print screening (133\u2013175 lpi) can land at the same period as JPEG block artefacts, and security guilloche printing on genuine cards is also periodic. Calibrate with printed copies to enable scoring.`,
         });
       }
-      if (doc.looksLikeDocument && doc.colorfulness < 6) {
+      if (loc.found && doc.colorfulness < 6) {
         findings.push({
           id: "doc-photocopy",
           label: "Photocopy / monochrome check",
@@ -1816,6 +2086,8 @@ export async function analyzeImageFraud(
       confidence: { parts: confidenceTrace.parts, final: confidence, formula: CONFIDENCE_FORMULA },
       verdictTrace: verdictTraced.steps,
       metrics,
+      checks: buildCheckLedger(pendingChecks, findings, thresholdOverrides),
+      calibrated: thresholdOverrides.size > 0,
     },
     generatedAt: new Date().toISOString(),
   };
@@ -2109,12 +2381,19 @@ function nativeMismatchFindings(
     // Still capture routinely exceeds the WebRTC video-track max (esp. iPhone).
     // Only flag absurd multiples; never hard-fail.
     if (photoPixels > ctx.deviceMaxPixels * 4) {
+      // INFO ONLY. The WebRTC video-track ceiling is unrelated to the still-image
+      // pipeline: phones routinely deliver 48MP stills from tracks that cap at
+      // 2MP video, so the "4×" multiple was an arbitrary guess with no physical
+      // basis. Recorded, never scored.
       findings.push({
         id: "native-resolution",
         label: "Resolution vs this device's camera",
-        status: "warn",
-        weight: 4,
-        detail: `Photo is ${width}×${height} (${(photoPixels / 1e6).toFixed(1)} MP) while this device's camera track reports max ~${(ctx.deviceMaxPixels / 1e6).toFixed(1)} MP via WebRTC. Native stills can exceed the video pipeline — soft signal only at extreme multiples.`,
+        status: "info",
+        weight: 0,
+        category: "device",
+        observed: `${width}×${height} (${(photoPixels / 1e6).toFixed(1)} MP) still vs ~${(ctx.deviceMaxPixels / 1e6).toFixed(1)} MP WebRTC video ceiling`,
+        expected: "Stills legitimately exceed the video-track ceiling by large factors",
+        detail: `The still is ${(photoPixels / ctx.deviceMaxPixels).toFixed(1)}× the resolution this device's camera track reports for video. That is normal — the still-image pipeline and the WebRTC video pipeline have unrelated limits, and phones commonly deliver 48MP stills from a 2MP video track. Recorded for completeness; not scored.`,
       });
     } else {
       findings.push({
@@ -2219,6 +2498,11 @@ export async function analyzeVideoFraud(
   const metrics: MetricEntry[] = [];
   const pushMetric = (group: string, name: string, value: string, state: MetricState, threshold?: string) => {
     metrics.push({ group, name, value, threshold, state });
+  };
+  const thresholdOverrides = calibrationOverrides();
+  const pendingChecks: { id: string; label: string; measured: string; thresholdId: string }[] = [];
+  const recordCheck = (id: string, label: string, measured: string, thresholdId: string): void => {
+    pendingChecks.push({ id, label, measured, thresholdId });
   };
   const step = (m: string) => options?.onStep?.(m);
   step(`Reading container structure (${Math.round(blob.size / 1024)} KB)\u2026`);
@@ -2416,9 +2700,26 @@ export async function analyzeVideoFraud(
     }
   }
 
-  findings.push(...markerFindings(scanText, "video"));
+  step("Reading provenance fields from container structure…");
+  const provenance = await scanProvenance(new Uint8Array(await blob.slice(0, Math.min(blob.size, 4 * 1024 * 1024)).arrayBuffer()));
+  pushMetric(
+    "Provenance",
+    "Containers parsed",
+    provenance.containersParsed.join(" · ") || "none",
+    "info",
+    "structure-scoped: only real provenance fields (©swr, ©too, WritingApp, XMP, C2PA) are matched against tool names"
+  );
+  findings.push(...markerFindings(provenance, "video"));
 
-  const virtualHits = [...new Set(VIRTUAL_CAM_MARKERS.filter((m) => markerHit(scanText, m.marker)).map((m) => m.name))];
+  // Virtual-camera tooling names itself in the writing-software field. Scoped the
+  // same way as editor names so compressed payload bytes cannot accuse.
+  const virtualHits = [
+    ...new Set(
+      provenance.fields
+        .filter((f) => f.tier === "writer")
+        .flatMap((f) => VIRTUAL_CAM_MARKERS.filter((m) => markerHit(f.value.toLowerCase(), m.marker)).map((m) => m.name))
+    ),
+  ];
   if (virtualHits.length > 0) {
     findings.push({
       id: "video-virtual-cam",
@@ -2501,38 +2802,38 @@ export async function analyzeVideoFraud(
         });
       }
       const mid = frames[Math.floor(frames.length / 2)];
-      const pm = computePixelMetricsFromCanvas(mid);
-      if (pm) {
-        const replay = assessScreenReplay(pm);
-        for (const s of replay.signals) {
-          pushMetric("Screen replay (mid frame)", s.label, String(s.value), s.triggered === "no" ? "ok" : s.triggered, `weak \u2265${s.threshold}`);
-        }
+      const replay = assessScreenReplayFromCanvas(mid, thresholdOverrides);
+      for (const s of replay.signals) {
         pushMetric(
           "Screen replay (mid frame)",
-          "Fused replay evidence",
-          `${Math.round(replay.score * 100)}% (${replay.verdict})`,
-          replay.verdict === "likely" ? "strong" : replay.verdict === "weak" ? "weak" : "ok",
-          "likely requires \u22652 strong OR 1 strong + 2 weak signals"
+          s.label,
+          s.value == null ? "not measurable" : String(s.value),
+          s.triggered === "unassessable" ? "info" : s.triggered === "no" ? "ok" : s.triggered,
+          s.threshold ? `${describeThreshold(s.threshold)} \u00b7 ${s.threshold.provenanceNote}` : "no threshold defined"
         );
-        const signalText = replay.signals
-          .map((s) => `${s.label}: ${s.value}${s.triggered !== "no" ? ` [${s.triggered.toUpperCase()}]` : ""}`)
-          .join(" \u00b7 ");
-        findings.push({
-          id: "video-screen-replay",
-          label: "Screen-replay detection (sampled frame)",
-          status: replay.verdict === "likely" ? "fail" : replay.verdict === "weak" ? "warn" : "pass",
-          weight: replay.verdict === "likely" ? 20 : replay.verdict === "weak" ? 8 : 0,
-          category: "screen",
-          observed: signalText,
-          expected: "No periodic grid, banding, or panel glare in frames",
-          detail:
-            replay.verdict === "likely"
-              ? `Multiple recapture signals in the sampled frame (evidence ${Math.round(replay.score * 100)}%): ${replay.signals.filter((s) => s.triggered !== "no").map((s) => s.detail).join(" ")}`
-              : replay.verdict === "weak"
-                ? "One weak recapture cue in the sampled frame \u2014 not conclusive alone."
-                : "No evidence the footage was filmed off a display.",
-        });
+        recordCheck(s.id, `${s.label} (sampled frame)`, s.value == null ? "not measurable" : String(s.value), s.thresholdId);
       }
+      pushMetric(
+        "Screen replay (mid frame)",
+        "Fused replay verdict",
+        replay.verdict,
+        replay.verdict === "likely" ? "strong" : replay.verdict === "single-signal" ? "weak" : replay.verdict === "unassessable" ? "info" : "ok",
+        "scoring requires two independent signals to agree"
+      );
+      const signalText = replay.signals
+        .map((s) => `${s.label}: ${s.value ?? "n/a"}${s.triggered !== "no" && s.triggered !== "unassessable" ? ` [${s.triggered.toUpperCase()}]` : ""}`)
+        .join(" \u00b7 ");
+      const scorable = replay.verdict === "likely" && replay.signals.some((s) => s.threshold?.scoring === true);
+      findings.push({
+        id: "video-screen-replay",
+        label: "Screen-replay detection (sampled frame)",
+        status: scorable ? "fail" : replay.verdict === "none" ? "pass" : "info",
+        weight: scorable ? 20 : 0,
+        category: "screen",
+        observed: signalText,
+        expected: "No display lattice and no refresh banding in sampled frames",
+        detail: replay.rationale,
+      });
     }
   } catch (err) {
     findings.push({
@@ -2576,6 +2877,8 @@ export async function analyzeVideoFraud(
       confidence: { parts: confidenceTrace.parts, final: confidence, formula: CONFIDENCE_FORMULA },
       verdictTrace: verdictTraced.steps,
       metrics,
+      checks: buildCheckLedger(pendingChecks, findings, thresholdOverrides),
+      calibrated: thresholdOverrides.size > 0,
     },
     generatedAt: new Date().toISOString(),
   };

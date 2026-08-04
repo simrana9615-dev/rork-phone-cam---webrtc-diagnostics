@@ -31,6 +31,7 @@ app tests and proves see [`coverage-report.md`](./coverage-report.md).
 | `/verify/:templateId` | `Verify` | Guided template flow (presets + `custom` with query params) |
 | `/advanced` | `Index` | Advanced camera & WebRTC diagnostics hub |
 | `/device-spec` | `DeviceSpec` | One-tap device camera spec battery with text + JSON export |
+| `/calibrate` | `Calibrate` | Threshold calibration: labelled genuine/screen/print captures, separation analysis, apply/export |
 | `/shared` | `SharedReport` | Read-only share-link viewer — **bypasses the phone gate** |
 | `*` | `NotFound` | Catch-all |
 
@@ -47,7 +48,15 @@ desktop.
 ### `Dashboard.tsx`
 Entry screen: two pinned EyeDeeKit hero cards (amber licence / indigo passport), the six
 verification template cards, the Custom Flow builder (doc / capture / face / pages
-pickers producing `/verify/custom?...`), and the Advanced Tools entry to `/advanced`.
+pickers producing `/verify/custom?...`), and the Advanced Tools, Device Spec and Threshold
+Calibration entries.
+
+### `Calibrate.tsx`
+Threshold calibration screen. Captures labelled samples in three classes (genuine document,
+shown on a screen, printed photocopy), measures each via `calibration-metrics.ts`, and shows
+per-metric separation between genuine and fraudulent captures with the derived thresholds.
+Metrics whose classes overlap are reported as unusable and stay unscored. Thresholds only
+take effect after **Apply thresholds**; the store plus full analysis exports as JSON.
 
 ### `IdKitFlow.tsx`
 The shared one-tap EyeDeeKit engine (variant-configured for licence or passport),
@@ -113,7 +122,13 @@ renders the read-only session summary.
 | Module | Responsibility |
 |---|---|
 | `verification-templates.ts` | Template definitions, custom resolver, session result types, `computeOverall` fusion, coverage matrix, text + JSON exports — see `templates.md` |
-| `fraud-detection.ts` | Core forensic engine (`verification-hub-forensics/2.4`): findings, scoring, confidence, verdict rules, capture-path-aware metadata (trusted native/live = info-only quirks), telemetry, retake advice — see `detection-engine.md` |
+| `fraud-detection.ts` | Core forensic engine (`verification-hub-forensics/2.5`): findings, scoring, confidence, verdict rules, capture-path-aware metadata (native/live = info-only quirks), telemetry incl. the check ledger, retake advice — see `detection-engine.md` |
+| `thresholds.ts` | Threshold registry with provenance (`browser-invariant` / `spec-defined` / `physical-limit` / `calibrated` / `uncalibrated`). Only defensible thresholds may score; `uncalibrated` ones are measured at weight 0 |
+| `calibration.ts` | Labelled sample store + per-metric separation analysis (percentile edges, gap, overlap detection) → threshold overrides, readiness, JSON export |
+| `calibration-metrics.ts` | Raw measurement extraction for the calibratable metrics (no grading, no verdict) |
+| `metadata-provenance.ts` | Structure-scoped provenance scan: JPEG segments, PNG chunks, RIFF, ISO-BMFF boxes, EBML. Returns only writer/content fields; records structural container names (APP13 `Photoshop 3.0`, ICC profiles, XMP namespaces) as benign so they can never accuse |
+| `screen-lattice.ts` | Display-lattice + refresh-banding forensics: native-resolution tiles, Hann-windowed DFT, JPEG grid exclusion, peak prominence, axis agreement |
+| `document-locate.ts` | Geometric document localization: border-statistics segmentation, morphology, connected components, convex hull, rotating-caliper min-area rect, ISO 7810 / ICAO TD3 aspect matching, deskewed crop |
 | `device-plausibility.ts` | Session device-norm: iOS/Android/desktop contradictions (GPU, recorder codecs, File System Access) — REVIEW-only |
 | `injection-guard.ts` | Capture-channel integrity: injection audit (definitive/strong/info tiers), native provenance, privacy-browser detection, virtual-camera markers |
 | `lens-enforcement.ts` | Post-capture EXIF lens/zoom policy for native captures |
@@ -121,7 +136,7 @@ renders the read-only session summary.
 | `face-vision.ts` | Face detection, ArcFace alignment orchestration, quality gates, live boxes, ensemble match |
 | `face-embedder.ts` | MobileFaceNet ONNX embedder (256-d), 5-point warp, cosine distance bands |
 | `ppg.ts` | rPPG pulse estimation (POS projection, dual BPM estimators, quality grading) + cross-feed continuity across silent and liveness legs |
-| `pixel-forensics.ts` | Screen-replay detection, noise/texture statistics, document pixel analysis, video frame extraction & temporal comparison |
+| `pixel-forensics.ts` | Screen-replay fusion (two-signal corroboration, unscored when uncalibrated/unassessable), noise/texture statistics, document pixel analysis inside the located crop, video frame extraction & temporal comparison |
 | `visual-forensics.ts` | Heat-map/chart renderers for the report visuals |
 | `mrz.ts` | ICAO 9303 MRZ parsing, check digits, date logic, zone cross-validation, confidence ledger |
 | `pdf417.ts` | PDF417 decode (BarcodeDetector → ZXing, rotation-tolerant) + AAMVA parsing + licence cross-checks |

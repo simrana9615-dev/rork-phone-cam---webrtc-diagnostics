@@ -4,20 +4,42 @@
  * Everything runs in canvas — no uploads.
  */
 
+import {
+  analyzeRefreshBanding,
+  analyzeScreenLattice,
+  type BandingResult,
+  type ScreenLatticeResult,
+} from "./screen-lattice";
+import { cropDocument, locateDocument, type DocumentLocation } from "./document-locate";
+import { resolveThreshold, type ResolvedThreshold } from "./thresholds";
+
 export type ScreenSignal = {
   id: string;
   label: string;
-  value: number;
-  threshold: number;
-  triggered: "strong" | "weak" | "no";
+  /** Raw measured value, or null when the measurement could not be taken. */
+  value: number | null;
+  /** Registry id so the report can cite where the threshold came from. */
+  thresholdId: string;
+  threshold: ResolvedThreshold | null;
+  triggered: "strong" | "weak" | "no" | "unassessable";
   detail: string;
 };
 
 export type ScreenReplayResult = {
   /** 0..1 — combined evidence that this frame shows a display being re-photographed. */
   score: number;
-  verdict: "none" | "weak" | "likely";
+  /**
+   * - `likely`        two independent signals agree → scored
+   * - `single-signal` one signal fired with no corroboration → reported, never scored
+   * - `none`          measured, nothing fired
+   * - `unassessable`  the image is too small/flat for the measurement to mean anything
+   */
+  verdict: "none" | "single-signal" | "likely" | "unassessable";
   signals: ScreenSignal[];
+  /** Why this verdict was reached, in plain language. */
+  rationale: string;
+  lattice: ScreenLatticeResult | null;
+  banding: BandingResult | null;
 };
 
 export type PixelMetrics = {
@@ -37,16 +59,23 @@ export type PixelMetrics = {
 };
 
 export type DocumentPixelAnalysis = {
-  paperFraction: number;
+  /** Geometric localization result — replaces the old bright-pixel guess. */
+  location: DocumentLocation;
+  looksLikeDocument: boolean;
+  /** Bright-pixel share INSIDE the located document. Informational only. */
+  brightFraction: number;
   textBlockCount: number;
   backgroundBlockCount: number;
   backgroundUniformity: number;
-  /** ELA energy of text regions relative to background — >2.2 suggests pasted/retyped text. */
+  /** ELA energy of text regions relative to blank paper, measured inside the document only. */
   textTamperRatio: number | null;
-  halftonePeriodicity: number;
-  /** Hasler–Süsstrunk colorfulness — near-zero means a monochrome copy (IDKit "looksLikePhotocopy" analog). */
+  /** Regular periodic pattern inside the document (print screening or a display lattice). */
+  periodic: { periodPx: number | null; prominence: number } | null;
+  /** Hasler–Süsstrunk colorfulness of the document itself. */
   colorfulness: number;
-  looksLikeDocument: boolean;
+  /** Pixel size of the crop that was actually analysed. */
+  cropWidth: number;
+  cropHeight: number;
 };
 
 export type TemporalMetrics = {
@@ -319,58 +348,112 @@ export async function computePixelMetrics(blob: Blob): Promise<PixelMetrics | nu
   return computePixelMetricsFromCanvas(canvas);
 }
 
+type Overrides = Map<string, { warnAt: number | null; failAt: number | null; source: string }>;
+
+function gradeSignal(
+  id: string,
+  label: string,
+  value: number | null,
+  thresholdId: string,
+  detail: string,
+  overrides?: Overrides
+): ScreenSignal {
+  const threshold = resolveThreshold(thresholdId, overrides);
+  if (value == null || !threshold) {
+    return { id, label, value, thresholdId, threshold, triggered: "unassessable", detail };
+  }
+  const above = threshold.direction === "above";
+  const hit = (limit: number | null): boolean =>
+    limit != null && (above ? value >= limit : value <= limit);
+  const triggered: ScreenSignal["triggered"] = hit(threshold.failAt) ? "strong" : hit(threshold.warnAt) ? "weak" : "no";
+  return { id, label, value, thresholdId, threshold, triggered, detail };
+}
+
 /**
- * Conservative screen-replay assessment. A "likely" verdict requires multiple
- * independent signals — a single weak cue never condemns a frame.
+ * Screen-replay assessment from real spectral measurements.
+ *
+ * Two independent physical signals are measured: the display's spatial lattice
+ * and its temporal refresh banding. A scoring verdict requires BOTH to agree —
+ * one signal alone is reported as an unscored observation, because a single
+ * sharp spatial frequency also occurs in fabric weave, window blinds and
+ * security printing, and banding alone occurs under fluorescent lighting.
  */
-export function assessScreenReplay(m: PixelMetrics): ScreenReplayResult {
-  const signals: ScreenSignal[] = [];
-  const push = (id: string, label: string, value: number, weakAt: number, strongAt: number, detail: string) => {
-    const triggered: ScreenSignal["triggered"] = value >= strongAt ? "strong" : value >= weakAt ? "weak" : "no";
-    signals.push({ id, label, value, threshold: weakAt, triggered, detail });
-  };
+export function assessScreenReplay(
+  lattice: ScreenLatticeResult | null,
+  banding: BandingResult | null,
+  overrides?: Overrides
+): ScreenReplayResult {
+  const latticeDetail = lattice
+    ? `Sharpest non-compression spatial peak stands ${lattice.prominence}× above the local noise floor at a period of ${lattice.x.periodPx ?? "?"}px horizontally / ${lattice.y.periodPx ?? "?"}px vertically, measured on ${lattice.tilesUsed} native-resolution tile(s) of a ${lattice.nativeWidth}×${lattice.nativeHeight} image. JPEG block periods (${lattice.excludedPeriods}) were excluded from the search.`
+    : "Image is too small or too flat at native resolution for a display lattice to be measurable — no claim made.";
+  const bandingDetail = banding
+    ? `Periodic row-brightness oscillation stands ${banding.prominence}× above the noise floor with a period of ${banding.periodRows ?? "?"} rows across ${banding.rowsAnalysed} analysed rows.`
+    : "Not enough image height to measure refresh banding — no claim made.";
 
-  push(
-    "moire-grid",
-    "Pixel-grid / moiré periodicity",
-    m.gridPeriodicity,
-    0.24,
-    0.38,
-    `High-frequency detail repeats every ~${m.gridPeriodLag ?? "?"}px (autocorrelation ${m.gridPeriodicity}). Photographed displays leave a periodic sub-pixel grid; natural scenes do not.`
-  );
-  push(
-    "banding",
-    "Refresh / brightness banding",
-    m.bandingScore,
-    0.3,
-    0.45,
-    `Horizontal luminance bands repeat every ~${m.bandingLag ?? "?"} rows (strength ${m.bandingScore}). Rolling-shutter capture of a display refresh causes this banding.`
-  );
-  const glareCombined = m.glareFraction >= 0.02 && m.glareBlobFraction >= 0.55 ? m.glareFraction : 0;
-  push(
-    "glare",
-    "Concentrated specular glare",
-    Math.round(glareCombined * 10000) / 10000,
-    0.02,
-    0.06,
-    `${(m.glareFraction * 100).toFixed(2)}% of pixels are blown out and ${(m.glareBlobFraction * 100).toFixed(0)}% of them form one blob — a reflection hotspot typical of glass screens under room light.`
-  );
-  push(
-    "cool-cast",
-    "Display color cast",
-    Math.max(0, m.coolCast),
-    10,
-    18,
-    `Blue channel exceeds red by ${m.coolCast} levels on average. Backlit LCD/OLED panels push a cool cast that camera white balance rarely removes fully.`
-  );
+  const signals: ScreenSignal[] = [
+    gradeSignal("screen-lattice", "Display pixel lattice", lattice?.prominence ?? null, "screen.lattice.prominence", latticeDetail, overrides),
+    gradeSignal("screen-banding", "Refresh banding", banding?.prominence ?? null, "screen.banding.prominence", bandingDetail, overrides),
+  ];
+  if (lattice) {
+    signals.push(
+      gradeSignal(
+        "screen-axis-agreement",
+        "Lattice axis agreement",
+        lattice.periodRatio,
+        "screen.lattice.periodRatio",
+        lattice.periodRatio != null
+          ? `Horizontal and vertical peak periods differ by a factor of ${lattice.periodRatio}. Display lattices are near-square (close to 1); incidental texture is not.`
+          : "Only one axis produced a peak, so squareness could not be tested.",
+        overrides
+      )
+    );
+  }
 
-  const strong = signals.filter((s) => s.triggered === "strong").length;
-  const weak = signals.filter((s) => s.triggered === "weak").length;
-  let verdict: ScreenReplayResult["verdict"] = "none";
-  if (strong >= 2 || (strong >= 1 && weak >= 2)) verdict = "likely";
-  else if (strong === 1 || weak >= 2) verdict = "weak";
-  const score = Math.min(1, strong * 0.45 + weak * 0.18);
-  return { score: Math.round(score * 100) / 100, verdict, signals };
+  const scoringSignals = signals.filter((s) => s.threshold?.scoring === true);
+  const primary = signals.filter((s) => s.id === "screen-lattice" || s.id === "screen-banding");
+  const firedPrimary = primary.filter((s) => s.triggered === "strong" || s.triggered === "weak");
+  const strongPrimary = primary.filter((s) => s.triggered === "strong");
+  const allUnassessable = primary.every((s) => s.triggered === "unassessable");
+
+  let verdict: ScreenReplayResult["verdict"];
+  let rationale: string;
+  if (allUnassessable) {
+    verdict = "unassessable";
+    rationale = "Neither the display lattice nor refresh banding could be measured on this image, so no screen-replay claim is made in either direction.";
+  } else if (firedPrimary.length >= 2 && strongPrimary.length >= 1) {
+    verdict = "likely";
+    rationale = `Both independent screen signals fired (${firedPrimary.map((s) => s.label).join(" + ")}), at least one strongly. A spatial lattice and a temporal refresh pattern occurring together is specific to a photographed display.`;
+  } else if (firedPrimary.length >= 1) {
+    verdict = "single-signal";
+    rationale = `Only ${firedPrimary.map((s) => s.label).join(" and ")} fired, with no corroborating second signal. One signal alone is not evidence of a screen — fabric weave, blinds, security printing and fluorescent lighting each produce one of these on genuine photos — so this is recorded without affecting the score.`;
+  } else {
+    verdict = "none";
+    rationale = "Neither the display lattice nor refresh banding fired.";
+  }
+  if (scoringSignals.length === 0 && verdict === "likely") {
+    // Thresholds still uncalibrated: report the agreement, do not score it.
+    rationale += " Thresholds for these measurements are not yet calibrated on this device, so the finding is reported without a score deduction — run calibration to enable scoring.";
+  }
+
+  const score = verdict === "likely" ? 0.9 : verdict === "single-signal" ? 0.35 : 0;
+  return { score, verdict, signals, rationale, lattice, banding };
+}
+
+/** Runs the lattice + banding measurements on a canvas and grades them. */
+export function assessScreenReplayFromCanvas(canvas: HTMLCanvasElement, overrides?: Overrides): ScreenReplayResult {
+  return assessScreenReplay(analyzeScreenLattice(canvas), analyzeRefreshBanding(canvas), overrides);
+}
+
+/** Runs the lattice + banding measurements on an original image at native resolution. */
+export async function assessScreenReplayFromBlob(blob: Blob, overrides?: Overrides): Promise<ScreenReplayResult> {
+  const img = await decodeBlob(blob);
+  if (!img) return assessScreenReplay(null, null, overrides);
+  const lattice = analyzeScreenLattice(img);
+  // Banding survives moderate downscaling (its period is tens of rows), so a
+  // capped canvas keeps memory sane on large phone photos.
+  const bandingCanvas = toCanvas(img, 1440);
+  const banding = bandingCanvas ? analyzeRefreshBanding(bandingCanvas) : null;
+  return assessScreenReplay(lattice, banding, overrides);
 }
 
 /** Per-block ELA grid used for document text-tamper localization. */
@@ -423,25 +506,37 @@ async function elaBlockGrid(canvas: HTMLCanvasElement): Promise<{ blocks: Float6
 }
 
 /**
- * Document-focused pixel analysis: separates text regions from paper background,
- * compares ELA energy between them (pasted/retyped text re-compresses differently),
- * and measures paper uniformity and print halftone periodicity.
+ * Document-focused pixel analysis.
+ *
+ * The document is first LOCATED geometrically, then every statistic is computed
+ * inside that rectangle. Previously these numbers were averaged over the entire
+ * frame, so the table, hand and background all contributed to "paper
+ * uniformity" and "text tamper" — which made the results untrustworthy in both
+ * directions.
  */
 export async function analyzeDocumentPixels(blob: Blob): Promise<DocumentPixelAnalysis | null> {
   const img = await decodeBlob(blob);
   if (!img) return null;
-  const canvas = toCanvas(img, 900);
-  if (!canvas) return null;
 
-  const g = grayData(canvas);
+  const location = locateDocument(img);
+  // Analyse the located card when found; otherwise fall back to the whole frame
+  // purely so the raw numbers still get reported (they are not scored in that case).
+  const nativeCrop =
+    location.found && location.quad ? cropDocument(img, location.quad, Math.min(location.quad.widthPx, 2400)) : null;
+  const analysisCanvas = nativeCrop
+    ? toCanvas(nativeCrop, 900)
+    : toCanvas(img, 900);
+  if (!analysisCanvas) return null;
+
+  const g = grayData(analysisCanvas);
   if (!g) return null;
-  const { lum, w, h } = g;
+  const { lum } = g;
 
-  let paperCount = 0;
-  for (let p = 0; p < lum.length; p++) if (lum[p] > 195) paperCount++;
-  const paperFraction = paperCount / lum.length;
+  let brightCount = 0;
+  for (let p = 0; p < lum.length; p++) if (lum[p] > 195) brightCount++;
+  const brightFraction = brightCount / lum.length;
 
-  const grid = await elaBlockGrid(canvas);
+  const grid = await elaBlockGrid(analysisCanvas);
   let textTamperRatio: number | null = null;
   let textBlockCount = 0;
   let backgroundBlockCount = 0;
@@ -451,45 +546,47 @@ export async function analyzeDocumentPixels(blob: Blob): Promise<DocumentPixelAn
     const edgeP70 = sortedEdges[Math.floor(sortedEdges.length * 0.7)] ?? 0;
     const textEla: number[] = [];
     const bgEla: number[] = [];
-    const bgMeans: number[] = [];
     for (let i = 0; i < grid.blocks.length; i++) {
-      if (grid.edges[i] >= Math.max(edgeP70, 8)) {
-        textEla.push(grid.blocks[i]);
-      } else if (grid.edges[i] < 4) {
-        bgEla.push(grid.blocks[i]);
-        bgMeans.push(grid.blocks[i]);
-      }
+      if (grid.edges[i] >= Math.max(edgeP70, 8)) textEla.push(grid.blocks[i]);
+      else if (grid.edges[i] < 4) bgEla.push(grid.blocks[i]);
     }
     textBlockCount = textEla.length;
     backgroundBlockCount = bgEla.length;
     if (textEla.length >= 6 && bgEla.length >= 6) {
-      const avg = (arr: number[]) => arr.reduce((a, v) => a + v, 0) / arr.length;
+      const avg = (arr: number[]): number => arr.reduce((a, v) => a + v, 0) / arr.length;
       const textAvg = avg(textEla);
       const bgAvg = avg(bgEla);
       textTamperRatio = Math.round((textAvg / (bgAvg + 0.25)) * 100) / 100;
-      const bgMean = avg(bgMeans);
-      const bgVar = bgMeans.reduce((a, v) => a + (v - bgMean) * (v - bgMean), 0) / bgMeans.length;
+      const bgMean = avg(bgEla);
+      const bgVar = bgEla.reduce((a, v) => a + (v - bgMean) * (v - bgMean), 0) / bgEla.length;
       backgroundUniformity = Math.round(Math.sqrt(bgVar) * 100) / 100;
     }
   }
 
-  const colHp = new Array<number>(w).fill(0);
-  for (let x = 1; x < w; x++) {
-    let acc = 0;
-    for (let y = 0; y < h; y++) acc += Math.abs(lum[y * w + x] - lum[y * w + x - 1]);
-    colHp[x] = acc / h;
-  }
-  const halftone = autocorrelationPeak(colHp.slice(1), 2, 10);
+  // Periodic ink/panel pattern, measured at the document's NATIVE resolution.
+  // At 900px the screening frequency of a printed copy is below Nyquist and the
+  // measurement is meaningless — which is why the old halftone number was noise.
+  const periodicSource = nativeCrop ?? img;
+  const periodicLattice = analyzeScreenLattice(periodicSource);
+  const periodic = periodicLattice
+    ? {
+        periodPx: periodicLattice.x.periodPx ?? periodicLattice.y.periodPx,
+        prominence: periodicLattice.prominence,
+      }
+    : null;
 
   return {
-    paperFraction: Math.round(paperFraction * 100) / 100,
+    location,
+    looksLikeDocument: location.found,
+    brightFraction: Math.round(brightFraction * 1000) / 1000,
     textBlockCount,
     backgroundBlockCount,
     backgroundUniformity,
     textTamperRatio,
-    halftonePeriodicity: Math.round(halftone.strength * 1000) / 1000,
+    periodic,
     colorfulness: Math.round(computeColorfulness(g) * 10) / 10,
-    looksLikeDocument: paperFraction > 0.35,
+    cropWidth: analysisCanvas.width,
+    cropHeight: analysisCanvas.height,
   };
 }
 

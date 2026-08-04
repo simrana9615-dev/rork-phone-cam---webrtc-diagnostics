@@ -362,21 +362,22 @@ export function frequencyProfileVisual(canvas: HTMLCanvasElement): ForensicVisua
     6,
     140,
     "#3ee0ff",
-    `column high-pass profile · grid autocorr ${gridPeak.strength.toFixed(3)}${gridPeak.lag != null ? ` @ lag ${gridPeak.lag}px` : ""} (weak ≥0.24 · strong ≥0.38)`
+    `column high-pass profile · shape reference only${gridPeak.lag != null ? ` · repeat at ~${gridPeak.lag}px on this preview` : ""}`
   );
   drawPanel(
     detrended,
     152,
     140,
     "#ffc23e",
-    `detrended row means · banding autocorr ${bandPeak.strength.toFixed(3)}${bandPeak.lag != null ? ` @ lag ${bandPeak.lag}rows` : ""} (weak ≥0.30 · strong ≥0.45)`
+    `detrended row means · shape reference only${bandPeak.lag != null ? ` · repeat at ~${bandPeak.lag} rows on this preview` : ""}`
   );
 
   return {
     id: "frequency-profile",
-    label: "Periodicity profiles (moiré grid + refresh banding)",
+    label: "Periodicity profiles (visual reference)",
     url: chart.toDataURL("image/png"),
-    caption: `Top (cyan): mean horizontal high-pass energy per column — a photographed display's sub-pixel grid produces a regular comb pattern with a high autocorrelation peak. Bottom (amber): detrended row brightness — rolling-shutter capture of a display refresh produces periodic horizontal bands. Flat/noisy profiles with low autocorrelation are normal for genuine scenes.`,
+    caption:
+      "Top (cyan): mean horizontal high-pass energy per column. Bottom (amber): detrended row brightness. These are VISUAL REFERENCES ONLY and carry no threshold — they are drawn on a downscaled preview, where a display lattice is below the resolvable limit. The scored screen-replay decision is made separately by the lattice measurement, which runs on native-resolution tiles with JPEG block periods excluded, and by the refresh-banding measurement. Read those numbers in the check ledger, not this chart.",
   };
 }
 

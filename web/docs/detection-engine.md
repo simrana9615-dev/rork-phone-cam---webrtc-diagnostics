@@ -1,15 +1,69 @@
 # Detection Engine — Technical Reference
 
 The forensic core of the app (`src/lib/fraud-detection.ts`, engine stamp
-`verification-hub-forensics/2.4`) plus its supporting analyzers. This document covers the
+`verification-hub-forensics/2.5`) plus its supporting analyzers. This document covers the
 scoring model, verdict rules, every signal family, and the calibration policy that keeps
 false positives out.
 
 ---
 
+## 0. Threshold provenance rule (engine 2.5)
+
+**A number may only change a score if its origin is defensible.** Every scoring threshold
+lives in `src/lib/thresholds.ts` with an explicit `provenance`:
+
+| Provenance | Meaning | Scores? |
+|---|---|---|
+| `browser-invariant` | Guaranteed by the web platform; impossible in a genuine capture | yes |
+| `spec-defined` | Fixed by ISO 7810 / ICAO 9303 / ITU-T T.81 / EXIF / IPTC | yes |
+| `physical-limit` | Hard limit of real optics or sensors | yes |
+| `calibrated` | Derived from measured captures on this device | yes |
+| `uncalibrated` | Measurable, but no proven separation yet | **no — weight 0** |
+
+`uncalibrated` checks are still measured and printed in the report with their raw values;
+they deduct nothing. `resolveThreshold()` promotes them to `calibrated` only when
+`src/lib/calibration.ts` has demonstrated separation between genuine and fraudulent
+captures. This is why a report can say “measured 7.4×, not scored” — that is the honest
+state, not an omission.
+
+### Audit buckets (2.4 → 2.5 review of every criterion)
+
+**Rebuilt** — right idea, wrong maths:
+
+| Criterion | What was wrong | Now |
+|---|---|---|
+| `editor-fingerprint` | Whole-file ASCII grep hit the APP13 `Photoshop 3.0` IPTC container that phones write → accused nearly every genuine photo (−14) | Field-scoped provenance scan (`metadata-provenance.ts`); only writer-tier fields can accuse |
+| `ai-signature`, `ai-source-type`, `ai-parameters`, `ai-c2pa` | Same raw-byte grep | Same field scoping; `DigitalSourceType` and PNG parameter chunks read structurally |
+| `screen-replay` | Autocorrelation on a 900px downscale, fired at 0.24; lattice is sub-Nyquist there and text/JPEG grid inflate it | `screen-lattice.ts`: spectral peak prominence on native-resolution tiles, JPEG 8/16px periods excluded, axis agreement, two-signal corroboration |
+| `doc-structure` | “≥35% pixels brighter than luma 195” | `document-locate.ts`: border-statistics segmentation → largest component → rotating-caliper min-area rect → rectangularity, frame fill, aspect vs ISO/ICAO standards |
+| `doc-text-tamper`, `doc-background`, `doc-halftone` | Averaged over the whole frame incl. the table | Computed inside the located, deskewed document crop only |
+| `synthetic-track`, `track-label-empty` | Missing `deviceId`/`groupId` treated as strong injection evidence | Info-only + explicit `channel-unassessable` notice |
+| `camera-identity` and peers | `browserMediated` required optional telemetry, so native captures without it were scored under upload scrutiny | Mediation granted to any `native-file` path unless actively contradicted |
+| Score arithmetic | Score summed unrounded weights while the UI showed rounded ones — deductions did not add up | Single canonical `findingImpact()`; ledger reconciles exactly |
+
+**Demoted to unscored** — measurable but no honest threshold:
+`ela` (tracks scene content), `pixel-noise` / `video-noise` (night mode and HDR stacking
+flatten genuine captures), `doc-background`, `doc-halftone`, `doc-text-tamper`,
+`adobe-app14` (non-Adobe encoders emit APP14 too), `native-resolution` (still and WebRTC
+pipelines have unrelated ceilings), `pixel-too-small` (less evidence is not fraud — it
+belongs in confidence).
+
+**Deleted** — unprovable in a browser:
+`glare` and `cool-cast` as screen-replay signals (laminated cards glare under room light;
+ambient white balance moves the blue–red delta as much as a panel does). Glare survives
+only as `doc-glare`, a capture-quality instruction, never as fraud evidence. The
+periodicity chart in `visual-forensics.ts` is now labelled a visual reference with no
+thresholds, because it is drawn on a downscale where a lattice cannot resolve.
+
+**Kept** — real measurement, defensible threshold: hard channel invariants
+(`native-event-trust`, `native-file-age`, `native-return-speed`), `capture-physical`
+(ISO/aperture/focal physical limits), `device-origin` on a claimed fresh native capture,
+container-format expectations, MRZ/PDF417 check digits, and the definitive injection
+signals (canvas-track class, orphaned `deviceId`, prototype identity, dual-path readback).
+
 ## 1. Design policy: no false accusations
 
-Two principles govern every check:
+Three principles govern every check:
 
 1. **Conservative fusion.** A hard verdict (`manipulated`, `ai-generated`, FAIL) always
    requires corroboration — at least two independent evidence families, or a signal
@@ -23,6 +77,9 @@ Two principles govern every check:
    **info-only, weight 0** — never amber risk and never a score hit. On uploads the same
    signals stay soft-warn. Privacy wrappers collapse into one evidence family and can at
    worst produce REVIEW — never FAIL.
+3. **An unprovable check scores nothing.** See §0. Where a measurement cannot separate
+   genuine from fraudulent captures, the report says so in plain language and deducts
+   zero — it never fills the gap with a guessed threshold.
 
 ## 2. Report model
 
@@ -37,8 +94,19 @@ Two principles govern every check:
 - **`categories`** — per-category score bars (metadata, pixels, channel, device, …).
 - **`visuals`** — on-device heat maps (see §7).
 - **`telemetry`** — `ReportTelemetry`: engine stamp, score ledger (`buildScoreTrace`),
-  confidence math (`computeConfidence`), verdict rule trace (`deriveVerdict` steps), and
-  every raw signal measurement (`MetricEntry` list). Fully embedded in the JSON export.
+  confidence math (`computeConfidence`), verdict rule trace (`deriveVerdict` steps),
+  every raw signal measurement (`MetricEntry` list), and the **check ledger**
+  (`CheckLedgerEntry[]`): per criterion the measured value, the threshold, its provenance
+  sentence, whether it was allowed to score, and its exact point impact. Fully embedded in
+  the JSON export.
+
+### Score arithmetic (reconciles exactly)
+
+`findingImpact(f)` is the single definition of a finding's cost: `fail` → `weight`,
+`warn` → `round(weight × 0.4, 1dp)`, `pass`/`info` → 0. `scoreFindings`,
+`buildScoreTrace`, the category bars and the check ledger all sum **these same values**,
+so the deductions a reader can see always add up to the score shown. (Before 2.5 the
+score used unrounded weights while the UI displayed rounded ones.)
 - **`retakeAdvice`** — actionable corrective instructions.
 
 ### Verdict rules (`deriveVerdict`, traced step-by-step in telemetry)
@@ -87,13 +155,51 @@ Other checks:
 
 - **ELA (error level analysis)** — per-block re-compression energy with block
   inconsistency statistic and a rendered heat map with text-region outlines.
+  **Unscored** (`ela.blockInconsistency` is `uncalibrated`): busy texture raises it on
+  genuine photos. The heat map remains for visual inspection.
 - **Noise/texture statistics** — sensor-noise residual (|Laplacian|), edge distribution,
-  colorfulness (Hasler–Süsstrunk) for photocopy/monochrome detection.
-- **Screen-replay screening** — moiré grid periodicity via `autocorrelationPeak` on
-  column/row profiles, refresh banding, specular highlight signature → document-mode
-  outcome `screen-recapture`.
+  colorfulness (Hasler–Süsstrunk). Noise floor is **unscored** — night mode and HDR
+  stacking remove shot noise from genuine captures.
+- **Screen-replay detection** (`src/lib/screen-lattice.ts`) — rebuilt in 2.5:
+  - Up to nine **native-resolution** 256×256 tiles (never a downscale — a display lattice
+    has a 2–8px period at native resolution and is destroyed below Nyquist by downscaling).
+  - 3×3 high-pass residual, Hann window, direct DFT over periods 2.4–18px.
+  - **JPEG grid excluded**: periods 16, 8, 4 and 8/3 px (ITU-T T.81 DCT blocks + 4:2:0 MCU)
+    are removed before peak selection, so compression can never be read as a screen.
+  - **Prominence** = peak power ÷ median power of the surrounding band. A ratio, so it is
+    invariant to exposure, contrast and overall texture level.
+  - **Axis agreement**: horizontal and vertical peak periods must agree within 1.35×
+    (panels are near-square; incidental texture is not).
+  - Flat, blown-out or black tiles are rejected and counted in the report.
+  - **Refresh banding** — spectral prominence of the detrended row-mean profile
+    (periods 4–80 rows), so lighting gradients contribute nothing.
+  - **Fusion**: `likely` (scored) requires **both** independent signals to fire with at
+    least one strong. One signal alone → `single-signal`, reported at weight 0. Too small
+    or too flat to measure → `unassessable`, also weight 0 — never silently “clean”.
+- **Document localization** (`src/lib/document-locate.ts`) — replaces the bright-pixel
+  guess: background model from the outer 7% frame border, colour-distance + local-texture
+  foreground mask, integral-image morphological close/open, largest 4-connected component,
+  convex hull, rotating-caliper minimum-area rectangle. Yields size, rotation,
+  rectangularity, frame fill and aspect, matched against ISO/IEC 7810 ID-1 (1.586:1),
+  ICAO TD3 (1.42:1), A4 and US Letter within 9%. `cropDocument()` deskews the rectangle so
+  all text/tamper/halftone statistics describe the document, not the surface behind it.
 - **Video temporal analysis** — sampled frame strip with inter-frame difference values;
   static-feed and loop detection.
+
+### Calibration (`src/lib/calibration.ts`, `/calibrate`)
+
+Labelled samples (`genuine` / `screen` / `print`) are measured by
+`calibration-metrics.ts`, stored in `localStorage`, and analysed per metric:
+90th/10th-percentile edges per class, gap, and normalised separation. Outcomes:
+
+- **`separates`** — thresholds are placed inside the gap (30% and 70% of it) and the check
+  becomes `calibrated` and scoring.
+- **`overlaps`** — the classes cannot be told apart; the check stays unscored permanently.
+- **`insufficient`** — fewer than 3 samples per class.
+
+Overrides apply only after the user presses **Apply thresholds**; the store and full
+separation analysis are exportable as JSON so every threshold is traceable to the captures
+that justified it.
 
 ## 5. Capture-channel integrity (`src/lib/injection-guard.ts`)
 
@@ -156,7 +262,9 @@ values.
 `buildImageVisuals` / `buildVideoVisuals` render on-device heat maps attached to every
 report: `noise-map` (sensor-noise texture), `edge-map` (detail distribution), `glare-map`
 (specular hotspots), `ela-blocks` (per-block ELA energy with text outlines),
-`frequency-profile` (moiré grid + refresh banding chart), `frame-strip` (video frames
+`frequency-profile` (column high-pass + detrended row-mean profiles — a **visual reference
+with no thresholds**, since it is drawn on a downscale where a display lattice cannot
+resolve; the scored decision comes from `screen-lattice.ts`), `frame-strip` (video frames
 with difference values). Each carries a caption with measured stats inline. Exports keep
 captions/stats; image data stays in-app.
 

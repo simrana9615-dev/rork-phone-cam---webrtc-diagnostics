@@ -5,6 +5,7 @@ import { PhoneGate } from "@/components/PhoneGate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+import Calibrate from "./pages/Calibrate";
 import Dashboard from "./pages/Dashboard";
 import DeviceSpec from "./pages/DeviceSpec";
 import IdKitFlow from "./pages/IdKitFlow";
@@ -29,6 +30,7 @@ const App = () => (
             <Route path="/verify/:templateId" element={<Verify />} />
             <Route path="/advanced" element={<Index />} />
             <Route path="/device-spec" element={<DeviceSpec />} />
+            <Route path="/calibrate" element={<Calibrate />} />
             <Route path="/shared" element={<SharedReport />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />

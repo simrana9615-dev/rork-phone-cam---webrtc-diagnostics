@@ -89,8 +89,9 @@ The `portrait: true` page is the one the face-match portrait is extracted from.
   refinement + Goertzel spectral scan over **42–180 BPM**). Quality "good" requires
   the two estimates to agree within **15 BPM** plus clear spectral SNR; minimum
   **5 s** of signal before any estimate.
-- **Screen-replay screening** (moiré/refresh banding, specular signature) and the full
-  **injection audit** (§ detection-engine.md) run on the same feed.
+- **Screen-replay screening** (native-resolution display lattice + refresh banding, both
+  required to agree before it can score) and the full **injection audit**
+  (§ detection-engine.md) run on the same feed.
 - **Multi-face detection** with live bounding boxes drawn over every detected face.
 - The best identity frame is captured for the face match.
 - Verdicts: `live` / `not-live` / `inconclusive`. `not-live` requires multiple

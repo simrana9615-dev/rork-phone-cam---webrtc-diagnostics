@@ -615,36 +615,62 @@ export async function auditStreamAuthenticity(stream: MediaStream): Promise<Inje
       : "The active track's device identity is consistent with the OS device list.",
   });
 
-  // Strong: synthetic track shape (canvas.captureStream / constructed MediaStream).
+  // INFO ONLY — absence of device identity is NOT evidence of injection.
+  //
+  // This used to be a "strong" signal, which produced a false "Synthetic track
+  // shape" accusation on genuine sessions. Legitimate environments routinely
+  // expose no deviceId/groupId: remote/streamed browsers and cloud device farms,
+  // in-app WebViews, privacy browsers that blank device identity as an
+  // anti-fingerprinting feature, and some Android WebView camera paths. Since a
+  // real camera and an injected canvas can look identical here, the measurement
+  // is recorded and never scored. Injection is proven instead by the definitive
+  // checks: a literal CanvasCaptureMediaStreamTrack class, an orphaned deviceId,
+  // a forged prototype chain, or a dual-path frame-readback mismatch.
   const synthetic = deviceId === "" && groupId === "";
   const capsEmpty = !("deviceId" in caps) && !("groupId" in caps);
   signals.push({
     id: "synthetic-track",
-    label: "Synthetic track shape",
-    severity: "strong",
+    label: "Device identity fields on the track",
+    severity: "info",
     triggered: synthetic,
     observed: synthetic
       ? `getSettings(): no deviceId, no groupId · getCapabilities(): ${capsEmpty ? "no device identity either" : "partial"} · label "${label || "(empty)"}"`
-      : `deviceId ${deviceId ? "present" : "absent"} · groupId ${groupId ? "present" : "absent"}`,
-    expected: "Real camera tracks always expose deviceId + groupId after permission is granted",
+      : `deviceId ${deviceId ? "present" : "absent"} · groupId ${groupId ? "present" : "absent"} · label "${label || "(empty)"}"`,
+    expected: "Present on most hardware cameras; legitimately absent in remote, wrapped and privacy browsers",
     detail: synthetic
-      ? "This track carries no device identity at all — exactly the shape of canvas.captureStream() or a constructed MediaStream, which is how JS injection delivers fake video. (Browser test flags can also produce identity-less fake devices, so this is corroborating rather than standalone proof.)"
-      : "The track exposes the device identity fields a real camera produces.",
+      ? "This track exposes no device identity. That is the shape of a script-constructed stream — but it is equally the shape of a remote/streamed browser, a cloud device farm, an in-app WebView, and privacy browsers that blank device identity on purpose. Because genuine and injected sessions are indistinguishable on this field alone, it is recorded as context and contributes nothing to the score."
+      : "The track exposes the device identity fields a hardware camera normally provides.",
   });
 
-  // Strong: empty label after an active grant.
+  // INFO ONLY — same reasoning as above; an empty label is a privacy/remote-browser
+  // trait, not proof of a constructed stream.
   signals.push({
     id: "track-label-empty",
     label: "OS device label",
-    severity: "strong",
+    severity: "info",
     triggered: label === "",
     observed: label === "" ? "(empty)" : label,
-    expected: "A non-empty OS-provided device name while capture is active",
+    expected: "Usually an OS-provided device name; legitimately blank in privacy and remote browsers",
     detail:
       label === ""
-        ? "While a capture is active the browser exposes the OS device name. An empty label on a live 'camera' track is characteristic of script-constructed streams."
+        ? "No OS device name is exposed. Privacy browsers blank this deliberately and remote/virtualised browsers often have nothing to report, so an empty label is recorded as context only and never scored."
         : "The track carries an OS-provided device name.",
   });
+
+  // When the environment cannot expose device identity at all, say so plainly
+  // instead of letting the reader infer injection from the observations above.
+  const pb = detectPrivacyBrowser();
+  if (synthetic || label === "") {
+    signals.push({
+      id: "channel-unassessable",
+      label: "Capture-channel integrity cannot be assessed in this environment",
+      severity: "info",
+      triggered: true,
+      observed: `${pb.detected ? `${pb.name} · ` : ""}deviceId ${deviceId ? "present" : "absent"} · groupId ${groupId ? "present" : "absent"} · label "${label || "(empty)"}"`,
+      expected: "A standard browser on the capture device, where device identity is observable",
+      detail: `This session does not expose the camera's device identity${pb.detected ? ` (${pb.name})` : " — typical of a preview, remote/streamed or wrapped browser"}, so the checks that anchor a video feed to real hardware have nothing to read. Capture-channel integrity is therefore UNKNOWN here, not failed: nothing is deducted, and no injection is implied. To obtain an assessable channel, run the capture in Safari or Chrome directly on the phone.`,
+    });
+  }
 
   // Strong: virtual-camera tooling self-identification.
   const lowerLabel = label.toLowerCase();
@@ -875,8 +901,11 @@ const SIGNAL_GROUPS: Record<string, string> = {
   "api-date-now": "wrapped-api",
   "hooked-pipeline-live": "wrapped-api",
   "track-missing": "stream-identity",
-  "synthetic-track": "stream-identity",
-  "track-label-empty": "stream-identity",
+  // synthetic-track / track-label-empty are info-only (see auditStreamAuthenticity):
+  // they are grouped for display but can never contribute score or corroboration.
+  "synthetic-track": "device-identity-context",
+  "track-label-empty": "device-identity-context",
+  "channel-unassessable": "device-identity-context",
   "track-instanceof": "stream-identity",
   "canvas-capture-track": "stream-identity",
   "res-consistency": "stream-identity",

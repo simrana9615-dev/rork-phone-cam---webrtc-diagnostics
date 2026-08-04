@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   CreditCard,
+  FlaskConical,
   Gauge,
   HeartPulse,
   MonitorSmartphone,
@@ -296,6 +297,23 @@ export default function Dashboard() {
             <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
               One-tap full spec test of this phone's cameras: every lens probed at max capability, 19 constraint patterns per
               facing, measured fps, codec matrix — exports as text + JSON.
+            </p>
+          </div>
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+        </Link>
+
+        <Link
+          to="/calibrate"
+          className="flex w-full items-center gap-3 rounded-2xl border border-border/70 bg-card p-3.5 text-left transition-all hover:border-emerald-400/50 active:scale-[0.985]"
+        >
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-emerald-500/40 bg-emerald-500/15 text-emerald-300">
+            <FlaskConical className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-[13.5px] font-semibold leading-tight">Threshold Calibration</div>
+            <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+              Several checks are measured but unscored until proven on this camera. Capture a few genuine documents and a few
+              shown on a screen; the app finds where they actually separate and only then lets those checks affect a score.
             </p>
           </div>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />

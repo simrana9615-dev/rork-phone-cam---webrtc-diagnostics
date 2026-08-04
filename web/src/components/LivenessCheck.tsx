@@ -14,7 +14,7 @@ import {
   type FaceDescription,
 } from "@/lib/face-vision";
 import { estimatePulse, sampleForeheadRgb, type PpgSample, type PulseEstimate } from "@/lib/ppg";
-import { assessScreenReplay, computePixelMetricsFromCanvas } from "@/lib/pixel-forensics";
+import { assessScreenReplayFromCanvas } from "@/lib/pixel-forensics";
 import { injectionFindings, runInjectionAudit, type InjectionAuditResult } from "@/lib/injection-guard";
 import type { Finding } from "@/lib/fraud-detection";
 import { FindingRow } from "@/components/ReportView";
@@ -196,7 +196,7 @@ export default function LivenessCheck({
   const maxFacesRef = useRef<number>(0);
   const resultRef = useRef<{
     baselineAvg: number;
-    screenReplay: ReturnType<typeof assessScreenReplay> | null;
+    screenReplay: ReturnType<typeof assessScreenReplayFromCanvas> | null;
     virtualLabels: string[];
     trackLabel: string;
     heldFrameChecked: boolean;
@@ -487,20 +487,18 @@ export default function LivenessCheck({
 
     if (r.screenReplay) {
       const sr = r.screenReplay;
+      const scorable = sr.verdict === "likely" && sr.signals.some((s) => s.threshold?.scoring === true);
       out.push({
         id: "screen-replay",
         label: "Screen-replay scan of the live feed",
-        status: sr.verdict === "likely" ? "fail" : sr.verdict === "weak" ? "warn" : "pass",
-        weight: sr.verdict === "likely" ? 25 : sr.verdict === "weak" ? 8 : 0,
+        status: scorable ? "fail" : sr.verdict === "none" ? "pass" : "info",
+        weight: scorable ? 25 : 0,
         category: "screen",
-        observed: sr.signals.map((s) => `${s.label}: ${s.value}${s.triggered !== "no" ? ` [${s.triggered.toUpperCase()}]` : ""}`).join(" · "),
-        expected: "No moiré grid, refresh banding, or panel glare in the live frame",
-        detail:
-          sr.verdict === "likely"
-            ? "Multiple recapture signals in the live frame — the camera appears to be pointed at a display."
-            : sr.verdict === "weak"
-              ? "One weak recapture cue — not conclusive alone."
-              : "No evidence the camera is filming a screen.",
+        observed: sr.signals
+          .map((s) => `${s.label}: ${s.value ?? "n/a"}${s.triggered !== "no" && s.triggered !== "unassessable" ? ` [${s.triggered.toUpperCase()}]` : ""}`)
+          .join(" · "),
+        expected: "No display lattice and no refresh banding in the live frame",
+        detail: sr.rationale,
       });
     }
 
@@ -850,11 +848,12 @@ export default function LivenessCheck({
                 const ctx = snap.getContext("2d", { willReadFrequently: true });
                 if (ctx) {
                   ctx.drawImage(vid, 0, 0, snap.width, snap.height);
-                  const pm = computePixelMetricsFromCanvas(snap);
-                  if (pm) {
-                    resultRef.current.screenReplay = assessScreenReplay(pm);
-                    pushLog("debug", `Liveness: live-frame screen scan → ${resultRef.current.screenReplay.verdict} (grid ${pm.gridPeriodicity}, banding ${pm.bandingScore}, glare ${pm.glareFraction})`);
-                  }
+                  const replay = assessScreenReplayFromCanvas(snap);
+                  resultRef.current.screenReplay = replay;
+                  pushLog(
+                    "debug",
+                    `Liveness: live-frame screen scan → ${replay.verdict} (lattice ${replay.lattice?.prominence ?? "n/a"}×, banding ${replay.banding?.prominence ?? "n/a"}×)`
+                  );
                 }
               }
               // Adaptive hold: finish the moment the pulse locks ("good") after
