@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronRight,
   ClipboardCopy,
+  FileArchive,
   FileDown,
   FileJson,
   Fingerprint,
@@ -36,6 +37,8 @@ import CaptureLedgerSection from "@/components/verify/CaptureLedgerSection";
 import { buildLedgerJsonObject, buildLedgerText, ledgerReset } from "@/lib/capture-ledger";
 import LivenessCheck, { type LivenessSessionResult } from "@/components/LivenessCheck";
 import ReportView, { FindingRow, ScoreRing, VERDICT_CHIP } from "@/components/ReportView";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput, PackMediaItem } from "@/lib/evidence-pack";
 import DocDataPanel from "@/components/DocDataPanel";
 import DocConfidenceBadge from "@/components/DocConfidenceBadge";
 import { downloadBlob, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
@@ -707,6 +710,117 @@ export default function Verify() {
     base.captureFeedLedger = buildLedgerJsonObject();
     return JSON.stringify(base, null, 2);
   }, [aiVerdicts, compare, faceResult, orderedPages, overall, template]);
+
+  /**
+   * Assembles the downloadable evidence pack: originals byte-for-byte, every
+   * derived render, per-file metadata re-read from the archived bytes, the full
+   * session log + capture ledger, the deep report, and a plain-language
+   * overview that reconciles each score to its deductions.
+   */
+  const buildPack = useCallback((): PackInput => {
+    if (!template || !overall) throw new Error("The session summary is not ready yet.");
+    const media: PackMediaItem[] = orderedPages.map((p, i) => ({
+      slug: `${String(i + 1).padStart(2, "0")}-${p.page.id}`,
+      label: p.page.label,
+      blob: p.blob,
+      fileName: p.fileName,
+      captureMeta: p.captureMeta,
+      report: p.report,
+      ai: aiVerdicts[p.page.id] ?? null,
+      derived: p.portrait?.cropUrl
+        ? [
+            {
+              id: "portrait-crop",
+              label: "Document portrait crop used for the face match",
+              url: p.portrait.cropUrl,
+              caption: `The exact pixels the identity embedding was computed from: ${p.portrait.quality.boxWidth}px wide in the original, detection score ${p.portrait.quality.detectionScore}${p.portrait.enhancement?.length ? `, prepared by — ${p.portrait.enhancement.join("; ")}` : ""}.`,
+            },
+          ]
+        : [],
+      notes: [
+        p.quickQuality
+          ? `Instant quality gate: ${p.quickQuality.ok ? "OK" : "retake advised"} — sharpness ${p.quickQuality.sharpness}, glare ${(p.quickQuality.glareFraction * 100).toFixed(1)}%`
+          : null,
+        p.docData ? `Deep data check: ${p.docData.outcome} — ${p.docData.summary}` : null,
+        p.barcode ? `Barcode: ${p.barcode.outcome} — ${p.barcode.summary}` : null,
+      ].filter((n): n is string => n != null),
+    }));
+    if (faceResult) {
+      media.push({
+        slug: "90-face",
+        label: faceResult.mode === "liveness" ? "Live face (liveness identity frame)" : "Selfie",
+        blob: faceResult.blob ?? null,
+        url: faceResult.url,
+        fileName: faceResult.report?.fileName ?? null,
+        captureMeta: faceResult.mode === "liveness" ? "in-browser liveness session, identity frame" : "native camera app selfie",
+        report: faceResult.report,
+        ai: aiVerdicts.selfie ?? null,
+        derived: faceResult.face?.cropUrl
+          ? [
+              {
+                id: "live-face-crop",
+                label: "Live face crop used for the identity match",
+                url: faceResult.face.cropUrl,
+                caption: `Aligned, roll-corrected crop the live embedding was extracted from — ${faceResult.face.quality.boxWidth}px wide in the source, detection score ${faceResult.face.quality.detectionScore}.`,
+              },
+            ]
+          : [],
+        notes: faceResult.facesDetected != null && faceResult.facesDetected > 1 ? [`${faceResult.facesDetected} faces detected in the frame`] : [],
+      });
+    }
+
+    const sections: PackInput["sections"] = [];
+    if (compare) {
+      sections.push({
+        title: "Face match — document portrait vs live face",
+        lines: [
+          `Verdict: ${compare.outcome.verdict.toUpperCase()}${compare.gated ? " (a mismatch was suppressed because capture quality was insufficient)" : ""}`,
+          `Similarity ${compare.outcome.similarity}% · fused distance ${compare.outcome.distance} (match ≤${MATCH_DISTANCE_MAX}, mismatch ≥${MISMATCH_DISTANCE_MIN})`,
+          ...compare.reasons,
+        ],
+      });
+    }
+    if (faceResult?.liveness) {
+      const pulse = faceResult.liveness.pulse;
+      sections.push({
+        title: "Liveness & pulse",
+        lines: [
+          `Verdict: ${faceResult.liveness.verdict.toUpperCase()}`,
+          pulse
+            ? `Pulse: ${pulse.bpm ?? "not resolved"} BPM (spectral cross-check ${pulse.bpmSpectral ?? "n/a"}) · coherence ${pulse.coherence} · SNR ${pulse.snr} · ${pulse.seconds}s of signal · quality ${pulse.quality}`
+            : "Pulse: not measured (a still photo cannot carry a cardiac signal)",
+          ...faceResult.liveness.findings.map((f) => `${f.status.toUpperCase()} — ${f.label}: ${f.detail}`),
+        ],
+      });
+    }
+    if (crossFindings.length > 0) {
+      sections.push({
+        title: "Licence cross-check — barcode vs front OCR",
+        lines: crossFindings.map((f) => `${f.status.toUpperCase()} — ${f.label}: ${f.detail}`),
+      });
+    }
+
+    return {
+      surface: `verification-${template.id}`,
+      title: `${template.name} — Verification Evidence Pack`,
+      subtitle: `${template.doc === "passport" ? "Passport" : "Driver licence"} · ${template.docCapture === "webrtc" ? "live browser capture" : "native camera app capture"} · face step: ${template.faceMode}`,
+      scopeNote:
+        "Everything in this pack was produced on this device during this session. Nothing was uploaded. The originals folder holds the camera files unmodified; every other image is a render derived from them.",
+      verdict: {
+        label: overall.verdict === "pass" ? "PASS" : overall.verdict === "review" ? "NEEDS REVIEW" : "FAIL",
+        tone: overall.verdict,
+        reasons: overall.reasons,
+        corrective: overall.correctiveActions,
+      },
+      media,
+      logs,
+      includeLedger: true,
+      deepText: exportText(),
+      deepJson: exportJson(),
+      coverage,
+      sections,
+    };
+  }, [aiVerdicts, compare, coverage, crossFindings, exportJson, exportText, faceResult, logs, orderedPages, overall, template]);
 
   /**
    * Builds a temporary share link: the compact summary (no images) is
@@ -1428,6 +1542,24 @@ export default function Verify() {
             ) : null}
 
             <CaptureLedgerSection filePrefix={`verification-${template.id}`} />
+
+            <section className="animate-rise space-y-2.5 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-3.5" style={{ animationDelay: "440ms" }}>
+              <h2 className="flex items-center gap-1.5 text-[13px] font-semibold">
+                <FileArchive className="h-4 w-4 text-emerald-400" />
+                Evidence Pack — Everything, One File
+              </h2>
+              <p className="text-[10.5px] leading-snug text-muted-foreground">
+                One ZIP with every capture in its <strong className="text-foreground">original camera form</strong> (stored uncompressed — same bytes,
+                same EXIF, same hash), the filtered/analysed renders beside them, per-file metadata re-read from the archived bytes, the complete
+                end-to-end log plus capture ledger, the deep forensic report, and a printable overview that explains the score deduction by
+                deduction. Built on this device; nothing is uploaded.
+              </p>
+              <EvidencePackButton
+                build={buildPack}
+                pushLog={pushLog}
+                hint="Open overview.html inside the ZIP first — it points at everything else."
+              />
+            </section>
 
             <section className="animate-rise space-y-2 rounded-2xl border border-border/70 bg-card p-3.5" style={{ animationDelay: "460ms" }}>
               <h2 className="text-[13px] font-semibold">Export & Share</h2>

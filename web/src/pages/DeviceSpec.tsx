@@ -19,6 +19,8 @@ import { useCallback, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput } from "@/lib/evidence-pack";
 import { downloadBlob } from "@/lib/camera-diagnostics";
 import {
   buildDeviceSpecJson,
@@ -107,6 +109,47 @@ export default function DeviceSpec() {
     const total = report.suites.reduce((n, s) => n + s.results.length, 0);
     return { granted, total };
   }, [report]);
+
+  /**
+   * Evidence pack for a spec run. There is no captured media here — the
+   * evidence is what the hardware and browser actually granted — so the pack
+   * carries the full text/JSON report plus the threshold reference.
+   */
+  const buildPack = useCallback((): PackInput => {
+    if (!report) throw new Error("Run the spec test first.");
+    const granted = suiteTotals ? `${suiteTotals.granted}/${suiteTotals.total} constraint patterns granted` : "constraint results recorded";
+    return {
+      surface: "device-spec",
+      title: "Device Camera Spec — Evidence Pack",
+      subtitle: `${report.totalVideoInputs} camera${report.totalVideoInputs === 1 ? "" : "s"} · ${granted} · ${(report.durationMs / 1000).toFixed(1)}s run`,
+      scopeNote:
+        "A capability probe, not a fraud screening: it records what this device and browser actually granted. No photos or clips are captured, so the pack has no originals folder — the report and the environment dump are the evidence.",
+      verdict: {
+        label: "SPEC RUN COMPLETE",
+        tone: "info",
+        reasons: [
+          `${report.totalVideoInputs} video input${report.totalVideoInputs === 1 ? "" : "s"} enumerated`,
+          granted,
+          `ImageCapture ${report.imageCaptureSupported ? "supported" : "unavailable"} · ${report.recorderCodecs.filter((c) => c.supported).length}/${report.recorderCodecs.length} recorder codecs supported`,
+          `Native barcode formats: ${report.barcodeDetectorFormats.length > 0 ? report.barcodeDetectorFormats.join(", ") : "BarcodeDetector unavailable"}`,
+        ],
+      },
+      media: [],
+      includeLedger: true,
+      deepText: buildDeviceSpecText(report),
+      deepJson: buildDeviceSpecJson(report),
+      sections: [
+        {
+          title: "Cameras found",
+          lines: report.cameras.map(
+            (c) =>
+              `${c.label || "(unlabelled)"} — ${c.facingGuess} facing${c.grantedWidth ? ` · granted ${c.grantedWidth}×${c.grantedHeight}${c.grantedFps ? `@${c.grantedFps}fps` : ""}` : ""}${c.measuredFps != null ? ` · measured ${c.measuredFps} fps` : ""}${c.error ? ` · error: ${c.error}` : ""}`
+          ),
+        },
+        { title: "Notes recorded during the run", lines: report.notes },
+      ],
+    };
+  }, [report, suiteTotals]);
 
   return (
     <div className="mx-auto flex min-h-dvh w-full max-w-md flex-col gap-3 px-3 pb-8 pt-4">
@@ -199,6 +242,12 @@ export default function DeviceSpec() {
                 <FileJson className="mr-1.5 h-4 w-4" />
                 Export .json
               </Button>
+            </div>
+            <div className="mt-2">
+              <EvidencePackButton
+                build={buildPack}
+                hint="One ZIP: the full spec report, the environment dump, the capture ledger, and the threshold reference."
+              />
             </div>
           </div>
 

@@ -87,6 +87,12 @@ export type FaceDescription = {
   embedDim?: number;
   /** Distance metric used for this descriptor (cosine for ArcFace, euclidean for legacy FaceNet). */
   metric?: "cosine" | "euclidean";
+  /**
+   * JPEG data URL of the enhanced, roll-corrected crop the identity embedding
+   * was actually extracted from. Exported as evidence so a reviewer can see the
+   * exact pixels the match was computed on, not just the distance.
+   */
+  cropUrl?: string;
 };
 
 export type FaceExpressionSample = {
@@ -790,6 +796,12 @@ export async function describeFaceRobust(
     if (variants.length > 0 && cropBox) {
       const quality = assessQuality(baseCanvas, cropBox, bestScore, sourceBoxWidth);
       const fused = variants.length > 1 ? meanDescriptor(variants) : variants[0];
+      let cropUrl: string | undefined;
+      try {
+        cropUrl = baseCanvas.toDataURL("image/jpeg", 0.9);
+      } catch {
+        cropUrl = undefined;
+      }
       return {
         descriptor: fused,
         box: inputBox,
@@ -801,6 +813,7 @@ export async function describeFaceRobust(
         engine,
         embedDim,
         metric,
+        cropUrl,
       };
     }
   }

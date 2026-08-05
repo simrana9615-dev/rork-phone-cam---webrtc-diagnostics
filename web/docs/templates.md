@@ -403,6 +403,14 @@ on the summary screen and embedded in both exports so "n/a" is never ambiguous.
   (deflate-raw) and base64url-encoded into the URL **fragment**: nothing is uploaded,
   fragments are never sent in HTTP requests, and links self-expire after **72 h**.
   Viewable on any device at `/shared` (bypasses the phone gate, read-only).
+- **Evidence pack** (`lib/evidence-pack.ts` → `lib/zip-writer.ts`) — one ZIP holding
+  every capture **byte-for-byte** (store-only, so extracted bytes/EXIF/hash match the
+  camera output exactly), the derived renders beside them with their captions, per-file
+  metadata re-read from the archived bytes, the full session log + capture ledger, the
+  deep text/JSON report, the threshold reference and engine docs, and a printable
+  `overview.html` that reconciles each score to its individual deductions. Anything that
+  could not be packed is named in the overview and logged as a warning — the export never
+  omits silently. Layout table in `architecture.md` §6.
 
 **Persistence** (`lib/session-store.ts`) — the whole session (blobs, reports, face step,
 AI verdicts) is snapshotted to IndexedDB (`verify-sessions`), surviving the tab eviction

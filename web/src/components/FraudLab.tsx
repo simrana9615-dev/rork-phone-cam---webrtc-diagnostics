@@ -11,11 +11,14 @@ import {
   analyzeImageFraud,
   analyzeVideoFraud,
   exportableReport,
+  formatReportText,
   type AiMediaVerdict,
   type MediaFraudReport,
 } from "@/lib/fraud-detection";
 import { requestImageAiVerdict, requestVideoAiVerdict } from "@/lib/ai-verdict";
-import { downloadBlob, type LogLevel } from "@/lib/camera-diagnostics";
+import { downloadBlob, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput } from "@/lib/evidence-pack";
 
 type LabTab = "media" | "document" | "face" | "liveness";
 
@@ -26,7 +29,7 @@ const TABS: { id: LabTab; label: string; icon: typeof FileSearch }[] = [
   { id: "liveness", label: "Liveness", icon: HeartPulse },
 ];
 
-function MediaAnalysis({ pushLog }: { pushLog: (level: LogLevel, message: string) => void }) {
+function MediaAnalysis({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<File | null>(null);
   const [analyzing, setAnalyzing] = useState<boolean>(false);
@@ -89,6 +92,53 @@ function MediaAnalysis({ pushLog }: { pushLog: (level: LogLevel, message: string
     }
   }, [pushLog, report]);
 
+  /** Evidence pack for one analysed file: the original, every render, the full ledger of checks. */
+  const buildPack = useCallback((): PackInput => {
+    if (!report) throw new Error("Analyse a file first.");
+    const file = fileRef.current;
+    return {
+      surface: "fraud-lab-media",
+      title: "Media Forensics — Evidence Pack",
+      subtitle: `${report.fileName} · ${report.kind} · ${report.verdictLabel}`,
+      scopeNote:
+        "A single-file forensic screening: metadata, container structure, pixel forensics and AI signatures for the supplied file. There is no capture-channel ledger because the file was supplied rather than captured through a monitored camera feed.",
+      verdict: {
+        label: `${report.verdictLabel} — score ${report.score}/100`,
+        tone: report.score >= 80 ? "pass" : report.score >= 55 ? "review" : "fail",
+        reasons: [
+          `Confidence ${report.confidence}% — how much evidence was actually available in this file`,
+          ...report.categories.map((c) => `${c.label}: ${c.score}/100 (${c.findings} checks, ${c.fails} fail, ${c.warns} warn)`),
+        ],
+        corrective: report.retakeAdvice,
+      },
+      media: [
+        {
+          slug: "01-media",
+          label: report.kind === "video" ? "Video file" : "Image file",
+          blob: file,
+          fileName: file?.name ?? report.fileName,
+          captureMeta: file ? `supplied file · ${file.type || "unknown type"} · last modified ${new Date(file.lastModified).toISOString()}` : null,
+          report,
+          ai: aiVerdict,
+        },
+      ],
+      logs,
+      includeLedger: false,
+      deepText: formatReportText(report, aiVerdict),
+      deepJson: JSON.stringify(
+        {
+          schema: "verification-hub/media-analysis@1",
+          exportedAt: new Date().toISOString(),
+          file: file ? { name: file.name, sizeBytes: file.size, type: file.type, lastModified: file.lastModified } : null,
+          report: exportableReport(report),
+          aiVerdict,
+        },
+        null,
+        2
+      ),
+    };
+  }, [aiVerdict, logs, report]);
+
   return (
     <div className="space-y-3">
       <input
@@ -149,6 +199,11 @@ function MediaAnalysis({ pushLog }: { pushLog: (level: LogLevel, message: string
             <FileJson className="mr-1.5 h-4 w-4" />
             Export Results + Raw Data (JSON)
           </Button>
+          <EvidencePackButton
+            build={buildPack}
+            pushLog={pushLog}
+            hint="The file untouched, every heat map and chart, the full tag dump, and a printable overview of the score."
+          />
         </>
       ) : null}
     </div>
@@ -156,7 +211,7 @@ function MediaAnalysis({ pushLog }: { pushLog: (level: LogLevel, message: string
 }
 
 /** Fraud Lab hub: Media Analysis · Document Check · Face Match · Liveness + Pulse. */
-export default function FraudLab({ pushLog }: { pushLog: (level: LogLevel, message: string) => void }) {
+export default function FraudLab({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
   const [tab, setTab] = useState<LabTab>("media");
   return (
     <div className="space-y-3">
@@ -176,9 +231,9 @@ export default function FraudLab({ pushLog }: { pushLog: (level: LogLevel, messa
           </button>
         ))}
       </div>
-      {tab === "media" ? <MediaAnalysis pushLog={pushLog} /> : null}
-      {tab === "document" ? <DocumentCheck pushLog={pushLog} /> : null}
-      {tab === "face" ? <FaceMatch pushLog={pushLog} /> : null}
+      {tab === "media" ? <MediaAnalysis pushLog={pushLog} logs={logs} /> : null}
+      {tab === "document" ? <DocumentCheck pushLog={pushLog} logs={logs} /> : null}
+      {tab === "face" ? <FaceMatch pushLog={pushLog} logs={logs} /> : null}
       {tab === "liveness" ? <LivenessCheck pushLog={pushLog} /> : null}
     </div>
   );

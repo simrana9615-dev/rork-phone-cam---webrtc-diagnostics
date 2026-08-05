@@ -13,14 +13,17 @@ import { requestImageAiVerdict } from "@/lib/ai-verdict";
 import { CaptureCancelledError, capacitorCapturePhoto, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
 import DocDataPanel from "@/components/DocDataPanel";
 import { computeDocConfidence, type DocumentDataCheck } from "@/lib/mrz";
-import { downloadBlob, type LogLevel } from "@/lib/camera-diagnostics";
+import { downloadBlob, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput } from "@/lib/evidence-pack";
+import { formatReportText } from "@/lib/fraud-detection";
 
 /**
  * Document Check: fraud analysis tuned for IDs, statements and paperwork —
  * text-region tamper localization, paper uniformity, recapture detection,
  * and a clear genuine / edited / screen-recapture / retake outcome.
  */
-export default function DocumentCheck({ pushLog }: { pushLog: (level: LogLevel, message: string) => void }) {
+export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
   const captureEngine = useCaptureEngine();
   const uploadRef = useRef<HTMLInputElement | null>(null);
   const cameraRef = useRef<HTMLInputElement | null>(null);
@@ -80,6 +83,89 @@ export default function DocumentCheck({ pushLog }: { pushLog: (level: LogLevel, 
       setAiLoading(false);
     }
   }, [pushLog]);
+
+  /** Evidence pack for one document check: the original file, the engine's renders, the data checks. */
+  const buildPack = useCallback((): PackInput => {
+    if (!report) throw new Error("Analyse a document first.");
+    const file = fileRef.current;
+    const conf = docData ? computeDocConfidence(docData) : null;
+    const deep: string[] = [
+      "DOCUMENT CHECK — DEEP REPORT",
+      "=".repeat(70),
+      `Exported ${new Date().toISOString()}`,
+      "",
+    ];
+    if (docData) {
+      deep.push(
+        `DEEP DATA CHECK: ${docData.outcome.toUpperCase()} — ${docData.summary}`,
+        conf ? `Data confidence: ${conf.score == null ? conf.label : `${conf.score}%`} — ${conf.note}` : "",
+        ...(conf?.parts ?? []).map((p) => `  ${p.ok ? "✓" : "✗"} ${p.label}: ${p.earned}/${p.max} pts — ${p.observed}`),
+        ""
+      );
+      if (docData.mrz) {
+        const m = docData.mrz;
+        deep.push(
+          `MRZ: ${m.format} · ${m.documentCode}/${m.issuingState} · ${[m.surname, m.givenNames].filter(Boolean).join(", ")} · no. ${m.documentNumber} · born ${m.birthDateIso ?? "?"} · expires ${m.expiryDateIso ?? "?"}`,
+          ...m.checkDigits.map((d) => `  ${d.ok ? "✓" : "✗"} ${d.field} check digit: printed ${d.actual}, computed ${d.expected}`),
+          ""
+        );
+      }
+      for (const f of docData.findings) {
+        deep.push(`[${f.status.toUpperCase()}] ${f.label}`);
+        if (f.observed) deep.push(`  observed: ${f.observed}`);
+        if (f.expected) deep.push(`  expected: ${f.expected}`);
+        deep.push(`  ${f.detail}`);
+      }
+      deep.push("");
+    }
+    deep.push(formatReportText(report, aiVerdict), "", "=== END OF REPORT ===");
+
+    return {
+      surface: "document-check",
+      title: "Document Check — Evidence Pack",
+      subtitle: `${report.fileName} · ${report.verdictLabel}`,
+      scopeNote:
+        "A single-file document check: forensic screening of one image plus the optional data read. It carries no live-capture ledger, because the file was supplied rather than captured through a monitored feed.",
+      verdict: {
+        label: `${report.docOutcome ? report.docOutcome.replace(/-/g, " ").toUpperCase() : report.verdictLabel} — score ${report.score}/100`,
+        tone: report.score >= 80 ? "pass" : report.score >= 55 ? "review" : "fail",
+        reasons: [
+          report.verdictLabel,
+          `Confidence ${report.confidence}% — how much evidence was actually available in this file`,
+          ...(docData ? [`Data check: ${docData.outcome} — ${docData.summary}`] : []),
+        ],
+        corrective: report.retakeAdvice,
+      },
+      media: [
+        {
+          slug: "01-document",
+          label: "Document image",
+          blob: file,
+          fileName: file?.name ?? report.fileName,
+          captureMeta: file ? `supplied file · ${file.type || "unknown type"} · last modified ${new Date(file.lastModified).toISOString()}` : null,
+          report,
+          ai: aiVerdict,
+          notes: docData ? [`Data check: ${docData.outcome} — ${docData.summary}`] : [],
+        },
+      ],
+      logs,
+      includeLedger: false,
+      deepText: deep.join("\n"),
+      deepJson: JSON.stringify(
+        {
+          schema: "verification-hub/document-check@1",
+          exportedAt: new Date().toISOString(),
+          file: file ? { name: file.name, sizeBytes: file.size, type: file.type, lastModified: file.lastModified } : null,
+          report: exportableReport(report),
+          docData,
+          docConfidence: conf,
+          aiVerdict,
+        },
+        null,
+        2
+      ),
+    };
+  }, [aiVerdict, docData, logs, report]);
 
   return (
     <div className="space-y-3">
@@ -193,6 +279,11 @@ export default function DocumentCheck({ pushLog }: { pushLog: (level: LogLevel, 
             <FileJson className="mr-1.5 h-4 w-4" />
             Export Results + Raw Data (JSON)
           </Button>
+          <EvidencePackButton
+            build={buildPack}
+            pushLog={pushLog}
+            hint="The original file untouched, the engine's renders and crops, the full tag dump, and a printable overview."
+          />
         </>
       ) : null}
     </div>

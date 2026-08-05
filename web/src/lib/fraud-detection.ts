@@ -1669,6 +1669,8 @@ export async function analyzeImageFraud(
   step("Running screen-replay & texture forensics\u2026");
   let pixelAnalyzed = false;
   let pixelMetrics: Awaited<ReturnType<typeof computePixelMetrics>> = null;
+  /** Kept in scope so the deskewed crop can be exported as visual evidence below. */
+  let docPixels: Awaited<ReturnType<typeof analyzeDocumentPixels>> = null;
   if (img) {
     pixelMetrics = await computePixelMetrics(blob);
     if (pixelMetrics) {
@@ -1796,6 +1798,7 @@ export async function analyzeImageFraud(
   if (options?.document) {
     step("Analyzing document structure (paper, text regions, tamper)\u2026");
     const doc = img ? await analyzeDocumentPixels(blob) : null;
+    docPixels = doc;
     if (doc) {
       const loc = doc.location;
       pushMetric(
@@ -2035,6 +2038,20 @@ export async function analyzeImageFraud(
 
   step("Rendering forensic visual heat maps\u2026");
   const visuals = img ? await buildImageVisuals(blob) : [];
+  // The deskewed document crop is the region every document statistic was
+  // measured inside — exported so a reviewer can confirm the engine measured the
+  // card itself and not the surface it was lying on.
+  if (docPixels?.cropUrl) {
+    const dloc = docPixels.location;
+    visuals.push({
+      id: "document-crop",
+      label: "Document crop actually analysed (deskewed)",
+      url: docPixels.cropUrl,
+      caption: dloc.found
+        ? `Located geometrically${dloc.quad ? ` at ${dloc.quad.widthPx}\u00d7${dloc.quad.heightPx}px, ${dloc.quad.angleDeg}\u00b0 rotation, ${dloc.quad.aspect}:1${dloc.matchedStandard ? ` (${dloc.matchedStandard.label})` : ""}` : ""}. Every document statistic — paper uniformity, text-vs-paper compression ratio, periodicity, colourfulness — was measured inside this rectangle only, at ${docPixels.cropWidth}\u00d7${docPixels.cropHeight}px.`
+        : `No document rectangle was located (${dloc.reason}), so the whole frame is shown here and the document-geometry checks were left unscored.`,
+    });
+  }
 
   step("Fusing category scores and deriving the verdict\u2026");
   const score = scoreFindings(findings);

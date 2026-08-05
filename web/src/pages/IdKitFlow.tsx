@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   ClipboardCopy,
   Download,
+  FileArchive,
   FileDown,
   FileJson,
   Fingerprint,
@@ -40,6 +41,8 @@ import CaptureEngineToggle from "@/components/verify/CaptureEngineToggle";
 import CaptureHoldOverlay from "@/components/verify/CaptureHoldOverlay";
 import CaptureLedgerSection from "@/components/verify/CaptureLedgerSection";
 import SilentClipDurationSetting from "@/components/verify/SilentClipDurationSetting";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput, PackMediaItem } from "@/lib/evidence-pack";
 import { downloadBlob, makeLog, trackSettings, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError, capacitorCapturePhoto, engineLaunchNote, engineOption, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
 import { runCaptureHold } from "@/lib/capture-hold";
@@ -1971,6 +1974,184 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
     return JSON.stringify(base, null, 2);
   }, [aiVerdicts, bestSilent, chains, compare, face, orderedPages, overall, template]);
 
+  /**
+   * Assembles the downloadable evidence pack for the ID Kit flow: document
+   * pages, the live/selfie face, and every voluntary silent front capture —
+   * stills and clips — in original form, with the engine's renders, per-file
+   * metadata, the whole log + ledger, and a plain-language overview.
+   */
+  const buildPack = useCallback((): PackInput => {
+    const media: PackMediaItem[] = [];
+    orderedPages.forEach((p, i) => {
+      media.push({
+        slug: `${String(i + 1).padStart(2, "0")}-${p.page.id}`,
+        label: p.page.label,
+        blob: p.blob,
+        fileName: p.fileName,
+        captureMeta: p.captureMeta,
+        report: p.report,
+        ai: aiVerdicts[p.page.id] ?? null,
+        derived: p.portrait?.cropUrl
+          ? [
+              {
+                id: "portrait-crop",
+                label: "Document portrait crop used for the identity chain",
+                url: p.portrait.cropUrl,
+                caption: `The exact pixels the identity embedding was computed from — ${p.portrait.quality.boxWidth}px wide in the original, detection score ${p.portrait.quality.detectionScore}.`,
+              },
+            ]
+          : [],
+        notes: [
+          p.quickQuality ? `Instant quality gate: ${p.quickQuality.ok ? "OK" : "retake advised"} — sharpness ${p.quickQuality.sharpness}` : null,
+          p.docData ? `Deep data check: ${p.docData.outcome} — ${p.docData.summary}` : null,
+          p.barcode ? `Barcode: ${p.barcode.outcome} — ${p.barcode.summary}` : null,
+        ].filter((n): n is string => n != null),
+      });
+    });
+    if (face) {
+      media.push({
+        slug: "50-face",
+        label: face.mode === "native-selfie" ? "Fallback selfie" : "Liveness identity frame",
+        blob: face.blob ?? null,
+        url: face.url,
+        fileName: face.report?.fileName ?? null,
+        captureMeta: face.mode === "native-selfie" ? "native camera app selfie" : "in-browser liveness session, identity frame",
+        report: face.report,
+        ai: aiVerdicts.selfie ?? null,
+        derived: face.face?.cropUrl
+          ? [
+              {
+                id: "live-face-crop",
+                label: "Live face crop used for the identity match",
+                url: face.face.cropUrl,
+                caption: `Aligned, roll-corrected crop the live embedding was extracted from — ${face.face.quality.boxWidth}px wide in the source, detection score ${face.face.quality.detectionScore}.`,
+              },
+            ]
+          : [],
+      });
+    }
+    orderedSilents.forEach((cap, i) => {
+      const isBest = bestSilent?.pageId === cap.pageId;
+      media.push({
+        slug: `6${i}-silent-still-${cap.pageId}`,
+        label: `Silent front still — before ${cap.pageLabel}${isBest ? " (session best)" : ""}`,
+        blob: cap.blob,
+        url: cap.url,
+        captureMeta: `voluntary passive front capture, ${cap.width}×${cap.height}, browser-encoded frame from the live feed`,
+        report: cap.report,
+        ai: aiVerdicts[`silent-${cap.pageId}`] ?? null,
+        derived: cap.face?.cropUrl
+          ? [
+              {
+                id: "silent-face-crop",
+                label: "Silent face crop",
+                url: cap.face.cropUrl,
+                caption: `Crop used for the passive identity chain — ${cap.face.quality.boxWidth}px wide, detection score ${cap.face.quality.detectionScore}. ${cap.faceUsable ? "Quality gates passed, so this face was eligible for matching." : "Quality gates failed, so this face was never used to assert a match."}`,
+              },
+            ]
+          : [],
+        notes: [
+          `Micro-motion: ${MOTION_LABEL[cap.motion.verdict]} — ${cap.motion.frames} frames over ${cap.motion.durationMs}ms, mean delta ${cap.motion.meanDelta}, peak ${cap.motion.maxDelta}`,
+          `Face usable for identity: ${cap.faceUsable ? "yes" : "no"}${cap.facesDetected != null ? ` · faces in frame: ${cap.facesDetected}` : ""}`,
+          cap.pulse ? `Pulse fingerprint: ${cap.pulse.bpm ?? "unresolved"} BPM · coherence ${cap.pulse.coherence}` : "No pulse fingerprint (face not present long enough)",
+        ],
+      });
+      if (cap.videoBlob) {
+        media.push({
+          slug: `6${i}-silent-clip-${cap.pageId}`,
+          label: `Silent front clip — before ${cap.pageLabel}`,
+          blob: cap.videoBlob,
+          captureMeta: `recorded from the live front feed (${cap.videoMime ?? "unknown container"})`,
+          notes: ["Original recorder output, unmodified. The micro-motion and pulse evidence above was measured from this clip."],
+        });
+      }
+    });
+
+    const sections: PackInput["sections"] = [];
+    if (compare) {
+      sections.push({
+        title: "Face match — document portrait vs live face",
+        lines: [
+          `Verdict: ${compare.outcome.verdict.toUpperCase()}${compare.gated ? " (mismatch suppressed — capture quality insufficient)" : ""}`,
+          `Similarity ${compare.outcome.similarity}% · fused distance ${compare.outcome.distance}`,
+          ...compare.reasons,
+        ],
+      });
+    }
+    if (face?.liveness) {
+      const pulse = face.liveness.pulse;
+      sections.push({
+        title: "Liveness & pulse",
+        lines: [
+          `Verdict: ${face.liveness.verdict.toUpperCase()}`,
+          pulse
+            ? `Pulse: ${pulse.bpm ?? "not resolved"} BPM (spectral ${pulse.bpmSpectral ?? "n/a"}) · coherence ${pulse.coherence} · SNR ${pulse.snr} · ${pulse.seconds}s · quality ${pulse.quality}`
+            : "Pulse: not measured",
+          ...face.liveness.findings.map((f) => `${f.status.toUpperCase()} — ${f.label}: ${f.detail}`),
+        ],
+      });
+    }
+    if (chains.length > 0) {
+      sections.push({
+        title: "Passive identity chain (voluntary silent front)",
+        lines: chains.map(({ cap, vsPortrait, vsLive, isSessionBest }) =>
+          [
+            `Before ${cap.pageLabel}${isSessionBest ? " ★ session best" : ""}:`,
+            !isSessionBest
+              ? "not used for identity (the session keeps only the single best silent face)"
+              : !cap.face || !cap.faceUsable
+                ? "no usable face — ignored, evidence trail only"
+                : `vs document portrait ${vsPortrait ? `${vsPortrait.outcome.verdict} (${vsPortrait.outcome.distance})` : "not comparable"} · vs live face ${vsLive ? `${vsLive.outcome.verdict} (${vsLive.outcome.distance})` : "not comparable"}`,
+          ].join(" ")
+        ),
+      });
+    }
+    if (crossFindings.length > 0) {
+      sections.push({
+        title: "Licence cross-check — barcode vs front OCR",
+        lines: crossFindings.map((f) => `${f.status.toUpperCase()} — ${f.label}: ${f.detail}`),
+      });
+    }
+
+    return {
+      surface: cfg.filePrefix,
+      title: `${cfg.title} — Evidence Pack`,
+      subtitle: `${template.doc === "passport" ? "Passport" : "Driver licence"} · native camera capture · voluntary silent front checks · face step: ${template.faceMode}`,
+      scopeNote:
+        "Produced entirely on this device during this session; nothing was uploaded. Document pages and silent clips are archived exactly as the camera and recorder produced them.",
+      verdict: {
+        label: overall.verdict === "pass" ? "PASS" : overall.verdict === "review" ? "NEEDS REVIEW" : "FAIL",
+        tone: overall.verdict,
+        reasons: overall.reasons,
+        corrective: overall.correctiveActions,
+      },
+      media,
+      logs,
+      includeLedger: true,
+      deepText: exportText(),
+      deepJson: exportJson(),
+      coverage,
+      sections,
+    };
+  }, [
+    aiVerdicts,
+    bestSilent,
+    cfg.filePrefix,
+    cfg.title,
+    chains,
+    compare,
+    coverage,
+    crossFindings,
+    exportJson,
+    exportText,
+    face,
+    logs,
+    orderedPages,
+    orderedSilents,
+    overall,
+    template,
+  ]);
+
   const retakePage = useCallback(
     (pageId: string) => {
       const old = pageResults[pageId];
@@ -2933,6 +3114,20 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
                 </section>
               );
             })}
+
+            <section className="animate-rise space-y-2.5 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-3.5" style={{ animationDelay: "540ms" }}>
+              <h2 className="flex items-center gap-1.5 text-[13px] font-semibold">
+                <FileArchive className="h-4 w-4 text-emerald-400" />
+                Evidence Pack — Everything, One File
+              </h2>
+              <p className="text-[10.5px] leading-snug text-muted-foreground">
+                One ZIP with every document page, the face capture and every voluntary silent still and clip in their
+                <strong className="text-foreground"> original captured form</strong> (stored uncompressed — same bytes, same EXIF), the engine's
+                renders beside them, per-file metadata, the full end-to-end log plus capture ledger, the deep report, and a printable overview that
+                explains the score deduction by deduction.
+              </p>
+              <EvidencePackButton build={buildPack} pushLog={pushLog} hint="Open overview.html inside the ZIP first — it points at everything else." />
+            </section>
 
             <section className="animate-rise space-y-2 rounded-2xl border border-border/70 bg-card p-3.5" style={{ animationDelay: "560ms" }}>
               <h2 className="text-[13px] font-semibold">Export</h2>

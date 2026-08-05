@@ -1664,7 +1664,7 @@ const Index = () => {
           title="Fraud Lab — Identity & Media Fraud Toolkit"
           subtitle="Media forensics with ultra-detailed evidence trails, document tamper checks, on-device face match, and a smile + pulse (rPPG) liveness test with screen-replay and virtual-camera detection."
         >
-          <FraudLab pushLog={pushLog} />
+          <FraudLab pushLog={pushLog} logs={logs} />
         </Section>
 
         <Section

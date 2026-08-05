@@ -111,6 +111,7 @@ renders the read-only session summary.
 | `FaceMatch.tsx` | Standalone Fraud Lab face-match tool (same ensemble engine as the flows) |
 | `DocumentCheck.tsx` / `DocDataPanel.tsx` / `DocConfidenceBadge.tsx` | Deep data check UI: MRZ ledger, per-check-digit rows, expandable confidence ledger badge |
 | `FraudLab.tsx` | Fraud Lab hub section (media screening entry points) |
+| `EvidencePackButton.tsx` | The one-tap **Download Evidence Pack (.zip)** action: builds the pack lazily on tap, streams progress inline, pushes every step and every completeness warning into the session log |
 | `LastPhotoExif.tsx` | Diagnostic-hub EXIF inspector for the newest captured photo: device / timestamp / GPS headline tiles with explicit not-in-file states, capture-parameter chips, and the complete raw tag dump (parsed locally); exports the reusable `ExifInspector` panel, also embedded in every session-gallery item, with a one-tap JSON download of the raw tags + the photo's observed capture timeline + screening verdict (heat-map image payloads excluded with an explicit note) |
 | `ReportView.tsx` | Forensic report renderer: verdict chip, category bars, finding rows (observed/expected/impact), heat-map visuals, technical appendix; exports `FindingRow` |
 | `CameraErrorHelp.tsx` | getUserMedia error classifier with actionable fixes |
@@ -133,10 +134,10 @@ renders the read-only session summary.
 | `injection-guard.ts` | Capture-channel integrity: injection audit (definitive/strong/info tiers), native provenance, privacy-browser detection, virtual-camera markers |
 | `lens-enforcement.ts` | Post-capture EXIF lens/zoom policy for native captures |
 | `ai-verdict.ts` | AI vision verdicts + document OCR via the Rork Toolkit proxy (resize ladder, 2.5 MB budget, strict JSON parsing, `aiVerdictAvailable`) |
-| `face-vision.ts` | Face detection, ArcFace alignment orchestration, quality gates, live boxes, ensemble match |
+| `face-vision.ts` | Face detection, ArcFace alignment orchestration, quality gates, live boxes, ensemble match. Publishes `cropUrl` — the aligned crop the embedding was actually extracted from — so a match can be audited visually, not just numerically |
 | `face-embedder.ts` | MobileFaceNet ONNX embedder (256-d), 5-point warp, cosine distance bands |
 | `ppg.ts` | rPPG pulse estimation (POS projection, dual BPM estimators, quality grading) + cross-feed continuity across silent and liveness legs |
-| `pixel-forensics.ts` | Screen-replay fusion (two-signal corroboration, unscored when uncalibrated/unassessable), noise/texture statistics, document pixel analysis inside the located crop, video frame extraction & temporal comparison |
+| `pixel-forensics.ts` | Screen-replay fusion (two-signal corroboration, unscored when uncalibrated/unassessable), noise/texture statistics, document pixel analysis inside the located crop (which it also exports as `cropUrl` visual evidence), video frame extraction & temporal comparison |
 | `visual-forensics.ts` | Heat-map/chart renderers for the report visuals |
 | `mrz.ts` | ICAO 9303 MRZ parsing, check digits, date logic, zone cross-validation, confidence ledger |
 | `pdf417.ts` | PDF417 decode (BarcodeDetector → ZXing, rotation-tolerant) + AAMVA parsing + licence cross-checks |
@@ -144,11 +145,40 @@ renders the read-only session summary.
 | `capture-quality.ts` | Instant post-capture quality gate (sharpness/glare/shadow) |
 | `camera-diagnostics.ts` | Camera/EXIF helpers, constraint builders, suite test patterns, capture utilities, log types |
 | `device-spec.ts` | Device Camera Spec Report engine: environment collection, per-camera max-capability probes, measured fps, constraint suite runs, codec matrix, text + JSON report builders |
+| `zip-writer.ts` | Dependency-free ZIP writer, **store-only (method 0)** so archived media is byte-identical to the capture. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. UTF-8 name flag on every entry; entries >4 GiB are rejected rather than silently corrupted |
+| `evidence-pack.ts` | Evidence pack assembler: originals verbatim, derived renders with captions, per-file metadata **re-read from the archived bytes** (ExifReader + structural provenance walk), session log + capture ledger, deep report, threshold reference + engine docs, and the printable HTML/text overview that reconciles every score to its deductions. Records rather than hides anything it could not pack |
 | `session-store.ts` | IndexedDB session persistence (6 h TTL, survives native-camera tab eviction) |
 | `share-link.ts` | Compressed, self-expiring (72 h), fragment-only share links — no server storage |
 | `utils.ts` | `cn` class-name helper |
 
-## 6. Environment & configuration
+## 6. Evidence pack export
+
+Every flow and every standalone tool ends with one **Download Evidence Pack (.zip)** button
+(`EvidencePackButton` → `lib/evidence-pack.ts` → `lib/zip-writer.ts`). Built entirely
+on-device; nothing is uploaded.
+
+Archive layout:
+
+| Path | Contents |
+|---|---|
+| `READ-ME-FIRST.txt` | What each folder is, and how a score is read |
+| `overview.html` / `overview.txt` | Verdict, per-file score reconciliation (every deduction with its exact points, summing to the score), coverage matrix, capture thumbnails, metadata summary, timeline, file list, and an explicit "not included — and why" section |
+| `report/deep-report.txt` / `.json` | The surface's full forensic report (findings with observed vs expected, check ledger with threshold provenance, doc-data check digits, barcode, face distances, liveness/pulse, AI verdicts) |
+| `originals/` | Captured photos and clips **byte-for-byte**, stored uncompressed on purpose — extracted bytes, EXIF and hash match the capture exactly |
+| `processed/<slug>/` | Derived renders (noise/edge/glare/ELA/frequency maps, video frame strips, the deskewed document crop, aligned face crops) plus `captions.txt` explaining how to read each one and stating plainly that these are renders, not captures |
+| `metadata/<slug>.txt` / `.json` | Full readable tag dump plus the container-structure walk (containers parsed, structural containers explicitly marked benign, writer- vs content-tier provenance fields) |
+| `log/session-log.txt` / `.json` | Complete end-to-end log, every entry, in order |
+| `log/capture-ledger.txt` / `.json` | Capture feed ledger — feeds opened, requested vs granted, frames, clips, native round-trips (omitted for supplied-file tools, which have no monitored feed) |
+| `reference/thresholds.txt` / `.json` | Every threshold, its value and its provenance class, including the `uncalibrated` ones that deduct nothing |
+| `reference/engine/*.md` | The engine documentation, lazily imported so it never inflates the app bundle |
+| `MANIFEST.txt` | Every archived path with its byte size |
+
+Design rules: originals are never re-encoded (only extra thumbnails and derived renders
+are generated); metadata is re-read from the archived bytes so the pack is self-proving;
+and a single missing artefact never fails the export — it is named in the overview's
+completeness section and pushed to the log as a warning.
+
+## 7. Environment & configuration
 
 - `EXPO_PUBLIC_TOOLKIT_URL` + `EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY` — Rork Toolkit proxy
   credentials for AI verdicts and vision OCR. When absent, `aiVerdictAvailable()` is
@@ -159,7 +189,7 @@ renders the read-only session summary.
 - PWA basics: `public/manifest.webmanifest` (standalone, portrait, dark theme),
   icons, and meta tags in `index.html`.
 
-## 7. Testing & builds
+## 8. Testing & builds
 
 - `bun run test` — vitest unit tests plus a Playwright-driven browser config
   (`vitest.browser.config.ts`).

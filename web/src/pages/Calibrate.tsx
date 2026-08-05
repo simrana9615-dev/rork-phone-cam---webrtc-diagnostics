@@ -31,6 +31,8 @@ import {
   type MetricSeparation,
 } from "@/lib/calibration";
 import { measureForCalibration } from "@/lib/calibration-metrics";
+import EvidencePackButton from "@/components/EvidencePackButton";
+import type { PackInput } from "@/lib/evidence-pack";
 import { cn } from "@/lib/utils";
 
 type ClassSpec = {
@@ -209,6 +211,85 @@ export default function Calibrate() {
     toast.success("Calibration cleared");
   }, []);
 
+  /**
+   * Evidence pack for a calibration run: the measured samples, the separation
+   * analysis, and which thresholds this earned the right to score. No sample
+   * images are held after measurement, which the pack states plainly.
+   */
+  const buildPack = useCallback((): PackInput => {
+    const lines: string[] = [
+      "CALIBRATION — DEEP REPORT",
+      "=".repeat(70),
+      `Exported ${new Date().toISOString()}`,
+      `Device: ${store.device}`,
+      `Samples measured: ${store.samples.length}`,
+      `Calibrated thresholds active: ${store.appliedAt != null ? `yes, applied ${new Date(store.appliedAt).toISOString()}` : "no"}`,
+      "",
+      "Purpose: a threshold is only allowed to remove points once it has been shown to separate genuine captures",
+      "from fraudulent ones on this device. Until then the measurement is reported and scores nothing.",
+      "",
+      "── SEPARATION ANALYSIS ──",
+    ];
+    for (const s of separations) {
+      lines.push(
+        "",
+        `${s.metricId} — ${s.def.label} [${s.outcome.toUpperCase()}]`,
+        `  measures: ${s.def.measures}`,
+        `  genuine: ${s.genuine ? `n=${s.genuine.count} · min ${s.genuine.min} · p10 ${s.genuine.p10} · median ${s.genuine.median} · p90 ${s.genuine.p90} · max ${s.genuine.max}` : "no samples"}`,
+        `  fraudulent: ${s.suspect ? `n=${s.suspect.count} · min ${s.suspect.min} · p10 ${s.suspect.p10} · median ${s.suspect.median} · p90 ${s.suspect.p90} · max ${s.suspect.max}` : "no samples"}`,
+        `  separation: ${s.separation ?? "not computable"}`,
+        `  suggested: warn ${s.suggestedWarn ?? "—"} · fail ${s.suggestedFail ?? "—"}`,
+        `  ${s.explanation}`
+      );
+    }
+    lines.push("", "── SAMPLES ──");
+    for (const sample of store.samples) {
+      lines.push(
+        `[${sample.klass}] ${sample.label} · ${sample.width}×${sample.height} · measured ${new Date(sample.capturedAt).toISOString()}`,
+        ...Object.entries(sample.metrics).map(([k, v]) => `    ${k}: ${v ?? "not measurable"}`)
+      );
+    }
+    lines.push("", "=== END OF REPORT ===");
+
+    return {
+      surface: "calibration",
+      title: "Calibration — Evidence Pack",
+      subtitle: `${store.samples.length} sample${store.samples.length === 1 ? "" : "s"} · ${separatingCount} measurement${separatingCount === 1 ? "" : "s"} separate cleanly`,
+      scopeNote:
+        "Calibration measures samples and keeps only the numbers — the sample images themselves are never stored, so this pack has no originals folder. It proves which thresholds earned the right to affect a score.",
+      verdict: {
+        label:
+          store.appliedAt != null
+            ? `CALIBRATED THRESHOLDS ACTIVE — ${separatingCount} scoring`
+            : separatingCount > 0
+              ? `${separatingCount} THRESHOLD${separatingCount === 1 ? "" : "S"} READY TO APPLY`
+              : "NOT YET CALIBRATED",
+        tone: store.appliedAt != null ? "pass" : separatingCount > 0 ? "review" : "info",
+        reasons: [
+          `${separatingCount} measurement${separatingCount === 1 ? "" : "s"} separate genuine from fraudulent captures cleanly and may be scored.`,
+          ...(overlapCount > 0
+            ? [`${overlapCount} measurement${overlapCount === 1 ? "" : "s"} overlap between the two classes, so ${overlapCount === 1 ? "it stays" : "they stay"} permanently unscored — no threshold could separate them honestly.`]
+            : []),
+          ...(readiness.ready ? [] : [`Not enough samples yet. Still to capture: ${readiness.missing.join(", ") || "—"}.`]),
+        ],
+      },
+      media: [],
+      includeLedger: false,
+      deepText: lines.join("\n"),
+      deepJson: exportCalibration(store),
+      sections: [
+        {
+          title: "What this changes in every report",
+          lines: [
+            "Thresholds proven here are cited as CALIBRATED in the check ledger of every future report, with the sample counts behind them.",
+            "Measurements that overlap stay unscored no matter how many samples are added — overlap means no honest threshold exists.",
+            "Switching calibration off returns those checks to reported-but-unscored.",
+          ],
+        },
+      ],
+    };
+  }, [overlapCount, readiness, separatingCount, separations, store]);
+
   const download = useCallback(() => {
     const blob = new Blob([exportCalibration(store)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -365,6 +446,13 @@ export default function Calibrate() {
             Export JSON
           </Button>
         </div>
+        {store.samples.length > 0 ? (
+          <EvidencePackButton
+            build={buildPack}
+            variant="secondary"
+            hint="One ZIP: every measured sample, the separation analysis, and which thresholds this earned the right to score."
+          />
+        ) : null}
         <Button
           size="sm"
           variant="ghost"

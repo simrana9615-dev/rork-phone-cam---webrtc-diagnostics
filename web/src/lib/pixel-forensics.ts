@@ -76,6 +76,8 @@ export type DocumentPixelAnalysis = {
   /** Pixel size of the crop that was actually analysed. */
   cropWidth: number;
   cropHeight: number;
+  /** JPEG data URL of the deskewed document crop every statistic above was measured inside. */
+  cropUrl: string | null;
 };
 
 export type TemporalMetrics = {
@@ -103,6 +105,19 @@ function toCanvas(source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElemen
   if (!ctx) return null;
   ctx.drawImage(source, 0, 0, w, h);
   return canvas;
+}
+
+/**
+ * JPEG data URL of a canvas, downscaled to `maxEdge` for export. Used only for
+ * derived evidence renders — original captures are never re-encoded.
+ */
+function exportCanvas(source: HTMLCanvasElement, maxEdge: number): string | null {
+  try {
+    const out = toCanvas(source, maxEdge);
+    return out ? out.toDataURL("image/jpeg", 0.9) : null;
+  } catch {
+    return null;
+  }
 }
 
 function decodeBlob(blob: Blob): Promise<HTMLImageElement | null> {
@@ -587,6 +602,9 @@ export async function analyzeDocumentPixels(blob: Blob): Promise<DocumentPixelAn
     colorfulness: Math.round(computeColorfulness(g) * 10) / 10,
     cropWidth: analysisCanvas.width,
     cropHeight: analysisCanvas.height,
+    // Exported as visual evidence: this is the exact region the numbers describe,
+    // so a reviewer can confirm the engine measured the card and not the table.
+    cropUrl: exportCanvas(nativeCrop ?? analysisCanvas, 1400),
   };
 }
 
