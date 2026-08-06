@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Camera, Loader2, ScanFace, Upload, UserCheck, UserX } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -16,7 +16,7 @@ import {
 import type { LogEntry, LogLevel } from "@/lib/camera-diagnostics";
 import { ScoreRing } from "@/components/ReportView";
 import EvidencePackButton from "@/components/EvidencePackButton";
-import type { PackInput, PackMediaItem } from "@/lib/evidence-pack";
+import { originForCaptureEngine, type PackInput, type PackMediaItem, type PackOrigin } from "@/lib/evidence-pack";
 
 type SlotState = {
   url: string | null;
@@ -152,6 +152,9 @@ function FaceSlot({
  * Match / Mismatch / Uncertain with quality-gated retake requests.
  */
 export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
+  /** Whether these bytes are a fresh camera file or a photo picked from storage. */
+  const matchCaptureEngine = useCaptureEngine();
+  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(matchCaptureEngine), [matchCaptureEngine]);
   const [slotA, setSlotA] = useState<SlotState>(EMPTY_SLOT);
   const [slotB, setSlotB] = useState<SlotState>(EMPTY_SLOT);
   const [busy, setBusy] = useState<boolean>(false);
@@ -239,6 +242,7 @@ export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel
     const media: PackMediaItem[] = slots.map(({ slot, slug, label }) => ({
       slug,
       label,
+      origin: fileOrigin,
       blob: slot.blob,
       url: slot.url,
       fileName: slot.fileName,

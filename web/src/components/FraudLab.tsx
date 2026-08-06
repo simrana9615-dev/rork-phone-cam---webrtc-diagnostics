@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { FileJson, FileSearch, FileText, HeartPulse, Loader2, ScanFace } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -19,6 +19,8 @@ import { requestImageAiVerdict, requestVideoAiVerdict } from "@/lib/ai-verdict";
 import { downloadBlob, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import EvidencePackButton from "@/components/EvidencePackButton";
 import type { PackInput } from "@/lib/evidence-pack";
+import { originForCaptureEngine, type PackOrigin } from "@/lib/evidence-pack";
+import { useCaptureEngine } from "@/lib/capture-engine";
 
 type LabTab = "media" | "document" | "face" | "liveness";
 
@@ -30,6 +32,9 @@ const TABS: { id: LabTab; label: string; icon: typeof FileSearch }[] = [
 ];
 
 function MediaAnalysis({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
+  const captureEngine = useCaptureEngine();
+  /** This screen always takes a file the user supplied, whatever engine picked it. */
+  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<File | null>(null);
   const [analyzing, setAnalyzing] = useState<boolean>(false);
@@ -115,6 +120,7 @@ function MediaAnalysis({ pushLog, logs }: { pushLog: (level: LogLevel, message: 
         {
           slug: "01-media",
           label: report.kind === "video" ? "Video file" : "Image file",
+          origin: fileOrigin,
           blob: file,
           fileName: file?.name ?? report.fileName,
           captureMeta: file ? `supplied file · ${file.type || "unknown type"} · last modified ${new Date(file.lastModified).toISOString()}` : null,

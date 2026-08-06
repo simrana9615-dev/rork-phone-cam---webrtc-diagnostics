@@ -6,15 +6,24 @@
  *     archive untouched, stored (not deflated), so EXIF, entropy-coded scan
  *     data and file hash all survive. Nothing in this module re-encodes an
  *     original.
- *  2. Everything the engine derived — heat maps, ELA, frame strips, deskewed
+ *  2. `originals/` holds ONLY bytes this app did not create — camera files,
+ *     platform stills, recorder output. A frame the app drew on a canvas and
+ *     encoded itself is not an original and is filed under `rendered-frames/`
+ *     instead. Each item's origin is declared by the capture code that made it
+ *     (`PackMediaItem.origin`); it is never guessed here.
+ *  3. Everything the engine derived — heat maps, ELA, frame strips, deskewed
  *     document crops, aligned face crops — is written to a separate folder and
  *     clearly labelled as derived, so a reviewer can never confuse a render
  *     with a capture.
- *  3. Nothing is silently missing. Every item that could not be packed is
+ *  4. Nothing is silently missing. Every item that could not be packed is
  *     recorded as a warning inside the pack itself.
- *  4. Metadata is re-read from the original bytes at pack time (ExifReader +
+ *  5. Metadata is re-read from the original bytes at pack time (ExifReader +
  *     the structural provenance walk), so the archive stands on its own
  *     instead of trusting numbers copied out of the UI.
+ *  6. The byte-identity claim is verified, not asserted: after the archive is
+ *     built, every media payload is carved back out of it and compared to the
+ *     source blob byte-for-byte, and the offsets/checksums needed to repeat
+ *     that check independently ship inside the pack.
  *
  * Everything runs locally; nothing is uploaded.
  */
@@ -34,12 +43,89 @@ import {
   type MediaFraudReport,
 } from "./fraud-detection";
 import { scanProvenance } from "./metadata-provenance";
+import type { CaptureEngine } from "./capture-engine";
 import { extractFrameCanvases } from "./pixel-forensics";
 import { describeThreshold, THRESHOLDS } from "./thresholds";
-import { buildZip, safeZipPath, type ZipEntry } from "./zip-writer";
+import { buildZip, crcHex, safeZipPath, verifyBytes, type ZipEntry, type ZipEntryInfo } from "./zip-writer";
 import type { CheckCoverage } from "./verification-templates";
 
 export type PackVerdictTone = "pass" | "review" | "fail" | "info";
+
+/**
+ * Where a media item's bytes came from. Declared by the capture code, never
+ * inferred here — it decides which folder the file is archived in and what the
+ * pack is allowed to claim about it.
+ */
+export type PackOrigin =
+  /** A File handed over by the operating system's camera app. */
+  | "camera-file"
+  /** A File the user picked from storage. */
+  | "supplied-file"
+  /** A still produced by the browser's own photo pipeline (ImageCapture.takePhoto). */
+  | "platform-photo"
+  /** Byte stream straight out of MediaRecorder. */
+  | "recorder-stream"
+  /** A frame this app drew to a canvas and encoded itself — NOT an original. */
+  | "app-encoded-frame";
+
+/**
+ * How a File-based capture should be classified, given the engine that produced
+ * it. Engines that open the OS camera app yield a fresh camera file; picker
+ * engines let the user choose an existing photo, so the pack must not claim the
+ * file came from the camera — the forensic checks decide whether it is fresh.
+ */
+export function originForCaptureEngine(engine: CaptureEngine): PackOrigin {
+  switch (engine) {
+    case "native-camera":
+    case "capacitor":
+    case "capture-boolean":
+      return "camera-file";
+    case "system-picker":
+    case "legacy-accept":
+    case "fs-picker":
+      return "supplied-file";
+  }
+}
+
+type OriginInfo = {
+  folder: "originals" | "rendered-frames";
+  short: string;
+  long: string;
+  metadataNote: string;
+};
+
+const ORIGIN_INFO: Record<PackOrigin, OriginInfo> = {
+  "camera-file": {
+    folder: "originals",
+    short: "camera file from the OS camera app",
+    long: "The file the operating system's camera app handed to the browser. These are the camera's own bytes: this app copied them into the archive without decoding or re-encoding them.",
+    metadataNote: "EXIF as the camera wrote it, intact.",
+  },
+  "supplied-file": {
+    folder: "originals",
+    short: "file supplied from storage",
+    long: "A file you selected from storage, copied into the archive byte-for-byte. This app did not alter it — but it cannot know what happened to the file before you supplied it, which is precisely what the forensic checks are for.",
+    metadataNote: "Whatever metadata the file arrived with, intact.",
+  },
+  "platform-photo": {
+    folder: "originals",
+    short: "platform still (ImageCapture.takePhoto)",
+    long: "A full-resolution still produced by the browser's own photo pipeline from the live camera track. The bytes are as the platform encoded them; this app copied them in untouched.",
+    metadataNote: "Only what the platform chose to embed — browsers usually write little or no EXIF on this path.",
+  },
+  "recorder-stream": {
+    folder: "originals",
+    short: "recorder output (MediaRecorder)",
+    long: "The exact byte stream the browser's media recorder produced from the live camera track. Copied in untouched — never remuxed, never transcoded.",
+    metadataNote: "MediaRecorder containers carry no EXIF; timing and codec facts live in the container itself.",
+  },
+  "app-encoded-frame": {
+    folder: "rendered-frames",
+    short: "frame encoded by this app (canvas → JPEG)",
+    long: "A frame this app drew from the live video track onto a canvas and encoded as JPEG. It is NOT an original camera file: the pixels are what the browser handed the canvas, and the JPEG around them was written by this app. That is exactly why it is filed here and not in originals/.",
+    metadataNote: "None. A canvas encode cannot carry camera EXIF, so absent metadata here says nothing about authenticity.",
+  },
+};
 
 /** A derived render (heat map, crop, chart) held as a data or blob URL. */
 export type PackDerived = {
@@ -54,7 +140,13 @@ export type PackMediaItem = {
   /** Filename-safe id, e.g. "01-front". Determines ordering in the archive. */
   slug: string;
   label: string;
-  /** The original captured bytes. Null when only a rendered URL exists. */
+  /**
+   * How these bytes came to exist. Required: the archive folder and the claims
+   * the pack makes about this file both follow from it, so it must be stated by
+   * whichever code performed the capture rather than guessed at export time.
+   */
+  origin: PackOrigin;
+  /** The captured bytes exactly as received. Null when only a rendered URL exists. */
   blob?: Blob | null;
   /** Original name as produced by the camera or picker. */
   fileName?: string | null;
@@ -93,12 +185,24 @@ export type PackInput = {
   extraFiles?: { path: string; data: Blob | string }[];
 };
 
+/** Result of carving one media payload back out of the finished archive. */
+export type PackVerification = {
+  path: string;
+  label: string;
+  ok: boolean;
+  bytes: number;
+  crc32: string;
+  detail: string;
+};
+
 export type PackResult = {
   blob: Blob;
   fileName: string;
   files: number;
   bytes: number;
   warnings: string[];
+  /** Byte-identity check on every archived media payload. */
+  verification: PackVerification[];
 };
 
 const ENGINE_DOCS: { file: string; label: string; load: () => Promise<{ default: string }> }[] = [
@@ -280,15 +384,21 @@ async function scanMetadata(blob: Blob): Promise<MetadataScan> {
   return out;
 }
 
-function metadataText(item: PackMediaItem, scan: MetadataScan, archivedAs: string): string {
+function metadataText(item: PackMediaItem, scan: MetadataScan, archivedAs: string, bytes: number, type: string): string {
+  const origin = ORIGIN_INFO[item.origin];
   const lines: string[] = [
     `METADATA — ${item.label}`,
     "=".repeat(60),
-    `Archived original: ${archivedAs}`,
+    `Archived at: ${archivedAs}`,
+    `Origin: ${origin.short}`,
+    `  ${origin.long}`,
+    `  Expected metadata on this path: ${origin.metadataNote}`,
     `Original file name: ${item.fileName ?? "(not provided by the capture path)"}`,
-    `Declared type: ${item.blob?.type || "unknown"}`,
-    `Bytes: ${item.blob ? item.blob.size.toLocaleString("en-US") : "—"}`,
+    `Declared type: ${type || "unknown"}`,
+    `Bytes: ${bytes.toLocaleString("en-US")}`,
     item.captureMeta ? `Capture channel: ${item.captureMeta}` : "Capture channel: (not recorded)",
+    "",
+    "The dump below was read out of the archived bytes at export time, not copied from the app's screens.",
     "",
     `READABLE TAG DUMP — ${scan.tagCount} tag(s)`,
     "-".repeat(60),
@@ -333,6 +443,7 @@ function findingLine(f: Finding): string {
 
 type ScoreRationale = {
   label: string;
+  slug: string;
   score: number | null;
   confidence: number | null;
   verdictLabel: string | null;
@@ -361,6 +472,7 @@ function rationaleFor(item: PackMediaItem): ScoreRationale | null {
     .map((c) => `${c.label} — measured ${c.measured}; not scored (${c.provenance})`);
   return {
     label: item.label,
+    slug: item.slug,
     score: r.score,
     confidence: r.confidence,
     verdictLabel: r.verdictLabel || VERDICT_LABELS[r.verdict],
@@ -411,12 +523,18 @@ function timelineFrom(logs: LogEntry[]): string[] {
   return logs.map((l) => `${l.ts}  [${l.level.toUpperCase().padEnd(7)}] ${l.message}`);
 }
 
+/** The in-app log buffer size; a full buffer means earlier entries were dropped. */
+const LOG_BUFFER_LIMIT = 300;
+
 function logsText(logs: LogEntry[], title: string): string {
   return [
     `END-TO-END SESSION LOG — ${title}`,
     "=".repeat(70),
     `${logs.length} entr${logs.length === 1 ? "y" : "ies"}, in order, exactly as recorded on the device.`,
-    "Timestamps are local device time (24-hour). The log buffer keeps the most recent 300 entries.",
+    "Timestamps are local device time (24-hour).",
+    logs.length >= LOG_BUFFER_LIMIT
+      ? `The log buffer holds the most recent ${LOG_BUFFER_LIMIT} entries and was full at export, so entries from earlier in this session were dropped before the pack was built.`
+      : "The buffer never filled during this session, so this is the complete log — nothing was dropped.",
     "",
     ...timelineFrom(logs),
     "",
@@ -431,8 +549,10 @@ function coverageText(coverage: CheckCoverage[]): string[] {
   });
 }
 
-const READ_ME = (input: PackInput, files: string[]): string =>
-  [
+const READ_ME = (input: PackInput, files: string[], packed: PackedRecord[]): string => {
+  const hasOriginals = packed.some((p) => ORIGIN_INFO[p.origin].folder === "originals");
+  const hasRendered = packed.some((p) => ORIGIN_INFO[p.origin].folder === "rendered-frames");
+  return [
     "EVIDENCE PACK — READ ME FIRST",
     "=".repeat(70),
     "",
@@ -449,19 +569,34 @@ const READ_ME = (input: PackInput, files: string[]): string =>
     "                               what did not, the data read from the document, the timeline, thumbnails.",
     "report/                        The deep forensic report — every finding with observed vs expected, every",
     "                               measurement with its threshold and where that threshold came from.",
-    "originals/                     The captured photos and clips, byte-for-byte as the camera produced them.",
-    "                               Stored uncompressed inside this ZIP on purpose: what you extract is exactly",
-    "                               what was captured, same bytes, same EXIF, same hash.",
+    ...(hasOriginals
+      ? [
+          "originals/                     Media whose bytes this app did NOT create — camera files, platform stills,",
+          "                               recorder output — copied in byte-for-byte and stored uncompressed on purpose.",
+          "                               What you extract is exactly what arrived: same bytes, same metadata, same",
+          "                               hash. originals/SOURCES.txt states, per file, which capture path produced it.",
+        ]
+      : []),
+    ...(hasRendered
+      ? [
+          "rendered-frames/               Frames this app drew from the live video track and encoded itself. NOT camera",
+          "                               files: the pixels came from the browser, the JPEG was written here. They are",
+          "                               kept out of originals/ so they can never be mistaken for camera output.",
+          "                               rendered-frames/READ-ME.txt explains what that does and does not prove.",
+        ]
+      : []),
     "processed/                     What the engine derived from each capture — heat maps, error-level analysis,",
     "                               frequency charts, video frame strips, the straightened document crop and the",
     "                               aligned face crops. These are RENDERS, not captures. captions.txt in each",
     "                               folder explains how to read every image.",
     "metadata/                      Per file: the full readable tag dump plus the container-structure walk, read",
     "                               back out of the archived bytes at export time.",
+    "verification/                  The size, CRC-32 and byte offset of every file in this archive, so you can",
+    "                               confirm for yourself that nothing was altered. Instructions included.",
     "log/                           The complete end-to-end session log and the capture feed ledger.",
     "reference/                     The threshold reference and the engine documentation, so the reasoning can be",
     "                               audited without access to the app.",
-    "MANIFEST.txt                   Every file in this archive with its size.",
+    "MANIFEST.txt                   Every file in this archive with its exact byte size.",
     "",
     "HOW TO READ A SCORE",
     "-".repeat(70),
@@ -472,8 +607,145 @@ const READ_ME = (input: PackInput, files: string[]): string =>
     "",
     `FILES: ${files.length}`,
   ].join("\n");
+};
 
-function overviewText(input: PackInput, rationales: ScoreRationale[], files: string[], warnings: string[], logs: LogEntry[]): string {
+/** What actually got archived for one media item — the basis for every claim the overview makes. */
+type PackedRecord = {
+  slug: string;
+  label: string;
+  origin: PackOrigin;
+  archivedAs: string | null;
+  bytes: number | null;
+  type: string;
+  fileName: string | null;
+  captureMeta: string | null;
+  tagCount: number | null;
+};
+
+function sourcesText(packed: PackedRecord[], folder: "originals" | "rendered-frames"): string {
+  const rows = packed.filter((p) => p.archivedAs != null && ORIGIN_INFO[p.origin].folder === folder);
+  const header =
+    folder === "originals"
+      ? [
+          "ORIGINALS — WHERE EACH FILE CAME FROM",
+          "=".repeat(70),
+          "",
+          "Every file in this folder arrived as a finished byte stream that this app did not author. It was copied",
+          "into the archive without being decoded, resized, recompressed or re-encoded, and it is stored",
+          "uncompressed (ZIP method 0), so extracting it returns the identical bytes. Confirm that yourself with",
+          "verification/byte-identity.txt.",
+          "",
+          "What this does prove: the app did not modify these files.",
+          "What it does not prove: that the scene in front of the lens was genuine. That is what the forensic",
+          "checks in report/ are for.",
+          "",
+        ]
+      : [
+          "RENDERED FRAMES — WHAT THESE ARE, AND WHAT THEY ARE NOT",
+          "=".repeat(70),
+          "",
+          "These images are NOT camera files. Each one is a frame the app pulled from the live video track, drew",
+          "onto a canvas, and encoded as JPEG itself. The pixel values are the ones the browser delivered; the file",
+          "around them was written by this app.",
+          "",
+          "Consequences, stated plainly:",
+          "  • There is no camera EXIF, and there never could be. Missing metadata here is not a red flag.",
+          "  • The JPEG quantisation is the app's, so compression-based measurements on these frames describe the",
+          "    app's encoder as much as the camera. The engine accounts for that; a human reader should too.",
+          "  • The bytes below are still exactly what the app produced — nothing re-encoded them a second time on",
+          "    the way into this archive.",
+          "",
+        ];
+  const body = rows.flatMap((r) => [
+    `${r.archivedAs}`,
+    `  ${r.label}`,
+    `  Origin: ${ORIGIN_INFO[r.origin].short}`,
+    `  ${ORIGIN_INFO[r.origin].long}`,
+    `  Bytes: ${r.bytes?.toLocaleString("en-US") ?? "—"} · type ${r.type || "unknown"}${r.fileName ? ` · name as received: ${r.fileName}` : ""}`,
+    r.captureMeta ? `  Capture channel: ${r.captureMeta}` : "  Capture channel: (not recorded)",
+    `  Metadata read back at export: ${r.tagCount == null ? "not attempted" : `${r.tagCount} tag(s) — see metadata/${r.slug}.txt`}`,
+    "",
+  ]);
+  return [...header, ...body].join("\n");
+}
+
+const VERIFY_HOW_TO = [
+  "HOW TO CHECK THIS YOURSELF",
+  "-".repeat(70),
+  "",
+  "1. Extract and compare. Every entry is stored, not compressed, so extraction is a pure copy:",
+  "     unzip -p <this-pack>.zip 'originals/<file>' > out.bin",
+  "     cmp out.bin <the file you still hold>          # if you kept a copy",
+  "",
+  "2. Checksum. The CRC-32 below is the value written into the ZIP's own directory AND the value of the",
+  "   payload bytes. Any archiver will verify it:",
+  "     unzip -t <this-pack>.zip                        # tests every entry's CRC",
+  "     crc32 out.bin                                   # must equal the value listed below",
+  "",
+  "3. Carve at the raw offset — the strongest check, because it bypasses ZIP tooling entirely. Because the",
+  "   entries are stored uncompressed, the file's bytes sit contiguously in the archive at the offset given",
+  "   below and can be lifted straight out:",
+  "     dd if=<this-pack>.zip bs=1 skip=<data offset> count=<bytes> of=carved.bin",
+  "     cmp carved.bin out.bin                          # identical",
+  "   If carving at the stated offset yields a valid, openable image or video, the bytes were never",
+  "   transformed on the way in — there is nowhere for a re-encode to hide.",
+  "",
+  "A note on honesty: this file cannot contain the result of verifying itself — nothing can. It contains the",
+  "numbers you check against. The app also runs check 3 on every media payload immediately after building the",
+  "archive and reports the outcome on screen and in the session log.",
+  "",
+].join("\n");
+
+function verificationText(table: ZipEntryInfo[], mediaPaths: Map<string, { label: string; origin: PackOrigin }>): string {
+  const lines: string[] = [
+    "BYTE IDENTITY — VERIFICATION DATA",
+    "=".repeat(70),
+    "",
+    "Every entry in this archive is stored with compression method 0 (store). No entry was deflated, and no",
+    "media payload was decoded or re-encoded on the way in. For each file below you get its exact size, its",
+    "CRC-32, and the byte offset inside this ZIP where its payload begins.",
+    "",
+    VERIFY_HOW_TO,
+    "MEDIA PAYLOADS",
+    "=".repeat(70),
+    "",
+  ];
+  const mediaRows = table.filter((e) => mediaPaths.has(e.path));
+  if (mediaRows.length === 0) lines.push("(this pack contains no media — it is a report-only export)", "");
+  for (const e of mediaRows) {
+    const info = mediaPaths.get(e.path);
+    lines.push(
+      e.path,
+      `  ${info?.label ?? ""}`,
+      `  origin      ${info ? ORIGIN_INFO[info.origin].short : "unknown"}`,
+      `  bytes       ${e.size.toLocaleString("en-US")}`,
+      `  crc-32      ${crcHex(e.crc32)}`,
+      `  data offset ${e.dataOffset}   (payload occupies bytes ${e.dataOffset}–${e.dataOffset + e.size - 1})`,
+      ""
+    );
+  }
+  lines.push("ALL OTHER ENTRIES", "=".repeat(70), "", "path  |  bytes  |  crc-32  |  data offset", "-".repeat(70));
+  for (const e of table) {
+    if (mediaPaths.has(e.path)) continue;
+    lines.push(`${e.path}  |  ${e.size}  |  ${crcHex(e.crc32)}  |  ${e.dataOffset}`);
+  }
+  lines.push(
+    "",
+    "Entries added after this file was generated (the central directory, and this report's own entry) are not",
+    "listed above — a file cannot describe its own position before it has one. `unzip -t` covers those.",
+    ""
+  );
+  return lines.join("\n");
+}
+
+function overviewText(
+  input: PackInput,
+  rationales: ScoreRationale[],
+  packed: PackedRecord[],
+  files: string[],
+  warnings: string[],
+  logs: LogEntry[]
+): string {
   const lines: string[] = [
     "=".repeat(70),
     input.title.toUpperCase(),
@@ -512,7 +784,7 @@ function overviewText(input: PackInput, rationales: ScoreRationale[], files: str
         lines.push("  Measured but deliberately NOT scored (no proven separation yet — see reference/thresholds.txt):");
         for (const u of r.unscored) lines.push(`   · ${u}`);
       }
-      lines.push(`  Read more: report/deep-report.txt (full findings) · metadata/${r.label} (tags) · processed/ (renders)`);
+      lines.push(`  Read more: report/deep-report.txt (full findings) · metadata/${r.slug}.txt (tags) · processed/${r.slug}/ (renders)`);
     }
   }
 
@@ -525,14 +797,29 @@ function overviewText(input: PackInput, rationales: ScoreRationale[], files: str
     lines.push("", "─".repeat(70), section.title.toUpperCase(), "─".repeat(70), ...section.lines);
   }
 
-  const withMeta = (input.media ?? []).filter((m) => m.blob);
-  if (withMeta.length > 0) {
-    lines.push("", "─".repeat(70), "METADATA GATHERED", "─".repeat(70));
-    for (const m of withMeta) {
+  const archived = packed.filter((p) => p.archivedAs != null);
+  if (archived.length > 0) {
+    lines.push(
+      "",
+      "─".repeat(70),
+      "EVIDENCE FILES — WHERE EACH ONE CAME FROM",
+      "─".repeat(70),
+      "Files under originals/ are byte-for-byte as they arrived; this app never decoded or re-encoded them.",
+      "Files under rendered-frames/ were encoded by this app from the live video track and carry no camera",
+      "metadata — they are kept separate so they cannot be mistaken for camera output. Verify any of it with",
+      "verification/byte-identity.txt.",
+      ""
+    );
+    for (const p of archived) {
       lines.push(
-        `${m.label}: ${m.fileName ?? "(unnamed)"} · ${m.blob ? formatBytes(m.blob.size) : "—"} · ${m.blob?.type || "unknown type"}${m.captureMeta ? ` · ${m.captureMeta}` : ""}`
+        `${p.label}`,
+        `  file      ${p.archivedAs}`,
+        `  origin    ${ORIGIN_INFO[p.origin].short}`,
+        `  size      ${p.bytes == null ? "—" : formatBytes(p.bytes)} · type ${p.type || "unknown"}${p.fileName ? ` · name as received: ${p.fileName}` : ""}`,
+        p.captureMeta ? `  channel   ${p.captureMeta}` : "  channel   (not recorded)",
+        `  metadata  ${p.tagCount == null ? "not read" : `${p.tagCount} tag(s) read back from the archived bytes → metadata/${p.slug}.txt`}`,
+        ""
       );
-      lines.push(`  Full tag dump: metadata/${m.slug}.txt`);
     }
   }
 
@@ -603,6 +890,7 @@ code{background:#efece6;padding:1px 5px;border-radius:5px;font:12px ui-monospace
 function overviewHtml(
   input: PackInput,
   rationales: ScoreRationale[],
+  packed: PackedRecord[],
   thumbs: { slug: string; label: string; url: string | null; meta: string }[],
   files: string[],
   warnings: string[],
@@ -646,7 +934,10 @@ function overviewHtml(
         "</div>"
       );
     }
-    parts.push("</div>", '<p class="muted">Previews only — the untouched originals are in <code>originals/</code>.</p>');
+    parts.push(
+      "</div>",
+      '<p class="muted">These thumbnails are downscaled JPEGs generated for this page only. The full-size files are in <code>originals/</code> (bytes exactly as they arrived) and <code>rendered-frames/</code> (frames this app encoded itself) — see the evidence table below for which is which.</p>'
+    );
   }
 
   if (rationales.length > 0) {
@@ -681,7 +972,7 @@ function overviewHtml(
         );
       }
       parts.push(
-        `<p class="muted">Read more: <code>report/deep-report.txt</code> · <code>metadata/${esc(r.label)}</code> · <code>processed/</code></p>`,
+        `<p class="muted">Read more: <code>report/deep-report.txt</code> · <code>metadata/${esc(r.slug)}.txt</code> · <code>processed/${esc(r.slug)}/</code></p>`,
         "</div>"
       );
     }
@@ -704,14 +995,16 @@ function overviewHtml(
     parts.push(`<h2>${esc(section.title)}</h2><ul>`, section.lines.map((l) => `<li>${esc(l)}</li>`).join(""), "</ul>");
   }
 
-  const withMeta = (input.media ?? []).filter((m) => m.blob);
-  if (withMeta.length > 0) {
+  const archived = packed.filter((p) => p.archivedAs != null);
+  if (archived.length > 0) {
     parts.push(
-      "<h2>Metadata gathered</h2><table><thead><tr><th>Capture</th><th>File</th><th>Read at export</th></tr></thead><tbody>",
-      withMeta
+      "<h2>Evidence files — where each one came from</h2>",
+      '<p class="muted">Files under <code>originals/</code> are byte-for-byte as they arrived: this app never decoded or re-encoded them. Files under <code>rendered-frames/</code> were encoded by this app from the live video track and cannot carry camera metadata, so they are kept separate rather than presented as camera output. Every size and checksum can be re-checked from <code>verification/byte-identity.txt</code>.</p>',
+      "<table><thead><tr><th>Capture</th><th>Archived as</th><th>Origin</th><th>Metadata</th></tr></thead><tbody>",
+      archived
         .map(
-          (m) =>
-            `<tr><td><b>${esc(m.label)}</b>${m.captureMeta ? `<br><span class="muted">${esc(m.captureMeta)}</span>` : ""}</td><td>${esc(m.fileName ?? "(unnamed)")}<br><span class="muted">${esc(m.blob ? formatBytes(m.blob.size) : "—")} · ${esc(m.blob?.type || "unknown")}</span></td><td><code>metadata/${esc(m.slug)}.txt</code></td></tr>`
+          (p) =>
+            `<tr><td><b>${esc(p.label)}</b>${p.captureMeta ? `<br><span class="muted">${esc(p.captureMeta)}</span>` : ""}</td><td><code>${esc(p.archivedAs ?? "")}</code><br><span class="muted">${esc(p.bytes == null ? "—" : formatBytes(p.bytes))} · ${esc(p.type || "unknown")}${p.fileName ? ` · ${esc(p.fileName)}` : ""}</span></td><td><span class="muted">${esc(ORIGIN_INFO[p.origin].short)}</span></td><td>${p.tagCount == null ? '<span class="muted">not read</span>' : `${p.tagCount} tag(s)<br><code>metadata/${esc(p.slug)}.txt</code>`}</td></tr>`
         )
         .join(""),
       "</tbody></table>"
@@ -736,6 +1029,7 @@ function overviewHtml(
 
   parts.push(
     '<h2>How to read this</h2><p class="muted">Each file starts at 100 points. A failed check removes its full weight, a warning removes 40% of it, and the deductions above add up to the score shown — nothing is hidden. A low confidence figure means little evidence was available (small image, stripped metadata); low confidence is never treated as guilt. Everything here was produced on this device; nothing was uploaded.</p>',
+    '<h2>Proving the files were not altered</h2><p class="muted">Every entry in this archive is stored uncompressed, so extracting a file is a straight copy of the bytes that went in. <code>verification/byte-identity.txt</code> lists each file\'s exact size, its CRC-32 and the byte offset where its payload starts inside the ZIP, with three ways to confirm it — including carving the bytes out at the raw offset without any ZIP tooling at all. Do not take the claim on trust; the numbers are there to be checked.</p>',
     "</div></body></html>"
   );
 
@@ -756,34 +1050,64 @@ export async function buildEvidencePack(input: PackInput, onProgress?: (message:
   const logs = input.logs ?? [];
   const thumbs: { slug: string; label: string; url: string | null; meta: string }[] = [];
   const rationales: ScoreRationale[] = [];
+  const packed: PackedRecord[] = [];
+  /** Archived media path → the exact source blob, for the post-build byte comparison. */
+  const mediaSources = new Map<string, { label: string; origin: PackOrigin; source: Blob }>();
 
-  const add = (path: string, data: ZipEntry["data"]): void => {
-    entries.push({ path: safeZipPath(path), data, date: now });
+  const add = (path: string, data: ZipEntry["data"]): string => {
+    const safe = safeZipPath(path);
+    entries.push({ path: safe, data, date: now });
+    return safe;
   };
 
-  // ── Originals, derived renders, metadata ──
+  // ── Captured media, derived renders, metadata ──
   for (const item of media) {
     onProgress?.(`Packing ${item.label}…`);
     const rationale = rationaleFor(item);
     if (rationale) rationales.push(rationale);
 
-    let archivedAs = "(no original bytes held)";
-    const original = item.blob ?? null;
-    if (original) {
-      archivedAs = `originals/${item.slug}.${extensionFor(original, item.fileName)}`;
-      add(archivedAs, original);
+    const folder = ORIGIN_INFO[item.origin].folder;
+    // A blob is the capture itself; a url-only item is a canvas render fetched back.
+    const source = item.blob ?? (item.url ? await urlToBlob(item.url) : null);
+    const record: PackedRecord = {
+      slug: item.slug,
+      label: item.label,
+      origin: item.origin,
+      archivedAs: null,
+      bytes: null,
+      type: source?.type ?? "",
+      fileName: item.fileName ?? null,
+      captureMeta: item.captureMeta ?? null,
+      tagCount: null,
+    };
+    let archivedAs = "(no bytes held for this item)";
+
+    if (source) {
+      archivedAs = add(`${folder}/${item.slug}.${extensionFor(source, item.fileName)}`, source);
+      record.archivedAs = archivedAs;
+      record.bytes = source.size;
+      mediaSources.set(archivedAs, { label: item.label, origin: item.origin, source });
+      if (!item.blob) {
+        warnings.push(
+          `${item.label}: no camera file exists for this capture — it was a frame the app encoded from the live video track, so it is archived under ${folder}/ and carries no camera metadata.`
+        );
+      }
       try {
-        const scan = await scanMetadata(original);
-        add(`metadata/${item.slug}.txt`, metadataText(item, scan, archivedAs));
+        const scan = await scanMetadata(source);
+        record.tagCount = scan.tagCount;
+        add(`metadata/${item.slug}.txt`, metadataText(item, scan, archivedAs, source.size, source.type));
         add(
           `metadata/${item.slug}.json`,
           JSON.stringify(
             {
               label: item.label,
               archivedAs,
+              origin: item.origin,
+              originDescription: ORIGIN_INFO[item.origin].long,
+              bytesAreUnalteredByThisApp: item.origin !== "app-encoded-frame",
               originalFileName: item.fileName ?? null,
-              declaredType: original.type || null,
-              bytes: original.size,
+              declaredType: source.type || null,
+              bytes: source.size,
               captureChannel: item.captureMeta ?? null,
               tagCount: scan.tagCount,
               tags: scan.tags,
@@ -795,22 +1119,16 @@ export async function buildEvidencePack(input: PackInput, onProgress?: (message:
           )
         );
       } catch (err) {
-        warnings.push(`${item.label}: metadata could not be re-read at export (${err instanceof Error ? err.message : String(err)}). The original bytes are still in ${archivedAs}.`);
+        warnings.push(
+          `${item.label}: metadata could not be re-read at export (${err instanceof Error ? err.message : String(err)}). The bytes themselves are unaffected and are in ${archivedAs}.`
+        );
       }
     } else if (item.url) {
-      const fetched = await urlToBlob(item.url);
-      if (fetched) {
-        archivedAs = `originals/${item.slug}.${extensionFor(fetched, item.fileName)}`;
-        add(archivedAs, fetched);
-        warnings.push(
-          `${item.label}: this capture exists only as a frame rendered by the browser (no camera file), so it is archived as encoded by the app rather than as original camera bytes.`
-        );
-      } else {
-        warnings.push(`${item.label}: image data was no longer available in memory at export time, so it could not be archived.`);
-      }
+      warnings.push(`${item.label}: the image data was no longer available in memory at export time, so it could not be archived.`);
     } else {
       warnings.push(`${item.label}: not captured in this session, so there is nothing to archive.`);
     }
+    packed.push(record);
 
     // Derived renders: report visuals + ELA + anything the surface adds.
     const derived: PackDerived[] = [
@@ -828,22 +1146,22 @@ export async function buildEvidencePack(input: PackInput, onProgress?: (message:
         `DERIVED RENDERS — ${item.label}`,
         "=".repeat(60),
         "These images were PRODUCED BY THE ENGINE from the capture. They are not photographs and not evidence of",
-        `themselves — they localise what the checks measured. The untouched capture is ${archivedAs}.`,
+        `themselves — they localise what the checks measured. The capture itself is ${archivedAs}.`,
         "",
       ];
       for (const d of derived) {
-        const blob = await urlToBlob(d.url);
-        if (!blob) {
+        const renderBlob = await urlToBlob(d.url);
+        if (!renderBlob) {
           warnings.push(`${item.label}: the "${d.label}" render was no longer available at export time.`);
           continue;
         }
-        const ext = extensionFor(blob, null);
+        const ext = extensionFor(renderBlob, null);
         const path = `processed/${item.slug}/${d.id}.${ext === "bin" ? "png" : ext}`;
-        add(path, blob);
+        add(path, renderBlob);
         captions.push(`${d.id}.${ext === "bin" ? "png" : ext} — ${d.label}`, `  ${d.caption ?? "(no caption recorded)"}`, "");
       }
       add(`processed/${item.slug}/captions.txt`, captions.join("\n"));
-    } else if (original) {
+    } else if (source) {
       warnings.push(`${item.label}: no derived renders were produced (pixel visualisations run on captures the engine screened in full).`);
     }
 
@@ -853,16 +1171,25 @@ export async function buildEvidencePack(input: PackInput, onProgress?: (message:
       label: item.label,
       url: thumbUrl,
       meta: [
-        original ? formatBytes(original.size) : item.url ? "browser frame" : "not captured",
+        source ? formatBytes(source.size) : "not captured",
+        ORIGIN_INFO[item.origin].folder === "originals" ? "unaltered bytes" : "app-encoded frame",
         item.report ? `score ${item.report.score}/100` : null,
         item.captureMeta ?? null,
       ]
         .filter(Boolean)
         .join(" · "),
     });
-    if (!thumbUrl && (original || item.url)) {
-      warnings.push(`${item.label}: a preview thumbnail could not be rendered for the overview (the original is unaffected).`);
+    if (!thumbUrl && source) {
+      warnings.push(`${item.label}: a preview thumbnail could not be rendered for the overview — the archived file itself is unaffected.`);
     }
+  }
+
+  // ── Per-folder provenance statements ──
+  if (packed.some((p) => p.archivedAs != null && ORIGIN_INFO[p.origin].folder === "originals")) {
+    add("originals/SOURCES.txt", sourcesText(packed, "originals"));
+  }
+  if (packed.some((p) => p.archivedAs != null && ORIGIN_INFO[p.origin].folder === "rendered-frames")) {
+    add("rendered-frames/READ-ME.txt", sourcesText(packed, "rendered-frames"));
   }
 
   // ── Deep report ──
@@ -922,38 +1249,116 @@ export async function buildEvidencePack(input: PackInput, onProgress?: (message:
 
   // ── Overview, read-me and manifest last: they list everything else. ──
   onProgress?.("Writing the overview…");
-  const TOP_LEVEL = ["MANIFEST.txt", "READ-ME-FIRST.txt", "overview.html", "overview.txt"];
+  const TOP_LEVEL = [
+    "MANIFEST.txt",
+    "READ-ME-FIRST.txt",
+    "overview.html",
+    "overview.txt",
+    "verification/byte-identity.txt",
+    "verification/byte-identity.json",
+  ];
   const listing = [...entries.map((e) => e.path), ...TOP_LEVEL].sort((a, b) => a.localeCompare(b));
-  const sized = new Map(entries.map((e) => [e.path, e.data instanceof Blob ? e.data.size : null] as const));
-  add("overview.txt", overviewText(input, rationales, listing, warnings, logs));
-  add("overview.html", overviewHtml(input, rationales, thumbs, listing, warnings, logs));
-  add("READ-ME-FIRST.txt", READ_ME(input, listing));
+  add("overview.txt", overviewText(input, rationales, packed, listing, warnings, logs));
+  add("overview.html", overviewHtml(input, rationales, packed, thumbs, listing, warnings, logs));
+  add("READ-ME-FIRST.txt", READ_ME(input, listing, packed));
+
+  const encoder = new TextEncoder();
+  const byteLength = (data: ZipEntry["data"]): number => {
+    if (data instanceof Blob) return data.size;
+    if (typeof data === "string") return encoder.encode(data).length;
+    if (data instanceof ArrayBuffer) return data.byteLength;
+    return data.byteLength;
+  };
+  const sized = new Map(entries.map((e) => [e.path, byteLength(e.data)] as const));
   add(
     "MANIFEST.txt",
     [
       `EVIDENCE PACK MANIFEST — ${input.title}`,
       "=".repeat(70),
       `Exported ${now.toISOString()}`,
-      `${listing.length} files. Media sizes are the exact archived byte counts; text files are generated at export.`,
+      `${listing.length} files. Every size below is the exact number of bytes stored in this archive.`,
+      "This manifest, the overview pages and the verification report all describe the archive they sit inside, so",
+      "their own sizes are listed in verification/byte-identity.txt rather than here.",
       "",
       ...listing.map((path) => {
         const bytes = sized.get(path);
-        return bytes == null ? path : `${path}  (${bytes.toLocaleString("en-US")} bytes)`;
+        return bytes == null ? `${path}  (size listed in verification/byte-identity.txt)` : `${path}  (${bytes.toLocaleString("en-US")} bytes)`;
       }),
     ].join("\n")
   );
 
   onProgress?.("Compiling the archive…");
-  const blob = await buildZip(entries, (p) => {
-    if (p.done % 4 === 0 || p.done === p.total) onProgress?.(`Archiving ${p.done}/${p.total} — ${p.path}`);
+  const mediaPaths = new Map([...mediaSources].map(([path, v]) => [path, { label: v.label, origin: v.origin }] as const));
+  const { blob, entries: table } = await buildZip(entries, {
+    onProgress: (p) => {
+      if (p.done % 4 === 0 || p.done === p.total) onProgress?.(`Archiving ${p.done}/${p.total} — ${p.path}`);
+    },
+    // Written after layout, so it can cite the real offset and checksum of every entry above it.
+    finalize: (laidOut) => [
+      { path: "verification/byte-identity.txt", data: verificationText(laidOut, mediaPaths), date: now },
+      {
+        path: "verification/byte-identity.json",
+        data: JSON.stringify(
+          {
+            exportedAt: now.toISOString(),
+            compressionMethod: "store (0) — nothing in this archive is compressed",
+            note: "dataOffset is the absolute byte position of the payload inside this ZIP. Carve `bytes` bytes from there to recover the file exactly.",
+            entries: laidOut.map((e) => {
+              const info = mediaPaths.get(e.path);
+              return {
+                path: e.path,
+                bytes: e.size,
+                crc32: crcHex(e.crc32),
+                dataOffset: e.dataOffset,
+                isMediaPayload: info != null,
+                origin: info?.origin ?? null,
+                bytesAreUnalteredByThisApp: info ? info.origin !== "app-encoded-frame" : null,
+              };
+            }),
+          },
+          null,
+          2
+        ),
+        date: now,
+      },
+    ],
   });
+
+  // ── Verify the claim rather than asserting it: carve every media payload back
+  //    out of the finished archive and compare it to the source, byte for byte.
+  onProgress?.("Verifying archived bytes…");
+  const verification: PackVerification[] = [];
+  for (const [path, entry] of mediaSources) {
+    const info = table.find((e) => e.path === path);
+    if (!info) {
+      verification.push({ path, label: entry.label, ok: false, bytes: entry.source.size, crc32: "", detail: "not found in the archive index" });
+      warnings.push(`${entry.label}: could not be located in the finished archive to verify — treat this pack as incomplete.`);
+      continue;
+    }
+    try {
+      const carved = blob.slice(info.dataOffset, info.dataOffset + info.size);
+      const { identical, crc32, firstDifferenceAt } = await verifyBytes(carved, entry.source);
+      const crcMatches = crc32 === info.crc32;
+      const ok = identical && crcMatches && info.size === entry.source.size;
+      const detail = ok
+        ? `${info.size.toLocaleString("en-US")} bytes identical to the capture · CRC-32 ${crcHex(info.crc32)} · payload at offset ${info.dataOffset}`
+        : `MISMATCH — archived ${info.size} bytes vs source ${entry.source.size}${firstDifferenceAt != null ? `, first difference at byte ${firstDifferenceAt}` : ""}${crcMatches ? "" : ", CRC-32 disagrees"}`;
+      verification.push({ path, label: entry.label, ok, bytes: info.size, crc32: crcHex(info.crc32), detail });
+      if (!ok) warnings.push(`${entry.label}: the archived bytes do NOT match the capture (${path}). Do not rely on this file.`);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      verification.push({ path, label: entry.label, ok: false, bytes: info.size, crc32: crcHex(info.crc32), detail: `could not be verified (${reason})` });
+      warnings.push(`${entry.label}: the byte-identity check could not run on ${path} (${reason}).`);
+    }
+  }
 
   return {
     blob,
     fileName: `${safeZipPath(input.surface)}-evidence-${stamp(now)}.zip`,
-    files: entries.length,
+    files: table.length,
     bytes: blob.size,
     warnings,
+    verification,
   };
 }
 

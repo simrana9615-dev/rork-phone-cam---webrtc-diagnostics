@@ -25,6 +25,7 @@ import type { PulseEstimate } from "@/lib/ppg";
 import { computeDocConfidence, type DocumentDataCheck } from "@/lib/mrz";
 import { crossCheckLicenceData, type LicenceBarcodeCheck } from "@/lib/pdf417";
 import type { QuickQuality } from "@/lib/capture-quality";
+import type { PackOrigin } from "@/lib/evidence-pack";
 
 export type DocType = "passport" | "licence";
 export type CaptureMethod = "webrtc" | "native";
@@ -168,6 +169,12 @@ export type PageResult = {
   url: string;
   fileName: string;
   captureMeta: string;
+  /**
+   * How these bytes came to exist — recorded by the capture path, not inferred
+   * later. Decides whether the evidence pack may present the file as an
+   * unaltered camera original or must file it as a frame the app encoded.
+   */
+  origin: PackOrigin;
   report: MediaFraudReport;
   portrait: FaceDescription | null;
   /** Optional deep data check (MRZ + ICAO 9303 + zone cross-validation). */

@@ -42,7 +42,7 @@ import CaptureHoldOverlay from "@/components/verify/CaptureHoldOverlay";
 import CaptureLedgerSection from "@/components/verify/CaptureLedgerSection";
 import SilentClipDurationSetting from "@/components/verify/SilentClipDurationSetting";
 import EvidencePackButton from "@/components/EvidencePackButton";
-import type { PackInput, PackMediaItem } from "@/lib/evidence-pack";
+import { originForCaptureEngine, type PackInput, type PackMediaItem, type PackOrigin } from "@/lib/evidence-pack";
 import { downloadBlob, makeLog, trackSettings, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError, capacitorCapturePhoto, engineLaunchNote, engineOption, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
 import { runCaptureHold } from "@/lib/capture-hold";
@@ -556,6 +556,8 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   const template = cfg.template;
   const firstNativePage = cfg.nativePages[0];
   const captureEngine = useCaptureEngine();
+  /** Provenance tier for File-based captures on the selected engine (camera vs picker). */
+  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
   /** Latest doc/selfie file handlers — refs avoid use-before-define in the capture launchers declared above the handlers. */
   const handleDocFileRef = useRef<(pageId: string, file: File, changeIsTrusted: boolean) => void>(() => undefined);
   const handleSelfieFallbackFileRef = useRef<(file: File, changeIsTrusted: boolean) => void>(() => undefined);
@@ -785,7 +787,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
 
   /** Shared post-forensics tail: portrait detection + storage + follow-up data checks. */
   const finishDocAnalysis = useCallback(
-    async (page: PageDef, blob: Blob, fileName: string, meta: string, report: MediaFraudReport) => {
+    async (page: PageDef, blob: Blob, fileName: string, meta: string, report: MediaFraudReport, origin: PackOrigin) => {
       pushLog(
         report.verdict === "authentic" ? "success" : report.verdict === "suspicious" || report.verdict === "needs-more-info" ? "warn" : "error",
         `${page.label}: ${report.verdictLabel} · score ${report.score}/100 · confidence ${report.confidence}% · outcome ${report.docOutcome ?? "—"}`
@@ -820,7 +822,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       setPageResults((prev) => {
         const old = prev[page.id];
         if (old) URL.revokeObjectURL(old.url);
-        return { ...prev, [page.id]: { page, blob, url, fileName, captureMeta: meta, report, portrait, quickQuality } };
+        return { ...prev, [page.id]: { page, blob, url, fileName, captureMeta: meta, origin, report, portrait, quickQuality } };
       });
       setAiState((prev) => ({ ...prev, [page.id]: { verdict: null, loading: false, error: null } }));
       if (navigator.vibrate) navigator.vibrate(15);
@@ -872,7 +874,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         });
         const fileName = file.name || `${template.doc}-${page.id}-${Date.now()}.jpg`;
         const meta = `${engineOption(captureEngine).label} · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
-        await finishDocAnalysis(page, file, fileName, meta, report);
+        await finishDocAnalysis(page, file, fileName, meta, report, fileOrigin);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         pushLog("error", `${page.label} analysis failed: ${msg}`);
@@ -883,7 +885,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         }
       }
     },
-    [captureEngine, finishDocAnalysis, pushLog, template.doc]
+    [captureEngine, fileOrigin, finishDocAnalysis, pushLog, template.doc]
   );
 
   /** Opens the native camera for a given document page, tracking press timing. */
@@ -1986,6 +1988,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       media.push({
         slug: `${String(i + 1).padStart(2, "0")}-${p.page.id}`,
         label: p.page.label,
+        origin: p.origin,
         blob: p.blob,
         fileName: p.fileName,
         captureMeta: p.captureMeta,
@@ -2012,6 +2015,8 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       media.push({
         slug: "50-face",
         label: face.mode === "native-selfie" ? "Fallback selfie" : "Liveness identity frame",
+        // The liveness identity frame is drawn and encoded in-browser; a fallback selfie is a real camera file.
+        origin: face.mode === "native-selfie" ? fileOrigin : "app-encoded-frame",
         blob: face.blob ?? null,
         url: face.url,
         fileName: face.report?.fileName ?? null,
@@ -2035,9 +2040,11 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       media.push({
         slug: `6${i}-silent-still-${cap.pageId}`,
         label: `Silent front still — before ${cap.pageLabel}${isBest ? " (session best)" : ""}`,
+        // Chosen frame from the clip, drawn to a canvas and JPEG-encoded here — not a camera file.
+        origin: "app-encoded-frame",
         blob: cap.blob,
         url: cap.url,
-        captureMeta: `voluntary passive front capture, ${cap.width}×${cap.height}, browser-encoded frame from the live feed`,
+        captureMeta: `voluntary passive front capture, ${cap.width}×${cap.height}, frame encoded by the app from the live feed`,
         report: cap.report,
         ai: aiVerdicts[`silent-${cap.pageId}`] ?? null,
         derived: cap.face?.cropUrl
@@ -2060,9 +2067,11 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         media.push({
           slug: `6${i}-silent-clip-${cap.pageId}`,
           label: `Silent front clip — before ${cap.pageLabel}`,
+          // Straight out of MediaRecorder — never remuxed or transcoded by the app.
+          origin: "recorder-stream",
           blob: cap.videoBlob,
           captureMeta: `recorded from the live front feed (${cap.videoMime ?? "unknown container"})`,
-          notes: ["Original recorder output, unmodified. The micro-motion and pulse evidence above was measured from this clip."],
+          notes: ["Recorder output exactly as the browser produced it. The micro-motion and pulse evidence above was measured from this clip."],
         });
       }
     });
@@ -2118,7 +2127,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       title: `${cfg.title} — Evidence Pack`,
       subtitle: `${template.doc === "passport" ? "Passport" : "Driver licence"} · native camera capture · voluntary silent front checks · face step: ${template.faceMode}`,
       scopeNote:
-        "Produced entirely on this device during this session; nothing was uploaded. Document pages and silent clips are archived exactly as the camera and recorder produced them.",
+        "Produced entirely on this device during this session; nothing was uploaded. Document pages arrive as camera files and silent clips as recorder output — both archived exactly as produced, byte-for-byte. The silent stills and the liveness identity frame were encoded by this app from the live video track, so they sit in rendered-frames rather than originals and carry no camera metadata by nature.",
       verdict: {
         label: overall.verdict === "pass" ? "PASS" : overall.verdict === "review" ? "NEEDS REVIEW" : "FAIL",
         tone: overall.verdict,
@@ -3121,12 +3130,19 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
                 Evidence Pack — Everything, One File
               </h2>
               <p className="text-[10.5px] leading-snug text-muted-foreground">
-                One ZIP with every document page, the face capture and every voluntary silent still and clip in their
-                <strong className="text-foreground"> original captured form</strong> (stored uncompressed — same bytes, same EXIF), the engine's
-                renders beside them, per-file metadata, the full end-to-end log plus capture ledger, the deep report, and a printable overview that
-                explains the score deduction by deduction.
+                One ZIP with every document page, the face capture and every voluntary silent still and clip archived
+                <strong className="text-foreground"> byte-for-byte</strong> — stored uncompressed, so what comes out is what went in, with the
+                offsets and checksums included to prove it. Camera files and recorder clips sit in <span className="mono">originals/</span>; the
+                silent stills and liveness frame, which this app encoded from the live feed, are kept separately in{" "}
+                <span className="mono">rendered-frames/</span> so they are never presented as camera output. Plus the engine's renders, per-file
+                metadata, the full end-to-end log and capture ledger, the deep report, and a printable overview that explains the score deduction by
+                deduction.
               </p>
-              <EvidencePackButton build={buildPack} pushLog={pushLog} hint="Open overview.html inside the ZIP first — it points at everything else." />
+              <EvidencePackButton
+                build={buildPack}
+                pushLog={pushLog}
+                hint="Open overview.html inside the ZIP first — it points at everything else. Every archived file is re-checked against the capture before the download completes."
+              />
             </section>
 
             <section className="animate-rise space-y-2 rounded-2xl border border-border/70 bg-card p-3.5" style={{ animationDelay: "560ms" }}>

@@ -9,6 +9,7 @@
 
 import type { AiMediaVerdict, MediaFraudReport } from "@/lib/fraud-detection";
 import type { FaceDescription } from "@/lib/face-vision";
+import type { PackOrigin } from "@/lib/evidence-pack";
 import type { DocumentDataCheck } from "@/lib/mrz";
 import type { LicenceBarcodeCheck } from "@/lib/pdf417";
 import type { QuickQuality } from "@/lib/capture-quality";
@@ -19,6 +20,8 @@ export type StoredPage = {
   blob: Blob;
   fileName: string;
   captureMeta: string;
+  /** Capture provenance tier, persisted so a resumed session keeps telling the truth. */
+  origin: PackOrigin;
   report: MediaFraudReport;
   portrait: FaceDescription | null;
   docData: DocumentDataCheck | null;

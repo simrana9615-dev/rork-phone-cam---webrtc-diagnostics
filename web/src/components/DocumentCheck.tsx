@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { FileJson, FileText, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -15,7 +15,7 @@ import DocDataPanel from "@/components/DocDataPanel";
 import { computeDocConfidence, type DocumentDataCheck } from "@/lib/mrz";
 import { downloadBlob, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import EvidencePackButton from "@/components/EvidencePackButton";
-import type { PackInput } from "@/lib/evidence-pack";
+import { originForCaptureEngine, type PackInput, type PackOrigin } from "@/lib/evidence-pack";
 import { formatReportText } from "@/lib/fraud-detection";
 
 /**
@@ -25,6 +25,8 @@ import { formatReportText } from "@/lib/fraud-detection";
  */
 export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
   const captureEngine = useCaptureEngine();
+  /** Whether these bytes are a fresh camera file or a photo picked from storage. */
+  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
   const uploadRef = useRef<HTMLInputElement | null>(null);
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<File | null>(null);
@@ -140,6 +142,7 @@ export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogL
         {
           slug: "01-document",
           label: "Document image",
+          origin: fileOrigin,
           blob: file,
           fileName: file?.name ?? report.fileName,
           captureMeta: file ? `supplied file · ${file.type || "unknown type"} · last modified ${new Date(file.lastModified).toISOString()}` : null,

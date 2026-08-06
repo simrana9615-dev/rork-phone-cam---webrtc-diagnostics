@@ -27,6 +27,8 @@ const VERSION = 20;
 const FLAG_UTF8 = 0x0800;
 const METHOD_STORE = 0;
 const MAX_ENTRY_BYTES = 0xffffffff;
+/** EOCD stores the central-directory offset in 32 bits, so the whole archive must fit too. */
+const MAX_ARCHIVE_BYTES = 0xffffffff;
 const CRC_CHUNK = 4 * 1024 * 1024;
 
 let crcTable: Uint32Array | null = null;
@@ -112,13 +114,46 @@ function toBlob(data: ZipEntry["data"]): Blob {
   return new Blob([copy.buffer]);
 }
 
-async function crcOfBlob(blob: Blob): Promise<number> {
+/** CRC-32 of a blob, streamed so a large clip never lands in memory whole. */
+export async function crc32OfBlob(blob: Blob): Promise<number> {
   const crc = new Crc32();
   for (let offset = 0; offset < blob.size; offset += CRC_CHUNK) {
     const slice = blob.slice(offset, Math.min(offset + CRC_CHUNK, blob.size));
     crc.update(new Uint8Array(await slice.arrayBuffer()));
   }
   return crc.value;
+}
+
+/** CRC-32 as the 8-digit lowercase hex string that zip/crc32 tools print. */
+export function crcHex(crc: number): string {
+  return (crc >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Streams two blobs side by side, comparing them byte-for-byte while computing
+ * the CRC-32 of the first. One pass over each, 4 MB at a time — used to verify
+ * that what landed in the archive is exactly what went in.
+ */
+export async function verifyBytes(archived: Blob, source: Blob): Promise<{ identical: boolean; crc32: number; firstDifferenceAt: number | null }> {
+  const crc = new Crc32();
+  let identical = archived.size === source.size;
+  let firstDifferenceAt: number | null = identical ? null : Math.min(archived.size, source.size);
+  const limit = Math.min(archived.size, source.size);
+  for (let offset = 0; offset < archived.size; offset += CRC_CHUNK) {
+    const end = Math.min(offset + CRC_CHUNK, archived.size);
+    const a = new Uint8Array(await archived.slice(offset, end).arrayBuffer());
+    crc.update(a);
+    if (firstDifferenceAt != null && offset >= limit) continue;
+    const b = new Uint8Array(await source.slice(offset, Math.min(end, limit)).arrayBuffer());
+    for (let i = 0; i < b.length; i += 1) {
+      if (a[i] !== b[i]) {
+        identical = false;
+        if (firstDifferenceAt == null) firstDifferenceAt = offset + i;
+        break;
+      }
+    }
+  }
+  return { identical, crc32: crc.value, firstDifferenceAt };
 }
 
 type Writer = {
@@ -159,21 +194,51 @@ type PreparedEntry = {
   date: number;
 };
 
+/** Where an entry physically lives in the finished archive. */
+export type ZipEntryInfo = {
+  path: string;
+  size: number;
+  crc32: number;
+  /** Offset of the local file header. */
+  headerOffset: number;
+  /** Offset of the first payload byte — carve from here for `size` bytes. */
+  dataOffset: number;
+};
+
+export type BuildZipOptions = {
+  onProgress?: (p: ZipProgress) => void;
+  /**
+   * Called once every entry above has been laid out, so the entries it returns
+   * can cite the exact offset and checksum of everything before them. This is
+   * how a verification report gets written into the archive it describes.
+   */
+  finalize?: (table: ZipEntryInfo[]) => Promise<ZipEntry[]> | ZipEntry[];
+};
+
+export type ZipResult = {
+  blob: Blob;
+  /** Offset/size/CRC of every entry, so any of them can be carved back out. */
+  entries: ZipEntryInfo[];
+};
+
 /**
  * Builds a ZIP archive from the given entries.
  *
  * Duplicate paths are de-duplicated (`name.ext` → `name (2).ext`) so a caller
- * never silently loses a file. Progress is reported per entry.
+ * never silently loses a file. Progress is reported per entry, and the returned
+ * table locates every payload inside the archive.
  */
-export async function buildZip(entries: ZipEntry[], onProgress?: (p: ZipProgress) => void): Promise<Blob> {
+export async function buildZip(entries: ZipEntry[], options?: BuildZipOptions): Promise<ZipResult> {
   const encoder = new TextEncoder();
   const used = new Set<string>();
   const parts: BlobPart[] = [];
   const prepared: PreparedEntry[] = [];
+  const table: ZipEntryInfo[] = [];
   let offset = 0;
+  let done = 0;
+  const onProgress = options?.onProgress;
 
-  for (let i = 0; i < entries.length; i += 1) {
-    const entry = entries[i];
+  const layout = async (entry: ZipEntry, total: number): Promise<void> => {
     let path = safeZipPath(entry.path);
     if (used.has(path)) {
       const dot = path.lastIndexOf(".");
@@ -189,11 +254,17 @@ export async function buildZip(entries: ZipEntry[], onProgress?: (p: ZipProgress
     if (blob.size > MAX_ENTRY_BYTES) {
       throw new Error(`"${path}" is ${(blob.size / 1024 / 1024 / 1024).toFixed(2)} GB — above the 4 GB per-file ZIP limit`);
     }
-    const crc = await crcOfBlob(blob);
+    const crc = await crc32OfBlob(blob);
     const nameBytes = encoder.encode(path);
     const { time, date } = dosDateTime(entry.date ?? new Date());
+    const headerLength = 30 + nameBytes.length;
+    if (offset + headerLength + blob.size > MAX_ARCHIVE_BYTES) {
+      throw new Error(
+        `The archive would exceed the 4 GB ZIP limit while adding "${path}". Export fewer clips at a time — a truncated archive would be worse than a refused one.`
+      );
+    }
 
-    const header = writer(30 + nameBytes.length);
+    const header = writer(headerLength);
     u32(header, LOCAL_SIG);
     u16(header, VERSION);
     u16(header, FLAG_UTF8);
@@ -210,10 +281,18 @@ export async function buildZip(entries: ZipEntry[], onProgress?: (p: ZipProgress
     parts.push(header.buffer);
     if (blob.size > 0) parts.push(blob);
     prepared.push({ nameBytes, blob, crc, size: blob.size, offset, time, date });
-    offset += header.buffer.byteLength + blob.size;
+    table.push({ path, size: blob.size, crc32: crc, headerOffset: offset, dataOffset: offset + headerLength });
+    offset += headerLength + blob.size;
 
-    onProgress?.({ done: i + 1, total: entries.length, path, bytes: blob.size });
-  }
+    done += 1;
+    onProgress?.({ done, total, path, bytes: blob.size });
+  };
+
+  for (const entry of entries) await layout(entry, entries.length);
+
+  const extra = (await options?.finalize?.(table)) ?? [];
+  const grandTotal = entries.length + extra.length;
+  for (const entry of extra) await layout(entry, grandTotal);
 
   const centralSize = prepared.reduce((sum, e) => sum + 46 + e.nameBytes.length, 0);
   const central = writer(centralSize);
@@ -249,5 +328,5 @@ export async function buildZip(entries: ZipEntry[], onProgress?: (p: ZipProgress
   u16(eocd, 0);
 
   parts.push(central.buffer, eocd.buffer);
-  return new Blob(parts, { type: "application/zip" });
+  return { blob: new Blob(parts, { type: "application/zip" }), entries: table };
 }

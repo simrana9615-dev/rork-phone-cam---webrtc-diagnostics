@@ -105,13 +105,13 @@ renders the read-only session summary.
 
 | Component | Role |
 |---|---|
-| `verify/LiveDocCapture.tsx` | WebRTC document viewfinder with the live alignment overlay (corner locks, skew/tilt hints, sharpness/brightness/steadiness gates) driven by `lib/doc-align.ts` |
+| `verify/LiveDocCapture.tsx` | WebRTC document viewfinder with the live alignment overlay (corner locks, skew/tilt hints, sharpness/brightness/steadiness gates) driven by `lib/doc-align.ts`. Reports the true provenance of each still to the caller — `platform-photo` for an `ImageCapture.takePhoto()` result, `app-encoded-frame` for the canvas fallback |
 | `verify/NativeCaptureStep.tsx` | Native file-input capture step: provenance recording, lens/zoom enforcement with red reject-and-retake panel |
 | `LivenessCheck.tsx` | Full liveness session: smile challenge–response, live face bounding boxes, rPPG pulse, screen-replay + injection checks, multi-face detection |
 | `FaceMatch.tsx` | Standalone Fraud Lab face-match tool (same ensemble engine as the flows) |
 | `DocumentCheck.tsx` / `DocDataPanel.tsx` / `DocConfidenceBadge.tsx` | Deep data check UI: MRZ ledger, per-check-digit rows, expandable confidence ledger badge |
 | `FraudLab.tsx` | Fraud Lab hub section (media screening entry points) |
-| `EvidencePackButton.tsx` | The one-tap **Download Evidence Pack (.zip)** action: builds the pack lazily on tap, streams progress inline, pushes every step and every completeness warning into the session log |
+| `EvidencePackButton.tsx` | The one-tap **Download Evidence Pack (.zip)** action: builds the pack lazily on tap, streams progress inline, pushes every step and every completeness warning into the session log, and reports the post-build byte-identity result per file (a failure is shown in red, never hidden) |
 | `LastPhotoExif.tsx` | Diagnostic-hub EXIF inspector for the newest captured photo: device / timestamp / GPS headline tiles with explicit not-in-file states, capture-parameter chips, and the complete raw tag dump (parsed locally); exports the reusable `ExifInspector` panel, also embedded in every session-gallery item, with a one-tap JSON download of the raw tags + the photo's observed capture timeline + screening verdict (heat-map image payloads excluded with an explicit note) |
 | `ReportView.tsx` | Forensic report renderer: verdict chip, category bars, finding rows (observed/expected/impact), heat-map visuals, technical appendix; exports `FindingRow` |
 | `CameraErrorHelp.tsx` | getUserMedia error classifier with actionable fixes |
@@ -145,8 +145,8 @@ renders the read-only session summary.
 | `capture-quality.ts` | Instant post-capture quality gate (sharpness/glare/shadow) |
 | `camera-diagnostics.ts` | Camera/EXIF helpers, constraint builders, suite test patterns, capture utilities, log types |
 | `device-spec.ts` | Device Camera Spec Report engine: environment collection, per-camera max-capability probes, measured fps, constraint suite runs, codec matrix, text + JSON report builders |
-| `zip-writer.ts` | Dependency-free ZIP writer, **store-only (method 0)** so archived media is byte-identical to the capture. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. UTF-8 name flag on every entry; entries >4 GiB are rejected rather than silently corrupted |
-| `evidence-pack.ts` | Evidence pack assembler: originals verbatim, derived renders with captions, per-file metadata **re-read from the archived bytes** (ExifReader + structural provenance walk), session log + capture ledger, deep report, threshold reference + engine docs, and the printable HTML/text overview that reconciles every score to its deductions. Records rather than hides anything it could not pack |
+| `zip-writer.ts` | Dependency-free ZIP writer, **store-only (method 0)** so archived media is byte-identical to the capture. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. Returns an offset/size/CRC table for every entry, and a `finalize` hook lets a report cite the real offsets of the entries above it. Also exports `verifyBytes` (one-pass compare + CRC) and `crc32OfBlob`. UTF-8 name flag on every entry; per-entry **and** whole-archive 4 GiB overflow are refused rather than silently truncated. Covered by `zip-writer.test.ts` |
+| `evidence-pack.ts` | Evidence pack assembler: unaltered captures verbatim in `originals/`, app-encoded frames separated into `rendered-frames/`, derived renders with captions, per-file metadata **re-read from the archived bytes** (ExifReader + structural provenance walk), session log + capture ledger, deep report, threshold reference + engine docs, the byte-identity verification data, and the printable HTML/text overview that reconciles every score to its deductions. Declares each file's origin tier, verifies every archived payload against its source after the build, and records rather than hides anything it could not pack |
 | `session-store.ts` | IndexedDB session persistence (6 h TTL, survives native-camera tab eviction) |
 | `share-link.ts` | Compressed, self-expiring (72 h), fragment-only share links — no server storage |
 | `utils.ts` | `cn` class-name helper |
@@ -164,19 +164,46 @@ Archive layout:
 | `READ-ME-FIRST.txt` | What each folder is, and how a score is read |
 | `overview.html` / `overview.txt` | Verdict, per-file score reconciliation (every deduction with its exact points, summing to the score), coverage matrix, capture thumbnails, metadata summary, timeline, file list, and an explicit "not included — and why" section |
 | `report/deep-report.txt` / `.json` | The surface's full forensic report (findings with observed vs expected, check ledger with threshold provenance, doc-data check digits, barcode, face distances, liveness/pulse, AI verdicts) |
-| `originals/` | Captured photos and clips **byte-for-byte**, stored uncompressed on purpose — extracted bytes, EXIF and hash match the capture exactly |
+| `originals/` | Media whose bytes the app did **not** author — camera files, platform stills (`ImageCapture.takePhoto`), MediaRecorder output — copied in byte-for-byte and stored uncompressed, so extracted bytes, EXIF and hash match the capture exactly. `originals/SOURCES.txt` states per file which capture path produced it |
+| `rendered-frames/` | Frames the app itself drew from the live video track and JPEG-encoded (canvas grabs, silent stills, the liveness identity frame). **Never** placed in `originals/`, because they are not camera files and cannot carry camera EXIF. `rendered-frames/READ-ME.txt` spells out what that does and does not prove |
 | `processed/<slug>/` | Derived renders (noise/edge/glare/ELA/frequency maps, video frame strips, the deskewed document crop, aligned face crops) plus `captions.txt` explaining how to read each one and stating plainly that these are renders, not captures |
 | `metadata/<slug>.txt` / `.json` | Full readable tag dump plus the container-structure walk (containers parsed, structural containers explicitly marked benign, writer- vs content-tier provenance fields) |
 | `log/session-log.txt` / `.json` | Complete end-to-end log, every entry, in order |
 | `log/capture-ledger.txt` / `.json` | Capture feed ledger — feeds opened, requested vs granted, frames, clips, native round-trips (omitted for supplied-file tools, which have no monitored feed) |
 | `reference/thresholds.txt` / `.json` | Every threshold, its value and its provenance class, including the `uncalibrated` ones that deduct nothing |
 | `reference/engine/*.md` | The engine documentation, lazily imported so it never inflates the app bundle |
-| `MANIFEST.txt` | Every archived path with its byte size |
+| `verification/byte-identity.txt` / `.json` | Every entry's exact size, CRC-32 and **absolute payload offset** inside the ZIP, with three independent ways to re-check them (`unzip -p` + `cmp`, `unzip -t` + `crc32`, or a raw `dd` carve that bypasses ZIP tooling entirely) |
+| `MANIFEST.txt` | Every archived path with its exact byte size |
 
-Design rules: originals are never re-encoded (only extra thumbnails and derived renders
-are generated); metadata is re-read from the archived bytes so the pack is self-proving;
-and a single missing artefact never fails the export — it is named in the overview's
-completeness section and pushed to the log as a warning.
+### Byte-identity: declared, routed, and verified
+
+The pack's central claim is that a capture comes out identical to what went in. Three
+mechanisms back it rather than one assurance:
+
+1. **Origin is declared at the capture site, never guessed at export.** `PackMediaItem.origin`
+   is a required field (`camera-file`, `supplied-file`, `platform-photo`, `recorder-stream`,
+   `app-encoded-frame`). `LiveDocCapture` reports `platform-photo` when
+   `ImageCapture.takePhoto()` wins and `app-encoded-frame` when it falls back to a canvas
+   grab — a runtime difference the pack could not otherwise know. `originForCaptureEngine()`
+   maps camera engines to `camera-file` and picker engines to `supplied-file`, so a photo
+   chosen from the library is never described as fresh camera output.
+2. **The folder follows the origin.** Only bytes the app did not author reach `originals/`;
+   anything the app encoded goes to `rendered-frames/`. A mislabelled render therefore
+   cannot occur by construction rather than by careful wording.
+3. **The claim is tested, not asserted.** After the archive is built, every media payload is
+   carved back out of the finished blob at its recorded offset and compared to the source
+   blob byte-for-byte (one streaming pass, 4 MB at a time, CRC recomputed alongside).
+   `PackResult.verification` carries the per-file outcome; `EvidencePackButton` shows it and
+   logs every line, and a mismatch is reported loudly instead of being smoothed over.
+   `src/lib/zip-writer.test.ts` locks the invariants: CRC-32 against the published check
+   value, store-method headers with matching sizes, carve-at-offset equality over a payload
+   containing all 256 byte values, multi-chunk payloads, and single-flipped-byte detection.
+
+Other design rules: originals are never re-encoded (only extra thumbnails and derived
+renders are generated); metadata is re-read from the archived bytes so the pack is
+self-proving; the log states whether its 300-entry buffer actually truncated rather than
+implying it always does; and a single missing artefact never fails the export — it is named
+in the overview's completeness section and pushed to the log as a warning.
 
 ## 7. Environment & configuration
 
@@ -192,6 +219,7 @@ completeness section and pushed to the log as a warning.
 ## 8. Testing & builds
 
 - `bun run test` — vitest unit tests plus a Playwright-driven browser config
-  (`vitest.browser.config.ts`).
+  (`vitest.browser.config.ts`). `src/lib/zip-writer.test.ts` guards the evidence pack's
+  byte-identity guarantee (see §6).
 - `bun run build` — production build to `dist/`.
 - Type checking is strict; lint via `bun run lint`.

@@ -403,14 +403,24 @@ on the summary screen and embedded in both exports so "n/a" is never ambiguous.
   (deflate-raw) and base64url-encoded into the URL **fragment**: nothing is uploaded,
   fragments are never sent in HTTP requests, and links self-expire after **72 h**.
   Viewable on any device at `/shared` (bypasses the phone gate, read-only).
-- **Evidence pack** (`lib/evidence-pack.ts` → `lib/zip-writer.ts`) — one ZIP holding
-  every capture **byte-for-byte** (store-only, so extracted bytes/EXIF/hash match the
-  camera output exactly), the derived renders beside them with their captions, per-file
-  metadata re-read from the archived bytes, the full session log + capture ledger, the
-  deep text/JSON report, the threshold reference and engine docs, and a printable
-  `overview.html` that reconciles each score to its individual deductions. Anything that
-  could not be packed is named in the overview and logged as a warning — the export never
-  omits silently. Layout table in `architecture.md` §6.
+- **Evidence pack** (`lib/evidence-pack.ts` → `lib/zip-writer.ts`) — one ZIP holding every
+  capture **byte-for-byte** (store-only, so extracted bytes/EXIF/hash match what arrived),
+  the derived renders beside them with their captions, per-file metadata re-read from the
+  archived bytes, the full session log + capture ledger, the deep text/JSON report, the
+  threshold reference and engine docs, and a printable `overview.html` that reconciles each
+  score to its individual deductions.
+
+  Provenance is kept honest rather than flattering: each item's origin is declared by the
+  capture path itself, so `originals/` contains only bytes the app did not author (native
+  camera files, `ImageCapture` stills, MediaRecorder clips), while frames the app encoded
+  from a canvas — the liveness identity frame, the silent stills, the WebRTC canvas fallback
+  — are filed separately under `rendered-frames/` and can never be presented as camera
+  output. After the archive is built, every media payload is carved back out of it and
+  compared to the source byte-for-byte, with the result shown on screen and logged;
+  `verification/byte-identity.txt` ships the offsets and checksums so a reviewer can repeat
+  the check without the app. Anything that could not be packed is named in the overview and
+  logged as a warning — the export never omits silently. Layout table in
+  `architecture.md` §6.
 
 **Persistence** (`lib/session-store.ts`) — the whole session (blobs, reports, face step,
 AI verdicts) is snapshotted to IndexedDB (`verify-sessions`), surviving the tab eviction

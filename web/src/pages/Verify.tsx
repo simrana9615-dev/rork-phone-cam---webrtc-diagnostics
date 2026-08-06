@@ -38,7 +38,8 @@ import { buildLedgerJsonObject, buildLedgerText, ledgerReset } from "@/lib/captu
 import LivenessCheck, { type LivenessSessionResult } from "@/components/LivenessCheck";
 import ReportView, { FindingRow, ScoreRing, VERDICT_CHIP } from "@/components/ReportView";
 import EvidencePackButton from "@/components/EvidencePackButton";
-import type { PackInput, PackMediaItem } from "@/lib/evidence-pack";
+import { originForCaptureEngine, type PackInput, type PackMediaItem, type PackOrigin } from "@/lib/evidence-pack";
+import { useCaptureEngine } from "@/lib/capture-engine";
 import DocDataPanel from "@/components/DocDataPanel";
 import DocConfidenceBadge from "@/components/DocConfidenceBadge";
 import { downloadBlob, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
@@ -73,7 +74,10 @@ type AiState = { verdict: AiMediaVerdict | null; loading: boolean; error: string
 
 type DocCaptureOpts = { provenance?: NativeProvenance; channelFindings?: Finding[] };
 
-type FailedDoc = { page: PageDef; blob: Blob; url: string; meta: string; opts?: DocCaptureOpts; error: string };
+/** Truthful provenance tier for a File-based capture on this device's chosen engine. */
+type CaptureOrigin = PackOrigin;
+
+type FailedDoc = { page: PageDef; blob: Blob; url: string; meta: string; origin: PackOrigin; opts?: DocCaptureOpts; error: string };
 
 type FailedSelfie = { file: File; url: string; prov: NativeProvenance; error: string };
 
@@ -185,6 +189,15 @@ export default function Verify() {
     return s;
   }, [template]);
 
+  /**
+   * Provenance tier for File-based captures on this device's chosen engine:
+   * camera engines yield a fresh camera file, picker engines may hand back an
+   * existing photo. Recorded at capture time so the evidence pack never claims
+   * a library pick came from the camera.
+   */
+  const captureEngine = useCaptureEngine();
+  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
+
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [pageResults, setPageResults] = useState<Record<string, PageResult>>({});
   const [faceResult, setFaceResult] = useState<FaceStepResult | null>(null);
@@ -260,6 +273,7 @@ export default function Verify() {
           blob: p.blob,
           fileName: p.fileName,
           captureMeta: p.captureMeta,
+          origin: p.origin,
           report: p.report,
           portrait: p.portrait,
           docData: p.docData ?? null,
@@ -297,6 +311,7 @@ export default function Verify() {
           url: URL.createObjectURL(sp.blob),
           fileName: sp.fileName,
           captureMeta: sp.captureMeta,
+          origin: sp.origin,
           report: sp.report,
           portrait: sp.portrait,
           docData: sp.docData,
@@ -371,7 +386,7 @@ export default function Verify() {
 
   // ── Capture handlers ───────────────────────────────────────────────────────
   const handleDocCapture = useCallback(
-    async (page: PageDef, blob: Blob, meta: string, opts?: DocCaptureOpts) => {
+    async (page: PageDef, blob: Blob, meta: string, origin: CaptureOrigin, opts?: DocCaptureOpts) => {
       if (!template) return;
       setResume(null);
       setFailedDoc((prev) => {
@@ -443,7 +458,7 @@ export default function Verify() {
         setPageResults((prev) => {
           const old = prev[page.id];
           if (old) URL.revokeObjectURL(old.url);
-          return { ...prev, [page.id]: { page, blob, url, fileName, captureMeta: meta, report, portrait, quickQuality } };
+          return { ...prev, [page.id]: { page, blob, url, fileName, captureMeta: meta, origin, report, portrait, quickQuality } };
         });
         setAiState((prev) => ({ ...prev, [page.id]: { verdict: null, loading: false, error: null } }));
         if (navigator.vibrate) navigator.vibrate(15);
@@ -467,7 +482,7 @@ export default function Verify() {
         const msg = err instanceof Error ? err.message : String(err);
         pushLog("error", `${page.label} analysis failed (capture kept — retry from the step): ${msg}`);
         if (mountedRef.current) {
-          setFailedDoc({ page, blob, url: URL.createObjectURL(blob), meta, opts, error: msg });
+          setFailedDoc({ page, blob, url: URL.createObjectURL(blob), meta, origin, opts, error: msg });
         }
       } finally {
         if (mountedRef.current) {
@@ -722,6 +737,7 @@ export default function Verify() {
     const media: PackMediaItem[] = orderedPages.map((p, i) => ({
       slug: `${String(i + 1).padStart(2, "0")}-${p.page.id}`,
       label: p.page.label,
+      origin: p.origin,
       blob: p.blob,
       fileName: p.fileName,
       captureMeta: p.captureMeta,
@@ -749,6 +765,8 @@ export default function Verify() {
       media.push({
         slug: "90-face",
         label: faceResult.mode === "liveness" ? "Live face (liveness identity frame)" : "Selfie",
+        // A liveness frame is drawn and encoded in-browser; a selfie is a real camera file.
+        origin: faceResult.mode === "liveness" ? "app-encoded-frame" : fileOrigin,
         blob: faceResult.blob ?? null,
         url: faceResult.url,
         fileName: faceResult.report?.fileName ?? null,
@@ -805,7 +823,7 @@ export default function Verify() {
       title: `${template.name} — Verification Evidence Pack`,
       subtitle: `${template.doc === "passport" ? "Passport" : "Driver licence"} · ${template.docCapture === "webrtc" ? "live browser capture" : "native camera app capture"} · face step: ${template.faceMode}`,
       scopeNote:
-        "Everything in this pack was produced on this device during this session. Nothing was uploaded. The originals folder holds the camera files unmodified; every other image is a render derived from them.",
+        "Everything in this pack was produced on this device during this session. Nothing was uploaded. The originals folder holds only bytes this app did not create — copied in unmodified. Frames the app encoded itself from the live video track sit in rendered-frames instead, and every other image is a render derived from a capture. Each file states which it is.",
       verdict: {
         label: overall.verdict === "pass" ? "PASS" : overall.verdict === "review" ? "NEEDS REVIEW" : "FAIL",
         tone: overall.verdict,
@@ -978,7 +996,7 @@ export default function Verify() {
                     </Button>
                     <Button
                       className="h-12 bg-emerald-500 text-emerald-950 hover:bg-emerald-400"
-                      onClick={() => void handleDocCapture(failedDoc.page, failedDoc.blob, failedDoc.meta, failedDoc.opts)}
+                      onClick={() => void handleDocCapture(failedDoc.page, failedDoc.blob, failedDoc.meta, failedDoc.origin, failedDoc.opts)}
                     >
                       <RotateCcw className="mr-1.5 h-4 w-4" />
                       Retry Analysis
@@ -996,7 +1014,7 @@ export default function Verify() {
                       guideAspect={step.page.guideAspect}
                       hint={step.page.hint}
                       pushLog={pushLog}
-                      onCapture={(blob, meta, channelFindings) => void handleDocCapture(step.page, blob, meta, { channelFindings })}
+                      onCapture={(blob, meta, channelFindings, origin) => void handleDocCapture(step.page, blob, meta, origin, { channelFindings })}
                     />
                   ) : (
                     <NativeCaptureStep
@@ -1004,7 +1022,9 @@ export default function Verify() {
                       buttonLabel={`Photograph ${step.page.label}`}
                       hint={step.page.hint}
                       pushLog={pushLog}
-                      onCapture={(file, provenance) => void handleDocCapture(step.page, file, `Native camera app · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`, { provenance })}
+                      onCapture={(file, provenance) =>
+                        void handleDocCapture(step.page, file, `Native camera app · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`, fileOrigin, { provenance })
+                      }
                     />
                   )}
                 </section>
@@ -1549,15 +1569,18 @@ export default function Verify() {
                 Evidence Pack — Everything, One File
               </h2>
               <p className="text-[10.5px] leading-snug text-muted-foreground">
-                One ZIP with every capture in its <strong className="text-foreground">original camera form</strong> (stored uncompressed — same bytes,
-                same EXIF, same hash), the filtered/analysed renders beside them, per-file metadata re-read from the archived bytes, the complete
-                end-to-end log plus capture ledger, the deep forensic report, and a printable overview that explains the score deduction by
-                deduction. Built on this device; nothing is uploaded.
+                One ZIP with every capture archived <strong className="text-foreground">byte-for-byte</strong> — stored uncompressed, so the bytes,
+                metadata and hash that come out are the ones that went in, and the pack ships the offsets and checksums to prove it. Camera files sit
+                in <span className="mono">originals/</span>; any frame the app encoded itself (a liveness still, or a canvas grab when the browser
+                cannot hand over a full-resolution photo) is kept separately in <span className="mono">rendered-frames/</span> so it can never be
+                mistaken for camera output. Plus the filtered/analysed renders, per-file metadata re-read from the archived bytes, the complete
+                end-to-end log and capture ledger, the deep forensic report, and a printable overview that explains the score deduction by deduction.
+                Built on this device; nothing is uploaded.
               </p>
               <EvidencePackButton
                 build={buildPack}
                 pushLog={pushLog}
-                hint="Open overview.html inside the ZIP first — it points at everything else."
+                hint="Open overview.html inside the ZIP first — it points at everything else. Every archived file is re-checked against the capture before the download completes."
               />
             </section>
 

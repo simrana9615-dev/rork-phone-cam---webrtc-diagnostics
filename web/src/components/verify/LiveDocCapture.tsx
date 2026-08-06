@@ -4,6 +4,7 @@ import { Camera, Loader2, ShieldAlert, ShieldCheck, Zap, ZapOff, ZoomIn } from "
 import { Button } from "@/components/ui/button";
 import CameraErrorHelp, { classifyCameraError, type CameraErrorInfo } from "@/components/CameraErrorHelp";
 import { captureFromVideo, stopStream, trackSettings, type LogLevel } from "@/lib/camera-diagnostics";
+import type { PackOrigin } from "@/lib/evidence-pack";
 import {
   ledgerBeginFeed,
   ledgerFeedDenied,
@@ -78,7 +79,7 @@ export default function LiveDocCapture({
   guideAspect: number;
   hint: string;
   pushLog: (level: LogLevel, message: string) => void;
-  onCapture: (blob: Blob, meta: string, channelFindings: Finding[]) => void;
+  onCapture: (blob: Blob, meta: string, channelFindings: Finding[], origin: PackOrigin) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -351,7 +352,7 @@ export default function LiveDocCapture({
    * Falls back to the video-frame grab if unsupported or slower/smaller.
    */
   const grabBestStill = useCallback(
-    async (video: HTMLVideoElement): Promise<{ blob: Blob; width: number; height: number; method: string }> => {
+    async (video: HTMLVideoElement): Promise<{ blob: Blob; width: number; height: number; method: string; origin: PackOrigin }> => {
       const track = streamRef.current?.getVideoTracks()[0];
       const IC = (window as unknown as { ImageCapture?: ImageCaptureCtor }).ImageCapture;
       if (IC && track && track.readyState === "live") {
@@ -374,15 +375,17 @@ export default function LiveDocCapture({
           const h = bmp.height;
           bmp.close();
           if (w >= video.videoWidth && h >= video.videoHeight) {
-            return { blob: photo, width: w, height: h, method: `ImageCapture still (${w}×${h})` };
+            // Encoded by the platform's photo pipeline, not by us.
+            return { blob: photo, width: w, height: h, method: `ImageCapture still (${w}×${h})`, origin: "platform-photo" };
           }
           pushLog("debug", `Doc capture: still photo ${w}×${h} smaller than the video frame — using the video frame instead`);
         } catch (err) {
           pushLog("debug", `Doc capture: ImageCapture unavailable/failed (${err instanceof Error ? err.message : String(err)}) — using video frame`);
         }
       }
+      // Drawn to a canvas and encoded here — not a camera file, and the pack must say so.
       const blob = await captureFromVideo(video);
-      return { blob, width: video.videoWidth, height: video.videoHeight, method: "video frame" };
+      return { blob, width: video.videoWidth, height: video.videoHeight, method: "video frame", origin: "app-encoded-frame" };
     },
     [pushLog]
   );
@@ -408,7 +411,7 @@ export default function LiveDocCapture({
       const meta = `Live WebRTC ${still.method} · ${still.width}×${still.height} (${orientation}) · measured ${measuredFps}fps · ${settingsLine}${torchOn ? " · torch ON" : ""}${zoomCaps && zoom > zoomCaps.min ? ` · zoom ${zoom.toFixed(1)}×` : ""} · channel ${audit.verdict}`;
       pushLog("success", `Doc capture: ${still.method} — ${still.width}×${still.height} (${(still.blob.size / 1024).toFixed(0)} KB) at ${measuredFps}fps measured`);
       stop();
-      onCapture(still.blob, meta, injectionFindings(audit));
+      onCapture(still.blob, meta, injectionFindings(audit), still.origin);
     } catch (err) {
       pushLog("error", `Doc capture failed: ${err instanceof Error ? err.message : String(err)}`);
       capturingRef.current = false;
