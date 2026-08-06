@@ -124,10 +124,28 @@ never silently skipped**:
 
 ## Capture engines (settings toggle)
 
-Native captures can be launched through six pipelines, selected in the
+Native captures can be launched through seven pipelines, selected in the
 "Capture engine" settings toggle (persisted locally, honored by every
 native-camera launch point: guided flows, EyeDeeKit doc pages + fallback
-selfie, the diagnostic hub, Document Check and Face Match):
+selfie, the diagnostic hub, Document Check and Face Match).
+
+The seven split into two families, and the split is the whole point:
+
+- **Six hand off to an OS picker or camera app.** The site never touches the
+  camera and learns nothing about the hardware — but the file that comes back
+  can carry full camera EXIF, including a `LensModel` string that names the
+  exact optic that fired ("iPhone 15 Pro back triple camera 6.765mm f/1.78").
+- **One opens the camera inside the page.** It names every camera on the
+  device and can pin one specific lens by id — but its stills carry no camera
+  EXIF at all, because no browser writes any.
+
+Richest hardware inventory and richest file metadata are therefore on
+*opposite* sides. Neither engine is strictly better, so `ENGINE_FACTS` in
+`capture-engine.ts` states the trade as data (permission prompt, what the site
+ends up holding, camera inventory, lens control, metadata, byte origin, nearest
+native equivalent) rather than ranking them. The settings toggle, the session
+log and the evidence pack all render from that one table, so a claim about an
+engine only has to be corrected in one place.
 
 - **Native camera app** (default) — direct `<input capture>`. The OS camera
   app opens; the original file returns; every provenance fact (trusted change
@@ -157,11 +175,60 @@ selfie, the diagnostic hub, Document Check and Face Match):
   name, and `lastModified` are first-hand. No camera hint is possible and no
   change event exists on this path, so event-trust facts are recorded as not
   observable — never invented. Unsupported browsers get an explicit error.
+- **AVFoundation (device-level)** — the only engine that opens the camera in
+  the page. `enumerateDevices()` is called *before* the prompt (count only —
+  browsers blank the labels) and again after it (every camera named), then
+  `getUserMedia({ deviceId: { exact } })` pins one specific physical camera and
+  `ImageCapture.takePhoto()` produces the still. See below.
 
 Each ledger round-trip records which engine launched it (trip label) and the
 engine-specific steps (`Camera.getPhoto() invoked`, `Change event intercepted
 on Capacitor's hidden input`, `system picker opening`,
-`showOpenFilePicker() invoked`, …).
+`showOpenFilePicker() invoked`, `enumerateDevices() called BEFORE any
+permission grant`, …).
+
+### AVFoundation (device-level) — what it does and does not give
+
+On iOS and macOS WebKit, `getUserMedia` and `enumerateDevices` are implemented
+on top of AVFoundation, and `MediaDeviceInfo.label` carries
+`AVCaptureDevice.localizedName` strings — "Back Dual Wide Camera", "Back Ultra
+Wide Camera", "Back Telephoto Camera", "Front Camera", "Desk View Camera". This
+engine therefore surfaces the same device inventory an
+`AVCaptureDevice.DiscoverySession` would. It is a shim over AVFoundation, not
+AVFoundation itself, and `device-camera.ts` never claims otherwise.
+
+`classifyCameraLabel()` maps each label to a lens class and names the
+corresponding AVFoundation device type (`builtInUltraWideCamera`,
+`builtInTelephotoCamera`, `builtInDualWideCamera`, `builtInTripleCamera`, …).
+Unrecognised or blank labels stay `unknown` with `classified: false`, so a guess
+is never presented as a reading.
+
+**Given:** every camera by name before any photo is taken; a stable per-origin
+`deviceId` and `groupId` for each; the resolution and frame-rate ranges each
+supports (`getCapabilities()`); zoom and torch control where the platform
+allows it; the granted settings read back after `applyConstraints()` rather than
+assumed; and `ImageCapture.getPhotoCapabilities()` for the still pipeline.
+
+**Not given:** camera EXIF — no browser writes make, model, lens, GPS or a
+capture timestamp onto a `getUserMedia` still, so every EXIF-based check
+(including `lens-enforcement.ts`) has nothing to read. The engine records that
+as *unavailable*, and because the camera was pinned by `deviceId` the lens
+identity is known directly rather than inferred, which is stronger than the EXIF
+route. Also not given: sensor-native still resolution, the per-format list, lens
+switch-over zoom factors, ISO/exposure ranges, RAW and depth — AVFoundation
+exposes these to native apps, the web platform does not.
+
+**Origin honesty:** the still is a `platform-photo` when
+`ImageCapture.takePhoto()` produced it and an `app-encoded-frame` when the
+canvas fallback ran (Safari has no `ImageCapture`). `DeviceCameraSheet`
+declares which at capture time; the evidence pack routes the file to
+`originals/` or `rendered-frames/` on that value, so a canvas encode can never
+be presented as camera output. `originForCaptureEngine("avfoundation")` returns
+the expected path only — callers holding a `DeviceCaptureResult` must prefer
+the origin it reports.
+
+The full inventory write-up (`inventoryReport()`) is attached to the ledger as a
+round-trip step note, so it is archived verbatim in the evidence pack.
 
 ## Where it surfaces
 

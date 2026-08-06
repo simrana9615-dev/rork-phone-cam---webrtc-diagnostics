@@ -11,6 +11,9 @@ import {
   engineOption,
   useCaptureEngine,
 } from "@/lib/capture-engine";
+import { deviceCameraCapturePhoto, logDeviceInventory } from "@/components/verify/DeviceCameraSheet";
+import { describeDevice } from "@/lib/device-camera";
+import type { PackOrigin } from "@/lib/evidence-pack";
 import { runCaptureHold } from "@/lib/capture-hold";
 import {
   ledgerBeginNativeTrip,
@@ -60,7 +63,12 @@ export default function NativeCaptureStep({
   buttonLabel: string;
   hint: string;
   pushLog: (level: LogLevel, message: string) => void;
-  onCapture: (file: File, provenance: NativeProvenance) => void;
+  /**
+   * `origin` is supplied only by engines that do not return an OS camera file
+   * (device-level capture). When absent the caller's engine-derived origin
+   * applies.
+   */
+  onCapture: (file: File, provenance: NativeProvenance, origin?: PackOrigin) => void;
 }) {
   const engine = useCaptureEngine();
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -107,7 +115,11 @@ export default function NativeCaptureStep({
    * observations (trust + files-API integrity) from whichever input fired.
    */
   const processFile = useCallback(
-    async (f: File, facts: { changeIsTrusted: boolean; filesApiNative: boolean; filesApiObserved: string }) => {
+    async (
+      f: File,
+      facts: { changeIsTrusted?: boolean; filesApiNative?: boolean; filesApiObserved?: string },
+      deviceLevel?: { origin: PackOrigin; lensNote: string }
+    ) => {
       const tripId = tripIdRef.current;
       const pageHiddenDuring = pressedAtPerfRef.current > 0 ? hiddenSeenRef.current : undefined;
       stopVisibilityWatch();
@@ -128,10 +140,39 @@ export default function NativeCaptureStep({
           pageHiddenDuring,
         };
         pushLog("debug", `Native capture: secured for ${(heldMs / 1000).toFixed(2)}s (bell-curve hold) before timing was recorded.`);
+        const eventNote =
+          facts.changeIsTrusted == null
+            ? "not observable on this path (no file input exists)"
+            : facts.changeIsTrusted
+              ? "trusted"
+              : "SCRIPT-DISPATCHED";
+        const filesNote =
+          facts.filesApiNative == null
+            ? "not applicable (no file input on this path)"
+            : facts.filesApiNative
+              ? "native"
+              : `wrapped (${facts.filesApiObserved ?? "observed"}) — privacy browsers do this legitimately; scored as a caution, not proof`;
         pushLog(
-          !facts.changeIsTrusted || pressTrustedRef.current === false ? "error" : facts.filesApiNative ? "info" : "warn",
-          `Native capture: received "${f.name}" (${(f.size / 1024).toFixed(0)} KB, ${f.type || "unknown type"}) · ${elapsedMs >= 0 ? `${(elapsedMs / 1000).toFixed(1)}s after press (incl. ${(heldMs / 1000).toFixed(1)}s securing hold)` : "press time unknown"} · press ${pressTrustedRef.current == null ? "untracked" : pressTrustedRef.current ? "trusted" : "SCRIPT-FIRED"} · event ${facts.changeIsTrusted ? "trusted" : "SCRIPT-DISPATCHED"} · page ${pageHiddenDuring == null ? "visibility untracked" : pageHiddenDuring ? "hidden during round-trip (camera app took over)" : "NEVER hidden during round-trip"} · files API ${facts.filesApiNative ? "native" : `wrapped (${facts.filesApiObserved}) — privacy browsers do this legitimately; scored as a caution, not proof`}`
+          facts.changeIsTrusted === false || pressTrustedRef.current === false ? "error" : facts.filesApiNative === false ? "warn" : "info",
+          `Native capture: received "${f.name}" (${(f.size / 1024).toFixed(0)} KB, ${f.type || "unknown type"}) · ${elapsedMs >= 0 ? `${(elapsedMs / 1000).toFixed(1)}s after press (incl. ${(heldMs / 1000).toFixed(1)}s securing hold)` : "press time unknown"} · press ${pressTrustedRef.current == null ? "untracked" : pressTrustedRef.current ? "trusted" : "SCRIPT-FIRED"} · event ${eventNote} · page ${pageHiddenDuring == null ? "visibility untracked" : pageHiddenDuring ? "hidden during round-trip (camera app took over)" : "NEVER hidden during round-trip"} · files API ${filesNote}`
         );
+        if (deviceLevel) {
+          // EXIF lens enforcement cannot run here: no browser writes camera
+          // EXIF onto a getUserMedia still. The camera identity is known
+          // directly instead, which is stronger than an EXIF inference.
+          pushLog("success", `Lens identity: ${deviceLevel.lensNote}`);
+          pushLog(
+            "info",
+            "Lens enforcement via EXIF skipped on this engine — a device-level still carries no camera metadata to read. The camera was pinned by device id instead, so which camera fired is known rather than inferred."
+          );
+          setLensRejection(null);
+          if (tripId) {
+            void ledgerNativeFileFacts(tripId, f, pressedAtEpochRef.current || null);
+            ledgerNativeStep(tripId, "Forensic analysis started", `recorded round-trip ${elapsedMs >= 0 ? `${Math.round(elapsedMs)}ms` : "unknown"} (includes the securing hold)`);
+          }
+          onCapture(f, provenance, deviceLevel.origin);
+          return;
+        }
         const lens = await enforceLensPolicy(f, facing);
         const described = describeLensCheck(lens, facing);
         pushLog(described.level, described.message);
@@ -151,6 +192,48 @@ export default function NativeCaptureStep({
       }
     },
     [facing, onCapture, pushLog, stopVisibilityWatch]
+  );
+
+  /**
+   * Launches the device-level (AVFoundation-class) pipeline: the camera opens
+   * inside the page, every camera on the device is named, and one is pinned by
+   * id. No file input exists on this path, so event-trust facts are recorded as
+   * not observable rather than invented.
+   */
+  const launchDeviceCamera = useCallback(
+    async (tripId: string) => {
+      try {
+        const res = await deviceCameraCapturePhoto(facing, (step, note) => ledgerNativeStep(tripId, step, note), buttonLabel);
+        ledgerNativeStep(
+          tripId,
+          "Event-trust facts not observable on this path",
+          "Device-level capture returns a Blob straight from the camera track — there is no file input and no change event to audit, so no trust claim is made either way"
+        );
+        // The full write-up goes into the ledger, which the evidence pack
+        // archives verbatim, so the hardware inventory survives the export.
+        ledgerNativeStep(tripId, "Device-level camera inventory recorded", res.report);
+        logDeviceInventory(res, pushLog);
+        await processFile(
+          res.file,
+          { changeIsTrusted: undefined, filesApiNative: undefined },
+          {
+            origin: res.origin,
+            lensNote: res.device ? describeDevice(res.device) : `track "${res.inventory.after[0]?.label ?? "unnamed"}" — no per-device match could be made`,
+          }
+        );
+      } catch (err) {
+        stopVisibilityWatch();
+        if (err instanceof CaptureCancelledError) {
+          ledgerNativeStep(tripId, "Device-level camera closed with no photo — capture cancelled");
+          pushLog("warn", "Device-level capture cancelled.");
+          return;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        ledgerNativeStep(tripId, "Device-level capture failed", msg);
+        pushLog("error", `Device-level capture failed: ${msg}`);
+      }
+    },
+    [buttonLabel, facing, processFile, pushLog, stopVisibilityWatch]
   );
 
   /** Launches the Capacitor Camera.getPhoto pipeline for this trip. */
@@ -266,8 +349,12 @@ export default function NativeCaptureStep({
           if (navigator.vibrate) navigator.vibrate(30);
           pushLog(
             "info",
-            `Native capture [${engineOption(engine).label}]: opening ${engine === "system-picker" ? "system picker" : `camera (${facing === "user" ? "front" : "back"})`}… press ${pressTrustedRef.current ? "trusted" : "SCRIPT-FIRED"}`
+            `Native capture [${engineOption(engine).label}]: opening ${engine === "avfoundation" ? `the camera in-page and naming every device (${facing === "user" ? "front" : "back"})` : engine === "system-picker" ? "system picker" : `camera (${facing === "user" ? "front" : "back"})`}… press ${pressTrustedRef.current ? "trusted" : "SCRIPT-FIRED"}`
           );
+          if (engine === "avfoundation") {
+            void launchDeviceCamera(tripId);
+            return;
+          }
           if (engine === "capacitor") {
             void launchCapacitor(tripId);
             return;

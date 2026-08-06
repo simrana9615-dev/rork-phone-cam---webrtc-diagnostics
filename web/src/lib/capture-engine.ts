@@ -30,6 +30,12 @@ import { auditFileInputIntegrity } from "@/lib/injection-guard";
  * - "fs-picker"       — File System Access API `showOpenFilePicker()`
  *   (Chromium-only): the native OS file picker returns a real file handle;
  *   no camera hint is possible, and no change event exists on this path.
+ * - "avfoundation"    — device-level capture: enumerateDevices() names every
+ *   camera, getUserMedia opens one specific physical camera by id, and
+ *   ImageCapture takes the still. On WebKit this stack is implemented on
+ *   AVFoundation and the device names are AVCaptureDevice.localizedName
+ *   values. Richest live hardware inventory, poorest file metadata — no
+ *   browser writes camera EXIF on this path.
  */
 export type CaptureEngine =
   | "native-camera"
@@ -37,7 +43,8 @@ export type CaptureEngine =
   | "capacitor"
   | "capture-boolean"
   | "legacy-accept"
-  | "fs-picker";
+  | "fs-picker"
+  | "avfoundation";
 
 const STORAGE_KEY = "vh-capture-engine-v1";
 
@@ -91,7 +98,176 @@ export const CAPTURE_ENGINE_OPTIONS: CaptureEngineOption[] = [
     description:
       "File System Access API showOpenFilePicker() (Chromium-only) — the native OS file picker returns a real file handle with original bytes, name, and lastModified intact. No camera hint is possible and no change event exists on this path, so event-trust facts are recorded as not observable, never invented.",
   },
+  {
+    id: "avfoundation",
+    label: "AVFoundation (device-level)",
+    short: "device-level",
+    description:
+      "enumerateDevices() names every camera on the device, getUserMedia opens one specific physical camera by id, and ImageCapture takes the still. On iOS and macOS WebKit this stack runs on AVFoundation and the names you see are AVCaptureDevice.localizedName strings. The most hardware information of any engine — and the least file metadata: no browser writes camera EXIF here, so these stills are archived as platform output, never as camera files.",
+  },
 ];
+
+/** How completely an engine delivers one kind of information. */
+export type EngineTrait = "full" | "partial" | "none";
+
+/**
+ * Exactly what each engine asks of the user and what the website receives in
+ * return. Kept as data rather than prose so the comparison UI, the session log
+ * and the evidence pack all describe the engines identically — and so a claim
+ * only has to be corrected in one place.
+ */
+export type EngineFacts = {
+  /** What the user is prompted with, and who prompts them. */
+  permissionPrompt: string;
+  /** What the website itself ends up holding once the user agrees. */
+  siteGrant: string;
+  /** True when the site needs the browser's camera permission and holds a live track. */
+  needsCameraPermission: boolean;
+  /** Does the site learn which cameras exist, independently of any photo? */
+  deviceInventory: EngineTrait;
+  /** What hardware naming the site receives, and when. */
+  deviceNaming: string;
+  /** Live control over the sensor: pinning a lens, resolution, zoom, torch. */
+  liveControl: EngineTrait;
+  /** How much metadata arrives attached to the bytes. */
+  metadata: EngineTrait;
+  metadataDetail: string;
+  /** Where the bytes come from, in the words the evidence pack uses. */
+  bytes: string;
+  /** The nearest native iOS equivalent of this pipeline. */
+  nativeEquivalent: string;
+  /** True when the user can hand over an existing photo instead of taking one. */
+  allowsLibraryPick: boolean;
+};
+
+const NO_BROWSER_PROMPT =
+  "None from the browser. The OS camera app opens and manages its own camera permission, which the user may already have granted to the system.";
+
+export const ENGINE_FACTS: Record<CaptureEngine, EngineFacts> = {
+  "native-camera": {
+    permissionPrompt: NO_BROWSER_PROMPT,
+    siteGrant: "One image file. The website never touches the camera and cannot see a live feed.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming:
+      "Nothing live. But the returned photo's EXIF usually names the exact lens that fired — e.g. \"iPhone 15 Pro back triple camera 6.765mm f/1.78\" — which identifies the physical optic more precisely than any live label does.",
+    liveControl: "none",
+    metadata: "full",
+    metadataDetail:
+      "Full EXIF as the camera wrote it: make, model, lens, focal length, aperture, ISO, exposure, orientation, capture timestamp, and GPS when the user has it enabled.",
+    bytes: "A camera file from the OS camera app — archived under originals/.",
+    nativeEquivalent: "UIImagePickerController with sourceType .camera — the system camera app, running outside your process.",
+    allowsLibraryPick: false,
+  },
+  "system-picker": {
+    permissionPrompt:
+      "None from the browser. iOS shows its own sheet offering Photo Library, Take Photo or Choose File; only the Take Photo branch involves the camera.",
+    siteGrant: "One image file, which may be a fresh photo or an existing one.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming:
+      "Nothing live. Whatever EXIF the chosen file happens to carry — which may be a camera's, an editor's, or nothing at all.",
+    liveControl: "none",
+    metadata: "partial",
+    metadataDetail:
+      "Whatever the chosen file arrived with. A fresh camera photo brings full EXIF; a screenshot or a re-saved image may bring almost none.",
+    bytes: "A file supplied from storage — archived under originals/, with no claim that it is fresh.",
+    nativeEquivalent: "PHPickerViewController / UIImagePickerController with sourceType .photoLibrary.",
+    allowsLibraryPick: true,
+  },
+  capacitor: {
+    permissionPrompt: NO_BROWSER_PROMPT,
+    siteGrant: "One image file, recovered from Capacitor's own hidden input before Capacitor rewrites it.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming: "Nothing live — same as the native camera engine, since running as a website this is a file input underneath.",
+    liveControl: "none",
+    metadata: "full",
+    metadataDetail:
+      "Full EXIF, provided the original File is intercepted at Capacitor's input. If interception misses, the bytes are rebuilt from a blob URL and the name and timestamp are synthesised — which this app reports rather than hides.",
+    bytes: "A camera file from the OS camera app — archived under originals/.",
+    nativeEquivalent:
+      "In a compiled Capacitor app this plugin calls UIImagePickerController and AVFoundation directly. Running as a website, webUseInput makes it drive a hidden file input instead — so here it is the native-camera path with Capacitor's API on top.",
+    allowsLibraryPick: false,
+  },
+  "capture-boolean": {
+    permissionPrompt: NO_BROWSER_PROMPT,
+    siteGrant: "One image file, from whichever camera UI the browser decided to open.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming: "Nothing live. EXIF after the fact, as with the native camera engine.",
+    liveControl: "none",
+    metadata: "full",
+    metadataDetail: "Full EXIF when the OS camera app supplies the file, exactly as the native-camera engine.",
+    bytes: "A camera file from the OS camera app — archived under originals/.",
+    nativeEquivalent: "UIImagePickerController with sourceType .camera and no camera-device preference set.",
+    allowsLibraryPick: false,
+  },
+  "legacy-accept": {
+    permissionPrompt:
+      "None from the browser. Modern browsers ignore the legacy hint and show the ordinary picker, so the user sees the same sheet as the system-picker engine.",
+    siteGrant: "One image file, usually chosen rather than taken.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming: "Nothing live. Whatever EXIF the chosen file carries.",
+    liveControl: "none",
+    metadata: "partial",
+    metadataDetail: "Whatever the chosen file arrived with — this engine exists to document how the device treats the obsolete hint, not to maximise metadata.",
+    bytes: "A file supplied from storage — archived under originals/, with no claim that it is fresh.",
+    nativeEquivalent: "No modern equivalent; this mirrors pre-standard Android and BlackBerry drafts.",
+    allowsLibraryPick: true,
+  },
+  "fs-picker": {
+    permissionPrompt: "A file-access prompt from the OS file picker. No camera is involved at any point.",
+    siteGrant: "A file handle, which this app reads once. No camera access whatsoever.",
+    needsCameraPermission: false,
+    deviceInventory: "none",
+    deviceNaming: "Nothing — this engine cannot reach a camera, only stored files.",
+    liveControl: "none",
+    metadata: "partial",
+    metadataDetail: "Whatever the stored file carries, with its real name and last-modified time intact from the filesystem.",
+    bytes: "A file supplied from storage — archived under originals/, with no claim that it is fresh.",
+    nativeEquivalent: "UIDocumentPickerViewController.",
+    allowsLibraryPick: true,
+  },
+  avfoundation: {
+    permissionPrompt:
+      "The browser's own camera prompt — \"Allow this site to use your camera?\". This is the only engine that asks for it, and the only one where the website itself holds a live camera track.",
+    siteGrant:
+      "A live video track plus the full camera inventory: every camera's name, a stable per-site id for each, which hardware group each belongs to, the resolution and frame-rate ranges each supports, and zoom or torch control where the platform allows it.",
+    needsCameraPermission: true,
+    deviceInventory: "full",
+    deviceNaming:
+      "Every camera by name, live and before any photo is taken — on iOS these are AVCaptureDevice.localizedName strings such as \"Back Dual Wide Camera\", \"Back Ultra Wide Camera\", \"Back Telephoto Camera\", \"Front Camera\" and \"Desk View Camera\"; on Android, entries like \"camera2 0, facing back\"; on desktop, the USB product name. Names appear only after permission is granted — before that the browser reports a count with the labels blanked.",
+    liveControl: "full",
+    metadata: "none",
+    metadataDetail:
+      "No camera EXIF at all. No browser writes make, model, lens, GPS or a capture timestamp onto a getUserMedia still, so every EXIF-based check has nothing to read. This app records that as unavailable rather than counting it against the capture — but it does mean the metadata half of the forensics goes quiet on this engine.",
+    bytes:
+      "A platform still from ImageCapture.takePhoto() — archived under originals/. If this browser has no ImageCapture (Safari), the frame is encoded by this app instead and archived under rendered-frames/, never presented as camera output.",
+    nativeEquivalent:
+      "AVCaptureDevice.DiscoverySession + AVCaptureSession + AVCapturePhotoOutput. On WebKit this really is that stack underneath — but the web platform withholds the format list, lens switch-over factors, exposure and ISO ranges, RAW and depth.",
+    allowsLibraryPick: false,
+  },
+};
+
+export function engineFacts(engine: CaptureEngine): EngineFacts {
+  return ENGINE_FACTS[engine] ?? ENGINE_FACTS["native-camera"];
+}
+
+/** True when this engine opens a live camera the site can inspect, rather than handing off to a picker. */
+export function isDeviceLevelEngine(engine: CaptureEngine): boolean {
+  return engine === "avfoundation";
+}
+
+/** Compact one-line description of the permission/information trade, for logs and the evidence pack. */
+export function engineTradeSummary(engine: CaptureEngine): string {
+  const f = engineFacts(engine);
+  const inventory =
+    f.deviceInventory === "full" ? "names every camera" : f.deviceInventory === "partial" ? "names some cameras" : "no camera inventory";
+  const meta = f.metadata === "full" ? "full EXIF" : f.metadata === "partial" ? "whatever EXIF the file carries" : "no camera EXIF";
+  return `${engineOption(engine).label}: ${f.needsCameraPermission ? "browser camera permission required" : "no browser camera permission"} · ${inventory} · ${meta}`;
+}
 
 function isEngine(v: unknown): v is CaptureEngine {
   return CAPTURE_ENGINE_OPTIONS.some((o) => o.id === v);
@@ -110,6 +286,14 @@ export function inputCaptureAttr(engine: CaptureEngine, facing: "user" | "enviro
     default:
       return undefined;
   }
+}
+
+/**
+ * True when this engine bypasses the hidden file input entirely and runs its
+ * own capture pipeline. Callers must branch on it before clicking an input.
+ */
+export function usesOwnPipeline(engine: CaptureEngine): boolean {
+  return engine === "capacitor" || engine === "fs-picker" || engine === "avfoundation";
 }
 
 /** The `accept` attribute for this engine — the legacy engine embeds the pre-standard capture=camera MIME parameter. */
@@ -132,6 +316,8 @@ export function engineLaunchNote(engine: CaptureEngine, facing: "user" | "enviro
       return "Capacitor Camera.getPhoto() (webUseInput)";
     case "fs-picker":
       return "File System Access showOpenFilePicker() — native OS file picker, no camera hint possible";
+    case "avfoundation":
+      return `device-level capture — enumerateDevices() names every camera, then one specific ${facing === "user" ? "front" : "back"} camera is opened by deviceId and the still comes from the browser's photo pipeline (no camera EXIF exists on this path)`;
   }
 }
 

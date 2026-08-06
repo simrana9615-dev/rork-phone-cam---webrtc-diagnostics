@@ -55,12 +55,16 @@ export type NativeProvenance = {
   pressedAt: number;
   /** ms between the button press and the change event firing. */
   elapsedMs: number;
-  /** Whether the change event was dispatched by the user agent (true) or by script (false). */
-  changeIsTrusted: boolean;
+  /**
+   * Whether the change event was dispatched by the user agent (true) or by
+   * script (false). Undefined when the capture path has no file input at all
+   * (device-level capture) — not observable, which is never the same as false.
+   */
+  changeIsTrusted?: boolean;
   /** Epoch ms when this page session started. */
   pageLoadedAt: number;
-  /** Whether HTMLInputElement's files accessor was still native at capture time. */
-  filesApiNative: boolean;
+  /** Whether HTMLInputElement's files accessor was still native at capture time. Undefined when no file input was involved. */
+  filesApiNative?: boolean;
   /** Whether the shutter-button press event itself was user-agent-dispatched (false = scripted click chain). */
   pressIsTrusted?: boolean;
   /** Whether the page lost visibility between press and file arrival (the native camera UI covers the page on phones). undefined = not tracked. */

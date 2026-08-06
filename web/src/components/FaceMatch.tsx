@@ -17,6 +17,7 @@ import type { LogEntry, LogLevel } from "@/lib/camera-diagnostics";
 import { ScoreRing } from "@/components/ReportView";
 import EvidencePackButton from "@/components/EvidencePackButton";
 import { originForCaptureEngine, type PackInput, type PackMediaItem, type PackOrigin } from "@/lib/evidence-pack";
+import { deviceCameraCapturePhoto } from "@/components/verify/DeviceCameraSheet";
 
 type SlotState = {
   url: string | null;
@@ -25,9 +26,11 @@ type SlotState = {
   blob: File | null;
   face: FaceDescription | null;
   error: string | null;
+  /** Declared by the capture path when it knows better than the engine default. */
+  origin: PackOrigin | null;
 };
 
-const EMPTY_SLOT: SlotState = { url: null, fileName: null, blob: null, face: null, error: null };
+const EMPTY_SLOT: SlotState = { url: null, fileName: null, blob: null, face: null, error: null, origin: null };
 
 function loadImageEl(blob: Blob): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -55,7 +58,7 @@ function FaceSlot({
   slot: SlotState;
   busy: boolean;
   captureUser: boolean;
-  onFile: (file: File) => void;
+  onFile: (file: File, origin?: PackOrigin) => void;
 }) {
   const captureEngine = useCaptureEngine();
   const uploadRef = useRef<HTMLInputElement | null>(null);
@@ -109,6 +112,14 @@ function FaceSlot({
           className="h-9"
           disabled={busy}
           onClick={() => {
+            if (captureEngine === "avfoundation") {
+              deviceCameraCapturePhoto(captureUser ? "user" : "environment", undefined, title)
+                .then((res) => onFile(res.file, res.origin))
+                .catch((err: unknown) => {
+                  if (!(err instanceof CaptureCancelledError)) console.error("FaceMatch: device-level capture failed", err);
+                });
+              return;
+            }
             if (captureEngine === "capacitor") {
               capacitorCapturePhoto(captureUser ? "user" : "environment")
                 .then((res) => onFile(res.file))
@@ -162,7 +173,7 @@ export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel
   const [retakeReasons, setRetakeReasons] = useState<string[]>([]);
 
   const handleFile = useCallback(
-    async (file: File, which: "A" | "B") => {
+    async (file: File, which: "A" | "B", origin?: PackOrigin) => {
       const setSlot = which === "A" ? setSlotA : setSlotB;
       setOutcome(null);
       setRetakeReasons([]);
@@ -175,13 +186,20 @@ export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel
         if (!face) {
           setSlot((prev) => {
             if (prev.url) URL.revokeObjectURL(prev.url);
-            return { url: img.src, fileName: file.name, blob: file, face: null, error: "No face detected — use a clear frontal photo with the face well lit." };
+            return {
+              url: img.src,
+              fileName: file.name,
+              blob: file,
+              face: null,
+              error: "No face detected — use a clear frontal photo with the face well lit.",
+              origin: origin ?? null,
+            };
           });
           pushLog("warn", `Face Match: no face found in "${file.name}"`);
         } else {
           setSlot((prev) => {
             if (prev.url) URL.revokeObjectURL(prev.url);
-            return { url: img.src, fileName: file.name, blob: file, face, error: null };
+            return { url: img.src, fileName: file.name, blob: file, face, error: null, origin: origin ?? null };
           });
           pushLog(
             face.quality.ok ? "success" : "warn",
@@ -242,7 +260,7 @@ export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel
     const media: PackMediaItem[] = slots.map(({ slot, slug, label }) => ({
       slug,
       label,
-      origin: fileOrigin,
+      origin: slot.origin ?? fileOrigin,
       blob: slot.blob,
       url: slot.url,
       fileName: slot.fileName,
@@ -394,8 +412,22 @@ export default function FaceMatch({ pushLog, logs }: { pushLog: (level: LogLevel
         phone. Quality gates suppress false mismatches: bad captures trigger a retake request instead.
       </p>
       <div className="grid grid-cols-2 gap-2">
-        <FaceSlot title="Photo 1 — Reference / ID" hint="Upload the ID portrait or reference photo" slot={slotA} busy={busy} captureUser={false} onFile={(f) => void handleFile(f, "A")} />
-        <FaceSlot title="Photo 2 — Probe / Selfie" hint="Take or upload the selfie to verify" slot={slotB} busy={busy} captureUser onFile={(f) => void handleFile(f, "B")} />
+        <FaceSlot
+          title="Photo 1 — Reference / ID"
+          hint="Upload the ID portrait or reference photo"
+          slot={slotA}
+          busy={busy}
+          captureUser={false}
+          onFile={(f, origin) => void handleFile(f, "A", origin)}
+        />
+        <FaceSlot
+          title="Photo 2 — Probe / Selfie"
+          hint="Take or upload the selfie to verify"
+          slot={slotB}
+          busy={busy}
+          captureUser
+          onFile={(f, origin) => void handleFile(f, "B", origin)}
+        />
       </div>
       <Button className="h-12 w-full bg-teal-500 text-teal-950 hover:bg-teal-400" disabled={busy || !slotA.face || !slotB.face} onClick={compare}>
         {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ScanFace className="mr-2 h-4 w-4" />}

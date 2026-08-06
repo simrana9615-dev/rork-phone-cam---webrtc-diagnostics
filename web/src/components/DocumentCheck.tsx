@@ -11,6 +11,7 @@ import {
 } from "@/lib/fraud-detection";
 import { requestImageAiVerdict } from "@/lib/ai-verdict";
 import { CaptureCancelledError, capacitorCapturePhoto, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
+import { deviceCameraCapturePhoto } from "@/components/verify/DeviceCameraSheet";
 import DocDataPanel from "@/components/DocDataPanel";
 import { computeDocConfidence, type DocumentDataCheck } from "@/lib/mrz";
 import { downloadBlob, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
@@ -26,7 +27,14 @@ import { formatReportText } from "@/lib/fraud-detection";
 export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
   const captureEngine = useCaptureEngine();
   /** Whether these bytes are a fresh camera file or a photo picked from storage. */
-  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
+  const engineOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
+  /**
+   * Set only by capture paths that know their own origin at capture time
+   * (device-level capture, where it depends on whether the browser's photo
+   * pipeline or the canvas fallback ran). Overrides the engine default.
+   */
+  const [declaredOrigin, setDeclaredOrigin] = useState<PackOrigin | null>(null);
+  const fileOrigin: PackOrigin = declaredOrigin ?? engineOrigin;
   const uploadRef = useRef<HTMLInputElement | null>(null);
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<File | null>(null);
@@ -38,9 +46,10 @@ export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogL
   const [docData, setDocData] = useState<DocumentDataCheck | null>(null);
 
   const onFile = useCallback(
-    async (file: File | null) => {
+    async (file: File | null, origin?: PackOrigin) => {
       if (!file) return;
       fileRef.current = file;
+      setDeclaredOrigin(origin ?? null);
       setReport(null);
       setAiVerdict(null);
       setAiError(null);
@@ -203,6 +212,22 @@ export default function DocumentCheck({ pushLog, logs }: { pushLog: (level: LogL
           className="h-12"
           disabled={analyzing}
           onClick={() => {
+            if (captureEngine === "avfoundation") {
+              pushLog("info", "Document Check: opening the camera in-page and naming every device (enumerateDevices + getUserMedia)…");
+              deviceCameraCapturePhoto("environment", (step, note) => pushLog("debug", note ? `Document Check: ${step} — ${note}` : `Document Check: ${step}`), "Photograph the document")
+                .then((res) => {
+                  pushLog(
+                    "info",
+                    `Document Check: ${res.inventory.after.length} camera${res.inventory.after.length === 1 ? "" : "s"} named — ${res.inventory.after.map((d) => d.label || "(unnamed)").join(" · ") || "none"}`
+                  );
+                  void onFile(res.file, res.origin);
+                })
+                .catch((err: unknown) => {
+                  if (err instanceof CaptureCancelledError) pushLog("warn", "Document Check: capture cancelled");
+                  else pushLog("error", `Document Check: device-level capture failed: ${err instanceof Error ? err.message : String(err)}`);
+                });
+              return;
+            }
             if (captureEngine === "capacitor") {
               pushLog("info", "Document Check: launching Capacitor Camera.getPhoto() (webUseInput)…");
               capacitorCapturePhoto("environment")

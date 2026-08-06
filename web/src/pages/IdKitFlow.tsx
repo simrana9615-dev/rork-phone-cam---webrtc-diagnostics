@@ -45,6 +45,7 @@ import EvidencePackButton from "@/components/EvidencePackButton";
 import { originForCaptureEngine, type PackInput, type PackMediaItem, type PackOrigin } from "@/lib/evidence-pack";
 import { downloadBlob, makeLog, trackSettings, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError, capacitorCapturePhoto, engineLaunchNote, engineOption, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
+import { deviceCameraCapturePhoto } from "@/components/verify/DeviceCameraSheet";
 import { runCaptureHold } from "@/lib/capture-hold";
 import { getSilentClipMaxMs } from "@/lib/silent-clip";
 import {
@@ -559,8 +560,14 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   /** Provenance tier for File-based captures on the selected engine (camera vs picker). */
   const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
   /** Latest doc/selfie file handlers — refs avoid use-before-define in the capture launchers declared above the handlers. */
-  const handleDocFileRef = useRef<(pageId: string, file: File, changeIsTrusted: boolean) => void>(() => undefined);
-  const handleSelfieFallbackFileRef = useRef<(file: File, changeIsTrusted: boolean) => void>(() => undefined);
+  const handleDocFileRef = useRef<(pageId: string, file: File, changeIsTrusted: boolean, origin?: PackOrigin) => void>(() => undefined);
+  const handleSelfieFallbackFileRef = useRef<(file: File, changeIsTrusted: boolean, origin?: PackOrigin) => void>(() => undefined);
+  /**
+   * Origin declared by a capture path that knows it better than the engine
+   * default does — device-level capture, where it depends on whether the
+   * browser's photo pipeline or this app's canvas encode produced the bytes.
+   */
+  const selfieOriginRef = useRef<PackOrigin | null>(null);
   const [stage, setStage] = useState<Stage>("intro");
   const [loaderVisible, setLoaderVisible] = useState<boolean>(false);
   const [loaderMsg, setLoaderMsg] = useState<string>("Verification starting…");
@@ -840,7 +847,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
 
   // ── Native document page analysis (OS camera capture) ──────────────────────
   const analyzeNativeDoc = useCallback(
-    async (page: PageDef, file: File) => {
+    async (page: PageDef, file: File, declaredOrigin?: PackOrigin) => {
       setAnalyzing(true);
       setAnalyzeMsg("Running EXIF + pixel forensics…");
       const pressed = pressedAtRef.current[page.id] ?? { epoch: 0, perf: 0 };
@@ -874,7 +881,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         });
         const fileName = file.name || `${template.doc}-${page.id}-${Date.now()}.jpg`;
         const meta = `${engineOption(captureEngine).label} · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`;
-        await finishDocAnalysis(page, file, fileName, meta, report, fileOrigin);
+        await finishDocAnalysis(page, file, fileName, meta, report, declaredOrigin ?? fileOrigin);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         pushLog("error", `${page.label} analysis failed: ${msg}`);
@@ -902,7 +909,41 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       awaitingRef.current = pageId;
       setFallback((prev) => ({ ...prev, [pageId]: false }));
       pushLog("info", `EyeDeeKit: opening ${engineOption(captureEngine).label} for ${label} (${trusted ? "user tap" : "auto-launch inside the permission trust window"})…`);
-      if (captureEngine === "capacitor") {
+      if (captureEngine === "avfoundation") {
+        void (async () => {
+          try {
+            const res = await deviceCameraCapturePhoto("environment", (step, note) => ledgerNativeStep(tripId, step, note), label);
+            ledgerNativeStep(
+              tripId,
+              "Event-trust facts not observable on this path",
+              "Device-level capture returns a Blob straight from the camera track — no file input, no change event to audit, so no trust claim is made either way"
+            );
+            pushLog(
+              "info",
+              `EyeDeeKit: this device named ${res.inventory.after.length} camera${res.inventory.after.length === 1 ? "" : "s"} — ${res.inventory.after.map((d) => d.label || "(unnamed)").join(" · ") || "none"}`
+            );
+            pushLog(
+              res.origin === "platform-photo" ? "info" : "warn",
+              res.origin === "platform-photo"
+                ? `${label}: still came from the browser's photo pipeline — archived under originals/ as a platform still, with no camera EXIF (none exists on this path).`
+                : `${label}: this browser has no ImageCapture, so the frame was encoded by this app — archived under rendered-frames/, never as a camera file.`
+            );
+            handleDocFileRef.current(pageId, res.file, false, res.origin);
+          } catch (err) {
+            if (awaitingRef.current === pageId) awaitingRef.current = null;
+            setAwaiting((prev) => (prev === pageId ? null : prev));
+            setFallback((prev) => ({ ...prev, [pageId]: true }));
+            if (err instanceof CaptureCancelledError) {
+              ledgerNativeStep(tripId, "Device-level camera closed with no photo — capture cancelled");
+              pushLog("warn", `EyeDeeKit: ${label} capture cancelled (device-level).`);
+            } else {
+              const msg = err instanceof Error ? err.message : String(err);
+              ledgerNativeStep(tripId, "Device-level capture failed", msg);
+              pushLog("error", `EyeDeeKit: device-level capture for ${label} failed: ${msg}`);
+            }
+          }
+        })();
+      } else if (captureEngine === "capacitor") {
         void (async () => {
           try {
             const res = await capacitorCapturePhoto("environment", (step, note) => ledgerNativeStep(tripId, step, note));
@@ -1335,7 +1376,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   );
 
   const handleDocFile = useCallback(
-    async (pageId: string, file: File, changeIsTrusted: boolean) => {
+    async (pageId: string, file: File, changeIsTrusted: boolean, declaredOrigin?: PackOrigin) => {
       setAwaiting((prev) => (prev === pageId ? null : prev));
       if (awaitingRef.current === pageId) awaitingRef.current = null;
       const timer = fallbackTimerRef.current[pageId];
@@ -1379,7 +1420,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         pushLog("info", `${page.label} received — starting the silent passive check for the ${nextPage.label.toLowerCase()}.`);
         void runSilentCapture(nextPage.id, true);
       }
-      await analyzeNativeDoc(page, file);
+      await analyzeNativeDoc(page, file, declaredOrigin);
     },
     [analyzeNativeDoc, cfg.nativePages, pushLog, runSilentCapture, template.pages]
   );
@@ -1473,7 +1514,34 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
       setAwaiting("selfie");
       awaitingRef.current = "selfie";
       pushLog("info", `EyeDeeKit: opening ${engineOption(captureEngine).label} (front) for the fallback selfie (${trusted ? "user tap" : "auto"})…`);
-      if (captureEngine === "capacitor") {
+      if (captureEngine === "avfoundation") {
+        void (async () => {
+          try {
+            const res = await deviceCameraCapturePhoto("user", (step, note) => ledgerNativeStep(tripId, step, note), "Selfie");
+            ledgerNativeStep(
+              tripId,
+              "Event-trust facts not observable on this path",
+              "Device-level capture returns a Blob straight from the camera track — no file input, no change event to audit"
+            );
+            pushLog(
+              "info",
+              `EyeDeeKit: this device named ${res.inventory.after.length} camera${res.inventory.after.length === 1 ? "" : "s"} — ${res.inventory.after.map((d) => d.label || "(unnamed)").join(" · ") || "none"}`
+            );
+            handleSelfieFallbackFileRef.current(res.file, false, res.origin);
+          } catch (err) {
+            if (awaitingRef.current === "selfie") awaitingRef.current = null;
+            setAwaiting((prev) => (prev === "selfie" ? null : prev));
+            if (err instanceof CaptureCancelledError) {
+              ledgerNativeStep(tripId, "Device-level camera closed with no photo — capture cancelled");
+              pushLog("warn", "EyeDeeKit: fallback selfie cancelled (device-level).");
+            } else {
+              const msg = err instanceof Error ? err.message : String(err);
+              ledgerNativeStep(tripId, "Device-level capture failed", msg);
+              pushLog("error", `EyeDeeKit: device-level selfie capture failed: ${msg}`);
+            }
+          }
+        })();
+      } else if (captureEngine === "capacitor") {
         void (async () => {
           try {
             const res = await capacitorCapturePhoto("user", (step, note) => ledgerNativeStep(tripId, step, note));
@@ -2016,7 +2084,7 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
         slug: "50-face",
         label: face.mode === "native-selfie" ? "Fallback selfie" : "Liveness identity frame",
         // The liveness identity frame is drawn and encoded in-browser; a fallback selfie is a real camera file.
-        origin: face.mode === "native-selfie" ? fileOrigin : "app-encoded-frame",
+        origin: face.mode === "native-selfie" ? (selfieOriginRef.current ?? fileOrigin) : "app-encoded-frame",
         blob: face.blob ?? null,
         url: face.url,
         fileName: face.report?.fileName ?? null,
@@ -2269,10 +2337,11 @@ export default function IdKitFlow({ variant = "licence" }: { variant?: EyeDeeKit
   ];
 
   useEffect(() => {
-    handleDocFileRef.current = (pageId, file, changeIsTrusted) => {
-      void handleDocFile(pageId, file, changeIsTrusted);
+    handleDocFileRef.current = (pageId, file, changeIsTrusted, origin) => {
+      void handleDocFile(pageId, file, changeIsTrusted, origin);
     };
-    handleSelfieFallbackFileRef.current = (file, changeIsTrusted) => {
+    handleSelfieFallbackFileRef.current = (file, changeIsTrusted, origin) => {
+      selfieOriginRef.current = origin ?? null;
       void handleSelfieFallbackFile(file, changeIsTrusted);
     };
   }, [handleDocFile, handleSelfieFallbackFile]);

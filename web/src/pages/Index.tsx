@@ -42,6 +42,7 @@ import { FindingRow } from "@/components/ReportView";
 import { analyzeImageFraud, type FraudVerdict, type MediaFraudReport } from "@/lib/fraud-detection";
 import CaptureEngineToggle from "@/components/verify/CaptureEngineToggle";
 import { CaptureCancelledError, capacitorCapturePhoto, engineLaunchNote, fsPickerCapturePhoto, inputAcceptAttr, inputCaptureAttr, useCaptureEngine } from "@/lib/capture-engine";
+import { deviceCameraCapturePhoto } from "@/components/verify/DeviceCameraSheet";
 import { auditFileInputIntegrity } from "@/lib/injection-guard";
 import { describeLensCheck, enforceLensPolicy } from "@/lib/lens-enforcement";
 
@@ -1250,6 +1251,29 @@ const Index = () => {
             onClick={(e) => {
               nativePressRef.current = Date.now();
               beginNativeWatch(e.nativeEvent?.isTrusted === true);
+              if (captureEngine === "avfoundation") {
+                pushLog("info", "Opening the camera in-page (device-level) — enumerateDevices names every camera before the still is taken");
+                deviceCameraCapturePhoto("environment", (step, note) => pushLog("debug", note ? `${step} — ${note}` : step), "Back camera")
+                  .then((res) => {
+                    pushLog(
+                      "info",
+                      `Device inventory: ${res.inventory.after.length} camera${res.inventory.after.length === 1 ? "" : "s"} named — ${res.inventory.after.map((d) => d.label || "(unnamed)").join(" · ") || "none"}`
+                    );
+                    pushLog(
+                      res.origin === "platform-photo" ? "success" : "warn",
+                      res.origin === "platform-photo"
+                        ? "Still produced by ImageCapture.takePhoto() — platform bytes, and no camera EXIF exists on this path by design."
+                        : "No ImageCapture in this browser — the frame was encoded by this app from the video track, so it is not a camera file."
+                    );
+                    void onNativeFile(res.file, "device-camera-back", { ...endNativeWatch() });
+                  })
+                  .catch((err: unknown) => {
+                    endNativeWatch();
+                    if (err instanceof CaptureCancelledError) pushLog("warn", "Device-level camera closed without a photo");
+                    else pushLog("error", `Device-level capture failed: ${err instanceof Error ? err.message : String(err)}`);
+                  });
+                return;
+              }
               if (captureEngine === "capacitor") {
                 pushLog("info", "Opening Capacitor Camera.getPhoto() (back camera, webUseInput)");
                 void launchCapacitorNative("environment", "native-back-camera");
@@ -1278,6 +1302,23 @@ const Index = () => {
             onClick={(e) => {
               nativePressRef.current = Date.now();
               beginNativeWatch(e.nativeEvent?.isTrusted === true);
+              if (captureEngine === "avfoundation") {
+                pushLog("info", "Opening the camera in-page (device-level, front) — enumerateDevices names every camera before the still is taken");
+                deviceCameraCapturePhoto("user", (step, note) => pushLog("debug", note ? `${step} — ${note}` : step), "Front camera")
+                  .then((res) => {
+                    pushLog(
+                      "info",
+                      `Device inventory: ${res.inventory.after.length} camera${res.inventory.after.length === 1 ? "" : "s"} named — ${res.inventory.after.map((d) => d.label || "(unnamed)").join(" · ") || "none"}`
+                    );
+                    void onNativeFile(res.file, "device-camera-front", { ...endNativeWatch() });
+                  })
+                  .catch((err: unknown) => {
+                    endNativeWatch();
+                    if (err instanceof CaptureCancelledError) pushLog("warn", "Device-level camera closed without a photo");
+                    else pushLog("error", `Device-level capture failed: ${err instanceof Error ? err.message : String(err)}`);
+                  });
+                return;
+              }
               if (captureEngine === "capacitor") {
                 pushLog("info", "Opening Capacitor Camera.getPhoto() (front camera, webUseInput)");
                 void launchCapacitorNative("user", "native-front-camera");

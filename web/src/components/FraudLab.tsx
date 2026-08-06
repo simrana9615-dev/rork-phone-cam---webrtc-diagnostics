@@ -32,9 +32,12 @@ const TABS: { id: LabTab; label: string; icon: typeof FileSearch }[] = [
 ];
 
 function MediaAnalysis({ pushLog, logs }: { pushLog: (level: LogLevel, message: string) => void; logs?: LogEntry[] }) {
-  const captureEngine = useCaptureEngine();
-  /** This screen always takes a file the user supplied, whatever engine picked it. */
-  const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
+  /**
+   * This screen only ever reads a file the user chose from storage — its input
+   * carries no capture attribute, so no capture engine applies and the origin
+   * is fixed rather than derived.
+   */
+  const fileOrigin: PackOrigin = "supplied-file";
   const inputRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<File | null>(null);
   const [analyzing, setAnalyzing] = useState<boolean>(false);

@@ -197,6 +197,12 @@ export default function Verify() {
    */
   const captureEngine = useCaptureEngine();
   const fileOrigin = useMemo<PackOrigin>(() => originForCaptureEngine(captureEngine), [captureEngine]);
+  /**
+   * Origin declared by the selfie capture path itself, used when it knows
+   * better than the engine default — device-level capture, where it depends on
+   * whether the browser's photo pipeline or this app's canvas encode ran.
+   */
+  const selfieOriginRef = useRef<PackOrigin | null>(null);
 
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [pageResults, setPageResults] = useState<Record<string, PageResult>>({});
@@ -766,7 +772,7 @@ export default function Verify() {
         slug: "90-face",
         label: faceResult.mode === "liveness" ? "Live face (liveness identity frame)" : "Selfie",
         // A liveness frame is drawn and encoded in-browser; a selfie is a real camera file.
-        origin: faceResult.mode === "liveness" ? "app-encoded-frame" : fileOrigin,
+        origin: faceResult.mode === "liveness" ? "app-encoded-frame" : (selfieOriginRef.current ?? fileOrigin),
         blob: faceResult.blob ?? null,
         url: faceResult.url,
         fileName: faceResult.report?.fileName ?? null,
@@ -1022,8 +1028,14 @@ export default function Verify() {
                       buttonLabel={`Photograph ${step.page.label}`}
                       hint={step.page.hint}
                       pushLog={pushLog}
-                      onCapture={(file, provenance) =>
-                        void handleDocCapture(step.page, file, `Native camera app · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`, fileOrigin, { provenance })
+                      onCapture={(file, provenance, origin) =>
+                        void handleDocCapture(
+                          step.page,
+                          file,
+                          `${origin ? "Device-level camera" : "Native camera app"} · ${file.name} · ${(file.size / 1024).toFixed(0)} KB`,
+                          origin ?? fileOrigin,
+                          { provenance }
+                        )
                       }
                     />
                   )}
@@ -1260,7 +1272,10 @@ export default function Verify() {
                 buttonLabel="Take Selfie with Camera App"
                 hint="Hold the phone at eye level, face centered and well lit, no hat or sunglasses. The selfie gets full EXIF forensics plus on-device face quality gates."
                 pushLog={pushLog}
-                onCapture={(file, provenance) => void handleSelfieCapture(file, provenance)}
+                onCapture={(file, provenance, origin) => {
+                  selfieOriginRef.current = origin ?? null;
+                  void handleSelfieCapture(file, provenance);
+                }}
               />
             )}
           </section>

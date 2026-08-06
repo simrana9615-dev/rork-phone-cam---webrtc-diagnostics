@@ -73,6 +73,12 @@ export type PackOrigin =
  * it. Engines that open the OS camera app yield a fresh camera file; picker
  * engines let the user choose an existing photo, so the pack must not claim the
  * file came from the camera — the forensic checks decide whether it is fresh.
+ *
+ * The device-level engine is the one case this cannot settle on its own: it
+ * yields a platform still when the browser has ImageCapture and an app-encoded
+ * frame when it does not, and only the capture itself knows which happened. The
+ * value here is the expected path; callers holding a DeviceCaptureResult must
+ * prefer the origin it reports.
  */
 export function originForCaptureEngine(engine: CaptureEngine): PackOrigin {
   switch (engine) {
@@ -84,6 +90,8 @@ export function originForCaptureEngine(engine: CaptureEngine): PackOrigin {
     case "legacy-accept":
     case "fs-picker":
       return "supplied-file";
+    case "avfoundation":
+      return "platform-photo";
   }
 }
 
