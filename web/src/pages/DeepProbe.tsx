@@ -35,6 +35,7 @@ import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
 import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
 import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
+import { useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
 import { buildManualShotList, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
 import { collectPassive, type PassiveGroup } from "@/lib/deep-probe/passive";
@@ -77,8 +78,34 @@ const STAGES: { phase: Phase; label: string; icon: typeof ShieldQuestion }[] = [
 /** Phases where the run is working through the bytes rather than waiting on you. */
 const WORKING: Phase[] = ["exports", "reading", "building"];
 
-/** What a finished run can hand over. Only the archive is off by default. */
-type ExportChoice = { sheet: boolean; spec: boolean; viewer: boolean; archive: boolean };
+/**
+ * How a stage ended, once it has ended. A stage that was refused, stopped or
+ * failed must not wear the same green tick as one that ran — the strip is the
+ * only at-a-glance account of the run's shape, and a uniform row of ticks at
+ * the end would misreport a run that skipped half of itself.
+ */
+type StageMark = "done" | "skipped" | "stopped" | "failed";
+
+const STAGE_MARK_STYLE: Record<StageMark, string> = {
+  done: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
+  skipped: "border-border/60 bg-background/40 text-muted-foreground",
+  stopped: "border-amber-500/45 bg-amber-500/10 text-amber-300",
+  failed: "border-rose-500/45 bg-rose-500/10 text-rose-300",
+};
+
+const STAGE_MARK_ICON: Record<StageMark, typeof Check> = {
+  done: Check,
+  skipped: Minus,
+  stopped: Square,
+  failed: X,
+};
+
+const STAGE_MARK_TITLE: Record<StageMark, string> = {
+  done: "This stage ran.",
+  skipped: "This stage never ran, and the sheets say why.",
+  stopped: "You stopped before or during this stage.",
+  failed: "This stage was attempted and failed. The failure is reported, not hidden.",
+};
 
 const COUNTDOWN_SECONDS = 4;
 /** How often a paused stage re-checks whether you have resumed. */
@@ -184,12 +211,13 @@ export default function DeepProbe() {
   const [fatal, setFatal] = useState<string | null>(null);
   const [archiveFatal, setArchiveFatal] = useState<string | null>(null);
   /**
-   * The archive is off by default. It is the one product of a run that has been
-   * killing the tab, and everything else is cheap — so the expensive thing is
-   * opted into rather than out of, until it has earned the trust back.
+   * Shared with the dashboard card and persisted, so the choice is made on the
+   * way in rather than discovered twenty minutes later — and survives the run
+   * that kills the tab, which is the run most likely to need it again.
    */
-  const [choice, setChoice] = useState<ExportChoice>({ sheet: true, spec: true, viewer: true, archive: false });
+  const [choice, setChoice] = useExportChoice();
   const [crash, setCrash] = useState<CrashReport | null>(null);
+  const [stageMarks, setStageMarks] = useState<Partial<Record<Phase, StageMark>>>({});
 
   const [paused, setPaused] = useState<boolean>(false);
   const [photoCount, setPhotoCount] = useState<number>(0);
@@ -221,6 +249,29 @@ export default function DeepProbe() {
 
   const addLog = useCallback((level: LogLevel, message: string): void => {
     setLogs((prev) => [...prev.slice(-299), makeLog(level, message)]);
+  }, []);
+
+  const markStage = useCallback((stage: Phase, mark: StageMark): void => {
+    setStageMarks((prev) => (prev[stage] ? prev : { ...prev, [stage]: mark }));
+  }, []);
+
+  /**
+   * The one door out of the gathering stages.
+   *
+   * Three routes used to jump straight to the archive builder instead — a
+   * refused camera, a stop during the sensors, a stop during the sweep. The
+   * builder cannot run at that point because the sheets it copies in have not
+   * been written, so all three dead-ended on an error card and the export
+   * choice was never shown. Every exit now comes through here, and it is
+   * idempotent so a stage that notices the abort after the fact cannot drag the
+   * run backwards out of a later phase.
+   */
+  const toExports = useCallback((...extra: StageOmission[]): void => {
+    if (ranRef.current.has("exports")) return;
+    ranRef.current.add("exports");
+    for (const omission of extra) omissionsRef.current.push(omission);
+    if (finishedAtRef.current === "") finishedAtRef.current = new Date().toISOString();
+    setPhase("exports");
   }, []);
 
   useEffect(() => {
@@ -356,6 +407,14 @@ export default function DeepProbe() {
     capturesRef.current = [];
     omissionsRef.current = [];
     suspensionsRef.current = [];
+    factsRef.current = [];
+    sheetsRef.current = null;
+    finishedAtRef.current = "";
+    setStageMarks({});
+    setSheets(null);
+    setPack(null);
+    setFatal(null);
+    setArchiveFatal(null);
     setRecords([]);
     setSensors([]);
     setLogs([]);
@@ -437,9 +496,10 @@ export default function DeepProbe() {
     void (async () => {
       statesAfterRef.current = await queryAllPermissions();
       addLog("success", "Every request at this scope has been made. Nothing was retried.");
+      markStage("permissions", "done");
       setPhase("sensors");
     })();
-  }, [phase, index, queue.length, addLog]);
+  }, [phase, index, queue.length, addLog, markStage]);
 
   /* ---------------- stage two: sensors ---------------- */
   const grantedIds = useMemo(() => new Set(records.filter((r) => r.outcome === "granted").map((r) => r.id)), [records]);
@@ -519,8 +579,10 @@ export default function DeepProbe() {
           });
         }
         ranRef.current.add("camera");
-        omissionsRef.current.push({ stage: "Camera sweep and manual shots", reason: "You stopped the run before these stages." });
-        setPhase("building");
+        markStage("sensors", "stopped");
+        markStage("camera", "stopped");
+        markStage("manual", "stopped");
+        toExports({ stage: "Camera sweep and manual shots", reason: "You stopped the run before these stages." });
         return;
       }
 
@@ -531,9 +593,10 @@ export default function DeepProbe() {
           reason: "Nothing that produces a time series was granted, so there was nothing to record. This is a consequence of the permission answers, not a fault.",
         });
       }
+      markStage("sensors", collected.length === 0 ? "skipped" : "done");
       setPhase("camera");
     })();
-  }, [phase, grantedIds, addLog, waitWhilePaused]);
+  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports]);
 
   /* ---------------- stage three: camera sweep ---------------- */
   useEffect(() => {
@@ -541,12 +604,16 @@ export default function DeepProbe() {
     ranRef.current.add("camera");
     void (async () => {
       if (!grantedIds.has("camera")) {
-        addLog("warn", "Camera permission was not granted, so the sweep cannot run. No camera claim appears anywhere in the archive.");
-        omissionsRef.current.push({
+        addLog(
+          "warn",
+          "Camera permission was not granted, so neither camera stage can run. No camera claim appears anywhere in the sheets. Everything already gathered — the permission answers, the passive facts and the sensor recordings — is still yours, and you choose what to do with it next."
+        );
+        markStage("camera", "skipped");
+        markStage("manual", "skipped");
+        toExports({
           stage: "Camera sweep and manual shots",
           reason: "Camera permission was not granted. The sweep does not re-prompt after a refusal, so both camera stages were skipped entirely.",
         });
-        setPhase("building");
         return;
       }
       addLog("info", "Camera sweep starting — every camera, every resolution rung, every ratio, frame rate and control mode.");
@@ -584,17 +651,22 @@ export default function DeepProbe() {
       }
 
       if (abortRef.current) {
-        omissionsRef.current.push({ stage: "Camera sweep (partially)", reason: "You stopped the sweep early. Every row recorded really ran; the remainder never started." });
-        setPhase("building");
+        markStage("camera", "stopped");
+        markStage("manual", "stopped");
+        toExports(
+          { stage: "Camera sweep (partially)", reason: "You stopped the sweep early. Every row recorded really ran; the remainder never started." },
+          { stage: "Your own shots", reason: "You stopped during the sweep, so the manual shot list never began." }
+        );
         return;
       }
 
+      markStage("camera", "done");
       const inventory = await enumerateVideoInputs();
       setManualSteps(buildManualSteps(inventory));
       setManualIndex(0);
       setPhase("manual");
     })();
-  }, [phase, grantedIds, addLog, waitWhilePaused]);
+  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports]);
 
   /* ---------------- stage four: manual shots ---------------- */
   const manualStep = phase === "manual" ? manualSteps[manualIndex] : undefined;
@@ -679,9 +751,9 @@ export default function DeepProbe() {
   useEffect(() => {
     if (phase !== "manual" || manualSteps.length === 0 || manualIndex < manualSteps.length) return;
     addLog("success", "Manual shots finished.");
-    finishedAtRef.current = new Date().toISOString();
-    setPhase("exports");
-  }, [phase, manualIndex, manualSteps.length, addLog]);
+    markStage("manual", "done");
+    toExports();
+  }, [phase, manualIndex, manualSteps.length, addLog, markStage, toExports]);
 
   /* ---------------- stage five: the facts, then the sheets ---------------- */
   useEffect(() => {
@@ -742,6 +814,7 @@ export default function DeepProbe() {
           `Sheets ready: the full stat sheet, the forensic item list, the correlation brief and the device spec. None of them needed an archive, and you have them now rather than after one.`
         );
 
+        markStage("reading", "done");
         if (wants.archive) {
           setPhase("building");
           return;
@@ -752,11 +825,13 @@ export default function DeepProbe() {
         const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
         setFatal(message);
         addLog("error", `The facts could not be read: ${message}`);
+        markStage("reading", "failed");
+        markStage("building", "failed");
         finishTrail("failed", message);
         setPhase("done");
       }
     })();
-  }, [phase, tier, runFacts, addLog]);
+  }, [phase, tier, runFacts, addLog, markStage]);
 
   /* ---------------- stage six: the archive, only if asked for ---------------- */
   useEffect(() => {
@@ -766,6 +841,7 @@ export default function DeepProbe() {
     void (async () => {
       if (!sheetSet) {
         setArchiveFatal("The sheets were not written, so there is nothing for the archive to copy in. This is a bug, and the run is reported as it is rather than patched over.");
+        markStage("building", "failed");
         finishTrail("failed", "sheets missing at archive time");
         setPhase("done");
         return;
@@ -796,36 +872,59 @@ export default function DeepProbe() {
             : `Archive built, but ${failed} capture(s) failed the byte-identity re-check. That failure is reported, not hidden.`
         );
         for (const warning of result.warnings) addLog("warn", warning);
+        markStage("building", "done");
         finishTrail("complete");
         setPhase("done");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         setArchiveFatal(message);
         addLog("error", `The archive could not be built: ${message} — the sheets above are unaffected and already yours.`);
+        markStage("building", "failed");
         finishTrail("failed", message);
         setPhase("done");
       }
     })();
-  }, [phase, runFacts, addLog]);
+  }, [phase, runFacts, addLog, markStage]);
 
+  /**
+   * Stop, from any stage.
+   *
+   * Two stages act on the flag rather than on this handler: the sensor loop and
+   * the camera sweep both check it between steps, so that a recording or a
+   * constraint under test is never cut in half and reported as if it were a
+   * complete reading. Both then route through `toExports` themselves. The
+   * stages that sit idle waiting for you — the permission queue and your own
+   * shots — have nothing to finish, so they leave immediately.
+   */
   const stopEverything = useCallback((): void => {
     abortRef.current = true;
     pausedRef.current = false;
     setPaused(false);
-    addLog("warn", "Stopping. Everything gathered so far is kept, and every sheet will be labelled partial.");
     finishedAtRef.current = new Date().toISOString();
     if (phase === "permissions") {
+      addLog("warn", "Stopping. Everything gathered so far is kept, and every sheet will be labelled partial.");
       for (const request of queue.slice(index)) setRecords((prev) => [...prev, skippedRecord(request)]);
       omissionsRef.current.push({ stage: "Remaining permission requests", reason: "You stopped the run. The requests that had not yet fired are listed as skipped." });
       ranRef.current.add("sensors");
       ranRef.current.add("camera");
-      omissionsRef.current.push({ stage: "Sensor recordings, camera sweep and manual shots", reason: "You stopped the run before these stages." });
-      setPhase("exports");
-    } else if (phase === "manual") {
-      omissionsRef.current.push({ stage: "Remaining manual shots", reason: "You stopped the run. The shots not yet taken were never attempted." });
-      setPhase("exports");
+      markStage("permissions", "stopped");
+      markStage("sensors", "stopped");
+      markStage("camera", "stopped");
+      markStage("manual", "stopped");
+      toExports({ stage: "Sensor recordings, camera sweep and manual shots", reason: "You stopped the run before these stages." });
+      return;
     }
-  }, [phase, queue, index, addLog]);
+    if (phase === "manual") {
+      addLog("warn", "Stopping. Everything gathered so far is kept, and every sheet will be labelled partial.");
+      markStage("manual", "stopped");
+      toExports({ stage: "Remaining manual shots", reason: "You stopped the run. The shots not yet taken were never attempted." });
+      return;
+    }
+    addLog(
+      "warn",
+      "Stopping. The step in progress finishes on its own — cutting one in half would leave a reading that describes an interrupted device rather than a real one — and then you go straight to your choices. Everything gathered is kept and labelled partial."
+    );
+  }, [phase, queue, index, addLog, markStage, toExports]);
 
   /** Saves one derived text file. Nothing here needs the archive to exist. */
   const saveText = useCallback((text: string, fileName: string, mime: string): void => {
@@ -902,22 +1001,31 @@ export default function DeepProbe() {
           {stages.map((stage) => {
             const order = stages.findIndex((s) => s.phase === (phase === "exports" ? "reading" : phase));
             const mine = stages.findIndex((s) => s.phase === stage.phase);
-            const state = phase === "done" || mine < order ? "done" : mine === order ? "active" : "todo";
-            const Icon = stage.icon;
+            // A recorded mark always wins. Position alone cannot tell a stage
+            // that ran from one that was refused or stopped, and at the end of a
+            // run every stage is behind the pointer — which is how a skipped
+            // stage used to end up wearing a green tick.
+            const mark = stageMarks[stage.phase];
+            const active = mine === order && mark === undefined;
+            const Icon = mark ? STAGE_MARK_ICON[mark] : stage.icon;
             return (
               <div
                 key={stage.phase}
+                title={mark ? STAGE_MARK_TITLE[mark] : undefined}
                 className={cn(
                   "flex flex-1 flex-col items-center gap-1 rounded-xl border px-1 py-2 transition-colors",
-                  state === "done"
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                    : state === "active"
+                  mark
+                    ? STAGE_MARK_STYLE[mark]
+                    : active
                       ? "border-fuchsia-500/50 bg-fuchsia-500/12 text-fuchsia-300"
                       : "border-border/60 bg-background/40 text-muted-foreground"
                 )}
               >
-                {state === "done" ? <Check className="h-3.5 w-3.5" /> : <Icon className="h-3.5 w-3.5" />}
+                <Icon className="h-3.5 w-3.5" />
                 <span className="text-[8.5px] font-semibold uppercase tracking-wide">{stage.label}</span>
+                {mark && mark !== "done" ? (
+                  <span className="text-[7.5px] font-semibold uppercase tracking-wide opacity-80">{mark}</span>
+                ) : null}
               </div>
             );
           })}
@@ -930,7 +1038,7 @@ export default function DeepProbe() {
         </div>
       ) : null}
 
-      {phase === "setup" ? <Setup tier={tier} setTier={setTier} onStart={() => void start()} /> : null}
+      {phase === "setup" ? <Setup tier={tier} setTier={setTier} choice={choice} setChoice={setChoice} onStart={() => void start()} /> : null}
 
       {phase === "permissions" ? (
         <div className="space-y-3">
@@ -1126,6 +1234,7 @@ export default function DeepProbe() {
             setChoice={setChoice}
             photoCount={photoCount}
             byteCount={byteCount}
+            omissions={omissionsRef.current}
             onGo={() => {
               addLog(
                 "info",
@@ -1457,24 +1566,53 @@ function ExportChoicePanel({
   setChoice,
   photoCount,
   byteCount,
+  omissions,
   onGo,
 }: {
   choice: ExportChoice;
   setChoice: (next: ExportChoice) => void;
   photoCount: number;
   byteCount: number;
+  omissions: StageOmission[];
   onGo: () => void;
 }) {
   const nothing = !choice.sheet && !choice.spec && !choice.viewer && !choice.archive;
+  const noPhotos = photoCount === 0;
   return (
     <div className="space-y-3">
       <div className="diag-card p-3.5">
-        <h2 className="section-title">The asking and the shooting are done</h2>
+        <h2 className="section-title">{noPhotos ? "The gathering is over — without photos" : "The asking and the shooting are done"}</h2>
         <p className="section-sub mt-1">
-          {photoCount} photo(s), {formatBytes(byteCount)} held. Choose what this run should hand over before it reads them — the choice changes how much
-          memory the next step needs, so it cannot honestly be offered afterwards.
+          {noPhotos ? (
+            <>
+              This run took no photos, so there is nothing to read. Everything else it learned still stands: every permission answer, everything the
+              device volunteered with no prompt at all, and every sensor recording that ran. Confirm what you want and the sheets are written from that.
+            </>
+          ) : (
+            <>
+              {photoCount} photo(s), {formatBytes(byteCount)} held. Your choices are already set from the menu — this is the last honest moment to change
+              them, because whether the bytes are kept or dropped decides how much memory the next step needs.
+            </>
+          )}
         </p>
       </div>
+
+      {omissions.length > 0 ? (
+        <div className="diag-card border-amber-500/40 p-3">
+          <h3 className="text-[11.5px] font-semibold text-amber-200">What did not happen ({omissions.length})</h3>
+          <div className="mt-1.5 space-y-1.5 text-[10.5px] leading-relaxed text-amber-200/85">
+            {omissions.map((o) => (
+              <div key={o.stage}>
+                <span className="font-semibold">{o.stage}</span> — {o.reason}
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
+            Each of these is written into the sheets as well, and the whole set is stamped PARTIAL. A gap that is named is evidence; a gap that is
+            quietly closed over is not.
+          </p>
+        </div>
+      ) : null}
 
       <div className="diag-card space-y-2 p-3">
         <TickBox
@@ -1502,48 +1640,66 @@ function ExportChoicePanel({
           on={choice.archive}
           onToggle={() => setChoice({ ...choice, archive: !choice.archive })}
           title="Raw archive (the heavy one)"
-          detail="The complete byte-for-byte dump: every photo untouched, hex dumps, carved metadata regions and four checksums each. This is the step that has been killing the browser, so it is off unless you ask for it."
+          detail={
+            noPhotos
+              ? "The byte-for-byte dump of every photo. This run has no photos, so the archive would hold only the sheets — which you can already save directly above."
+              : "The complete byte-for-byte dump: every photo untouched, hex dumps, carved metadata regions and four checksums each. This is the step that has been killing the browser, so it is off unless you ask for it."
+          }
           icon={Package}
           tone="heavy"
         />
       </div>
 
-      <div
-        className={cn(
-          "diag-card p-3 text-[10.5px] leading-relaxed",
-          choice.archive ? "border-amber-500/40 text-amber-200/90" : "border-emerald-500/35 text-emerald-200/90"
-        )}
-      >
-        {choice.archive ? (
-          <>
-            <span className="font-semibold">The photo bytes will be kept.</span> All {formatBytes(byteCount)} of them stay in memory while the archive is
-            assembled, which is what this browser has been dying on. The sheets are still written first and handed to you before the archive is
-            attempted, so a crash now costs you the dump and nothing else.
-          </>
-        ) : (
-          <>
-            <span className="font-semibold">Each photo's bytes will be released the moment its facts are read.</span> That is what keeps this path
-            cheap. It also means no archive can be made from this run afterwards — you would have to run again with the archive ticked.
-          </>
-        )}
-      </div>
+      {noPhotos ? null : (
+        <div
+          className={cn(
+            "diag-card p-3 text-[10.5px] leading-relaxed",
+            choice.archive ? "border-amber-500/40 text-amber-200/90" : "border-emerald-500/35 text-emerald-200/90"
+          )}
+        >
+          {choice.archive ? (
+            <>
+              <span className="font-semibold">The photo bytes will be kept.</span> All {formatBytes(byteCount)} of them stay in memory while the archive is
+              assembled, which is what this browser has been dying on. The sheets are still written first and handed to you before the archive is
+              attempted, so a crash now costs you the dump and nothing else.
+            </>
+          ) : (
+            <>
+              <span className="font-semibold">Each photo's bytes will be released the moment its facts are read.</span> That is what keeps this path
+              cheap. It also means no archive can be made from this run afterwards — you would have to run again with the archive ticked.
+            </>
+          )}
+        </div>
+      )}
 
       {nothing ? (
         <div className="diag-card border-border/70 p-3 text-[10.5px] leading-relaxed text-muted-foreground">
-          Nothing is ticked. The photos will still be read and the sheets still written — they are how the run reports itself — but none of them will be
-          offered for saving or shown on screen.
+          Nothing is ticked. The sheets are still written — they are how the run reports itself — but none of them will be offered for saving or shown on
+          screen.
         </div>
       ) : null}
 
       <Button className="h-14 w-full bg-fuchsia-500 text-[14px] font-semibold text-fuchsia-950 hover:bg-fuchsia-400" onClick={onGo}>
-        {choice.archive ? "Read the photos, then build the archive" : "Read the photos and write the sheets"}
+        {noPhotos ? "Write the sheets" : choice.archive ? "Read the photos, then build the archive" : "Read the photos and write the sheets"}
         <ChevronRight className="ml-1 h-4 w-4" />
       </Button>
     </div>
   );
 }
 
-function Setup({ tier, setTier, onStart }: { tier: PermissionTier; setTier: (t: PermissionTier) => void; onStart: () => void }) {
+function Setup({
+  tier,
+  setTier,
+  choice,
+  setChoice,
+  onStart,
+}: {
+  tier: PermissionTier;
+  setTier: (t: PermissionTier) => void;
+  choice: ExportChoice;
+  setChoice: (next: ExportChoice) => void;
+  onStart: () => void;
+}) {
   const requestCount = useMemo(() => requestsForTier(tier).length, [tier]);
   const estimate = useMemo(() => {
     const promptMinutes = Math.ceil(requestCount * 0.2);
@@ -1599,6 +1755,45 @@ function Setup({ tier, setTier, onStart }: { tier: PermissionTier; setTier: (t: 
         </div>
       </div>
 
+      <div className="diag-card p-3">
+        <h3 className="px-0.5 text-[12.5px] font-semibold">What it should hand you at the end</h3>
+        <p className="mb-2 mt-1 px-0.5 text-[10.5px] leading-relaxed text-muted-foreground">
+          Set from the menu card, and changed here if you want. It is asked now because the archive decides whether every photo is held in memory or
+          dropped as soon as it has been read — and because a run that ends early should still know what you wanted from it.
+        </p>
+        <div className="space-y-2">
+          <TickBox
+            on={choice.sheet}
+            onToggle={() => setChoice({ ...choice, sheet: !choice.sheet })}
+            title="Full stat and spec sheet"
+            detail="Every detectable factor of the run, as a readable page and as plain text, with the forensic item list at the top and as its own file."
+            icon={FileText}
+          />
+          <TickBox
+            on={choice.spec}
+            onToggle={() => setChoice({ ...choice, spec: !choice.spec })}
+            title="AI mimic spec"
+            detail="One concise markdown file holding only what is distinctive about this device. What is identical on every phone alive is left out on purpose."
+            icon={FileCode}
+          />
+          <TickBox
+            on={choice.viewer}
+            onToggle={() => setChoice({ ...choice, viewer: !choice.viewer })}
+            title="Look through it here"
+            detail="The same content on screen, section by section. No download and no unzipping."
+            icon={ListChecks}
+          />
+          <TickBox
+            on={choice.archive}
+            onToggle={() => setChoice({ ...choice, archive: !choice.archive })}
+            title="Raw archive (the heavy one)"
+            detail="The byte-for-byte dump: every photo untouched, hex dumps, carved metadata regions and four checksums each. This is the step that has been killing the browser, so it is off unless you ask for it."
+            icon={Package}
+            tone="heavy"
+          />
+        </div>
+      </div>
+
       <div className="diag-card p-3.5">
         <h3 className="text-[12.5px] font-semibold">What this will cost you</h3>
         <div className="mt-2 grid grid-cols-2 gap-1.5 text-[11px]">
@@ -1625,8 +1820,8 @@ function Setup({ tier, setTier, onStart }: { tier: PermissionTier; setTier: (t: 
       <div className="diag-card p-3.5 text-[11px] leading-relaxed text-muted-foreground">
         <h3 className="mb-1.5 text-[12.5px] font-semibold text-foreground">Three things stated up front</h3>
         <p>
-          <span className="text-foreground">You can stop at any point.</span> Everything gathered so far is kept and the archive is built from it,
-          clearly labelled partial, listing exactly which stages did not happen.
+          <span className="text-foreground">You can stop at any point.</span> Whatever stage you are in, Stop lands on your choices and the sheets are
+          written from everything gathered so far — clearly labelled partial, listing exactly which stages did not happen and why.
         </p>
         <p className="mt-1.5">
           <span className="text-foreground">A refusal is a result.</span> Nothing here is retried behind a second tap, and declining is recorded as

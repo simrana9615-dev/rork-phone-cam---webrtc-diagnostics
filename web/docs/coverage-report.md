@@ -447,6 +447,43 @@ work is gone: the encoder parse, the IFD walk and the tag dump share one read of
 of three, carved segments are lazy `Blob.slice` views the writer reads once each, and the
 byte-identity re-check streams rather than materialising the archive a second time.
 
+**The options nobody could see.** A report of "I can't see the deep probe various final options"
+turned out to be exactly literal, and the export screen was not the problem — three routes never
+reached it. Each gathering stage chose its own next phase, and three of them jumped straight to
+the archive builder: camera permission refused, Stop pressed during the sensor recordings, Stop
+pressed during the camera sweep. The builder opens by reading the sheets it is meant to copy in,
+finds nothing there because the stage that writes them was skipped, and correctly refuses — so all
+three ended on a red "this is a bug" card with no sheets, no spec, no viewer and no tick boxes.
+The two routes that did work were the two that sit idle waiting for input, which is why the fault
+fell precisely on the people who ended a run early or declined the camera. Every exit now funnels
+through one idempotent door to the export choice. Idempotent matters: the sweep notices an abort
+only after its current step finishes, and a late notification must not drag a run backwards out of
+a later phase.
+
+**A stepper that flattered the run.** Stage state was derived from position — anything behind the
+pointer was done — and at the end of a run everything is behind the pointer. A camera sweep that
+never ran because the prompt was refused therefore finished wearing the same green tick as one
+that swept every rung of every lens. On a diagnostic whose entire value is not overclaiming, that
+is the wrong failure. Stages now record a mark at the moment they end — done, skipped, stopped or
+failed — and a recorded mark always beats position. A run that skipped half of itself looks like
+one.
+
+**The choice is made on the way in.** It was previously offered only after the last photo, roughly
+twenty minutes into a run — and never at all if the run ended early. It now lives on the dashboard
+card, on the setup screen and at the pre-read checkpoint as one shared, persisted value. The
+checkpoint stays where it is, because whether the bytes are kept or dropped genuinely cannot be
+asked after the read; it just arrives pre-filled as a confirmation rather than a first sighting.
+Persistence is not a convenience here: the run being configured is the one most likely to kill the
+tab, and losing the setting with it would make the second attempt repeat the first. A stored value
+that cannot be parsed falls back field by field rather than wholesale, so one corrupt key cannot
+silently switch the heavy path back on.
+
+**A run with no photos still reports.** Refusing the camera used to end in that same error card.
+It now produces the full sheets from what was actually gathered — every permission answer,
+everything the device volunteered with no prompt at all, every sensor recording — with both camera
+stages named as skipped and the reason given. The omission list is shown on screen before the
+choice is confirmed, not only inside the files afterwards.
+
 **Interruption:** Pause and Stop are available throughout. A pause always lands *between*
 steps — the recording or constraint in flight completes first, because a half-recorded
 sensor window or a half-applied constraint would describe a paused device rather than the

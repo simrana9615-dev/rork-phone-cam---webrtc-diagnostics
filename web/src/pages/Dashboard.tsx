@@ -2,14 +2,19 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   BookOpenText,
+  Check,
   ChevronDown,
   ChevronRight,
   CreditCard,
+  FileCode,
+  FileText,
   FlaskConical,
   FolderOpen,
   Gauge,
   HeartPulse,
+  ListChecks,
   MonitorSmartphone,
+  Package,
   Radar,
   ScanFace,
   Smartphone,
@@ -19,6 +24,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { summariseChoice, useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { cn } from "@/lib/utils";
 import { TEMPLATES, type CaptureMethod, type DocType, type FaceMode } from "@/lib/verification-templates";
 
@@ -64,9 +70,106 @@ function OptionRow<T extends string>({
   );
 }
 
+/**
+ * One output toggle on the Deep Probe card.
+ *
+ * Deliberately a sibling of the card body rather than a child of it: a button
+ * nested inside a link still follows the link on tap, so the two would fight
+ * and a tick would start a twenty-minute run.
+ */
+function ExportToggle({
+  on,
+  onToggle,
+  label,
+  icon: Icon,
+  heavy,
+}: {
+  on: boolean;
+  onToggle: () => void;
+  label: string;
+  icon: typeof FileText;
+  heavy?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={on}
+      aria-label={label}
+      onClick={onToggle}
+      className={cn(
+        "flex min-h-11 items-center justify-center gap-1 rounded-lg border px-1 py-1.5 text-[9.5px] font-semibold leading-tight transition-colors active:scale-95",
+        on
+          ? heavy
+            ? "border-amber-500/60 bg-amber-500/18 text-amber-200"
+            : "border-fuchsia-500/60 bg-fuchsia-500/18 text-fuchsia-200"
+          : "border-border/70 bg-background/40 text-muted-foreground"
+      )}
+    >
+      {on ? <Check className="h-3 w-3 shrink-0" /> : <Icon className="h-3 w-3 shrink-0 opacity-70" />}
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
+/**
+ * The Deep Probe entry: the run's four outputs are chosen here, on the way in.
+ *
+ * They used to be offered only after the last photo — twenty-odd minutes in,
+ * and never reached at all by a run that ended early. Choosing on the front
+ * door means the setting survives a tab the run kills, and that a refused
+ * camera prompt still lands somewhere useful.
+ */
+function DeepProbeCard({ choice, setChoice, onOpen }: { choice: ExportChoice; setChoice: (next: ExportChoice) => void; onOpen: () => void }) {
+  return (
+    <div className="overflow-hidden rounded-2xl border border-fuchsia-500/40 bg-gradient-to-br from-fuchsia-500/12 via-card to-card shadow-[0_0_40px_-16px_hsl(291_84%_61%/0.45)]">
+      <button type="button" onClick={onOpen} className="flex w-full items-center gap-3 p-3.5 text-left transition-all active:scale-[0.985]">
+        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300">
+          <Radar className="h-5 w-5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="text-[13.5px] font-semibold leading-tight">Deep Probe</span>
+            <span className="rounded-md border border-fuchsia-500/40 bg-fuchsia-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-fuchsia-300">
+              Long run
+            </span>
+          </div>
+          <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+            Asks for every permission a website can ask you for, records what your device actually hands over, then photographs through every camera at
+            every resolution, ratio and mode it supports. 15–30 minutes; stop at any point and you still get everything gathered so far.
+          </p>
+        </div>
+        <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />
+      </button>
+
+      <div className="border-t border-fuchsia-500/20 bg-background/25 px-3 pb-3 pt-2.5">
+        <div className="mb-1.5 text-[9.5px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">What it hands you at the end</div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <ExportToggle on={choice.sheet} onToggle={() => setChoice({ ...choice, sheet: !choice.sheet })} label="Stat sheet" icon={FileText} />
+          <ExportToggle on={choice.spec} onToggle={() => setChoice({ ...choice, spec: !choice.spec })} label="AI mimic spec" icon={FileCode} />
+          <ExportToggle on={choice.viewer} onToggle={() => setChoice({ ...choice, viewer: !choice.viewer })} label="Read on screen" icon={ListChecks} />
+          <ExportToggle
+            on={choice.archive}
+            onToggle={() => setChoice({ ...choice, archive: !choice.archive })}
+            label="Raw archive"
+            icon={Package}
+            heavy
+          />
+        </div>
+        <p className="mt-2 text-[9.5px] leading-relaxed text-muted-foreground">
+          {choice.archive
+            ? "Raw archive on: every photo is held in memory byte-for-byte until the dump is built. This is the heavy step, and the one that has been killing the browser."
+            : summariseChoice(choice)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /** Start dashboard: 6 verification templates, custom flow builder, advanced tools. */
 export default function Dashboard() {
   const navigate = useNavigate();
+  const [exportChoice, setExportChoice] = useExportChoice();
   const [customOpen, setCustomOpen] = useState<boolean>(false);
   const [doc, setDoc] = useState<DocType>("passport");
   const [capture, setCapture] = useState<CaptureMethod>("webrtc");
@@ -102,6 +205,8 @@ export default function Dashboard() {
       </header>
 
       <div className="space-y-2.5">
+        <DeepProbeCard choice={exportChoice} setChoice={setExportChoice} onOpen={() => navigate("/deep-probe")} />
+
         <button
           type="button"
           className="w-full overflow-hidden rounded-2xl border border-amber-500/40 bg-gradient-to-br from-amber-500/15 via-card to-card p-3.5 text-left shadow-[0_0_40px_-16px_hsl(45_93%_58%/0.5)] transition-all hover:border-amber-400/60 active:scale-[0.985]"
@@ -302,29 +407,6 @@ export default function Dashboard() {
             </p>
           </div>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-        </Link>
-
-        <Link
-          to="/deep-probe"
-          className="flex w-full items-center gap-3 rounded-2xl border border-fuchsia-500/40 bg-gradient-to-br from-fuchsia-500/12 via-card to-card p-3.5 text-left transition-all hover:border-fuchsia-400/60 active:scale-[0.985]"
-        >
-          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300">
-            <Radar className="h-5 w-5" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5">
-              <span className="text-[13.5px] font-semibold leading-tight">Deep Probe</span>
-              <span className="rounded-md border border-fuchsia-500/40 bg-fuchsia-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-fuchsia-300">
-                Long run
-              </span>
-            </div>
-            <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
-              Asks for every permission a website can ask you for, records what your device actually hands over, then photographs through every
-              camera at every resolution, ratio and mode it supports. Ends in one archive with the untouched files, a hex dump of every byte, every
-              carved metadata region and four checksums each. 15–30 minutes; you can stop at any point and keep what you have.
-            </p>
-          </div>
-          <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />
         </Link>
 
         <Link

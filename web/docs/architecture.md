@@ -121,21 +121,37 @@ belonging to other apps).
    ceiling rather than trusting what is on screen.
 4. **Manual shots** — every named camera in the pinned viewfinder plus three zoom steps each,
    then both facings through all three camera-app handoffs.
-5. **Exports** — four tick boxes, the archive **off** by default (§6b.3). Shown here rather
-   than at the end because with the archive unticked the photo bytes are released as they are
-   read, and a choice offered afterwards could no longer be acted on.
+5. **Exports** — the four tick boxes of `lib/deep-probe/export-choice.ts`, the archive **off**
+   by default (§6b.3), arriving pre-filled from the dashboard card and the setup screen. Kept
+   here as the last checkpoint rather than the first sighting, because with the archive
+   unticked the photo bytes are released as they are read and a choice offered afterwards
+   could no longer be acted on. Every stage that did not run is listed on this screen with its
+   reason before the choice is confirmed.
 6. **Sheets** — `lib/deep-probe/capture-facts.ts` then `lib/deep-probe/sheets.ts`. One walk
    over each capture, then every sheet written from the result. Nothing large is held.
 7. **Archive** *(only if ticked)* — `lib/deep-probe/raw-pack.ts`, then every capture is carved
    back out of the finished blob and compared byte-for-byte, with the result shown on screen.
    The stepper omits this stage entirely when it was not asked for.
 
+Every exit from stages 1–4 funnels through one idempotent `toExports()`. Three routes used to
+bypass it and jump straight to stage 7 — a refused camera, a stop during the sensors, a stop
+during the sweep — where the builder found no sheets to copy in and dead-ended on its own
+"this is a bug" card, taking the export choice with it. That was the whole reason the tick
+boxes were unreachable. See §6b.4.
+
+The stepper reads recorded per-stage marks (`done` / `skipped` / `stopped` / `failed`), not
+position. At the end of a run every stage sits behind the pointer, so position alone painted a
+refused camera the same green as one that ran.
+
 On arrival the page reads whatever the last run left in `localStorage` and, if that run never
 closed its trail, shows a `CrashBanner` naming the step it died in, what it was holding and
 which of the two deaths it was — with the whole trail copyable as text. Reported exactly once.
 
 Stopping at any point keeps everything gathered; the remaining stages are pushed onto the
-omission list with a reason and every sheet is labelled `PARTIAL`.
+omission list with a reason and every sheet is labelled `PARTIAL`. The permission queue and the
+manual shots leave immediately because they sit idle waiting for input; the sensor loop and the
+camera sweep act on the abort flag between steps instead, so a recording or a constraint under
+test is never cut in half and reported as a complete reading.
 
 ### `SharedReport.tsx`
 Decodes the share-link fragment (deflate-raw + base64url), enforces the 72 h TTL, and
@@ -157,6 +173,7 @@ renders the read-only session summary.
 | `LastPhotoExif.tsx` | Diagnostic-hub EXIF inspector for the newest captured photo: device / timestamp / GPS headline tiles with explicit not-in-file states, capture-parameter chips, and the complete raw tag dump (parsed locally); exports the reusable `ExifInspector` panel, also embedded in every session-gallery item, with a one-tap JSON download of the raw tags + the photo's observed capture timeline + screening verdict (heat-map image payloads excluded with an explicit note) |
 | `ReportView.tsx` | Forensic report renderer: verdict chip, category bars, finding rows (observed/expected/impact), heat-map visuals, technical appendix; exports `FindingRow` |
 | `CameraErrorHelp.tsx` | getUserMedia error classifier with actionable fixes |
+| `Dashboard.tsx` → `DeepProbeCard` | The Deep Probe entry, first in the list: card body opens the run, four sibling toggles set what it hands over. The toggles are siblings rather than children because a button nested in a link still follows the link, and a tick would start a twenty-minute run |
 | `deep-probe/CrashBanner.tsx` | What the last run was doing when it died: the step, the step number and time into the run, how long the page kept answering its timer afterwards, the heap either side, the capture bytes held, the verdict and how it was reached. One tap copies the whole trail. Shown only for a run that never closed its trail, and only once |
 | `deep-probe/SheetViewer.tsx` | The stat sheet on screen — section list, then the section — rendered from the same block registry as the downloadable sheet and the HTML page, so the three cannot disagree. No download, no archive, no unzipping |
 | `deep-probe/ProbeViewfinder.tsx` | Deep Probe's manual-shot viewfinder, pinned to one `deviceId` and holding one end of that camera's own reported zoom range (`min`/`mid`/`max` resolved against the range rather than a hardcoded factor). HUD states the granted size, which still path will run and that no camera EXIF exists on this path, all *before* the shutter. A camera with no zoom control produces a clearly-recorded unzoomed shot instead of a fake one. Mounted imperatively via `probeManualShot()`, rejecting with `CaptureCancelledError` on skip |
@@ -202,6 +219,7 @@ renders the read-only session summary.
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
 | `deep-probe/hex-budget.ts` | How much of a run may be rendered as hex and why. Holds the 4.94-characters-per-byte constant measured against `hexLines` itself, the device-derived total allowance, the equal per-capture share with its floor and ceiling, the heap-pressure threshold, and the policy statement written into the archive. Pure and fully unit-tested, because getting this number wrong does not degrade the archive — it destroys the run |
 | `deep-probe/breathe.ts` | The yield that keeps a long pass alive. `scheduler.yield()` where it exists, a `MessageChannel` macrotask otherwise (a nested `setTimeout(0)` is clamped to 4 ms after five levels — over a thousand iterations that alone is four seconds), `setTimeout` as the floor. `breatheEvery` yields on a time cadence rather than per item, so the cost of breathing does not scale with the number of bytes walked |
+| `deep-probe/export-choice.ts` | The four outputs of a run, shared and persisted. One value behind the dashboard card, the setup screen and the pre-read checkpoint, with a listener set so two mounted views cannot drift. Reads at mount rather than module load so a test or a server render with no `localStorage` cannot throw, coerces a malformed stored value field by field (a corrupt key must not silently re-enable the archive), and treats a store that refuses every operation as a session-only choice rather than an error |
 | `deep-probe/crash-trail.ts` | Breadcrumbs that outlive the tab. Every step is written to `localStorage` before it runs, so a kill leaves the step name behind; a heartbeat on a 250 ms timer separates the two deaths, because a blocked main thread cannot service a timer while a page that runs out of memory answers one right up to the end. Returns a `CrashReport` naming the step, the silence gap, the heap either side and a verdict — and refuses to guess when the browser reports no heap at all. Hot path writes one ~200-byte key; the full trail is flushed on a throttle with the opening steps always forced through |
 | `deep-probe/capture-facts.ts` | The facts pass: **one** walk over each capture producing its four checksums, encoder report, IFD walk, structure map and full tag dump, in both the shapes the spec and the brief consume. Breathes between captures. When no archive was asked for it drains the caller's array as it goes, so each blob becomes collectable at the moment its facts are read rather than at the end of the loop. Does not count `exifreader`'s synthetic `file.FileType` group as metadata — counting it meant a canvas frame with genuinely no metadata never registered as one |
 | `deep-probe/sheets.ts` | Every sheet a run can produce without an archive: the full stat sheet (plain text **and** a readable HTML page), the forensic item list, the correlation brief and the device spec. One section registry, three renderings — plain text, HTML and the on-screen viewer are all rendered from the same blocks, so what is read cannot drift from what is saved. Also the home of `StageOmission`, `RunFacts` and the text builders the archive shares |
@@ -357,6 +375,38 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.4 One door out, and a stepper that does not flatter the run
+
+"I can't see the deep probe various final options" turned out to be literal, and the cause was
+not the export screen at all — it was three routes that never reached it.
+
+Stages 1–4 each decided their own next phase. Two of them chose correctly; three jumped straight
+to `building`:
+
+- camera permission refused, so both camera stages are skipped;
+- Stop pressed during the sensor recordings;
+- Stop pressed during the camera sweep.
+
+Stage 7 opens by reading `sheetsRef.current`, which stage 6 fills. Arriving there without passing
+through stage 6 finds it `null`, and the builder does the honest thing: it refuses, sets
+`archiveFatal` and jumps to `done`. The result is a red "this is a bug" card and nothing else —
+no sheets, no spec, no viewer, and no tick boxes, because the tick boxes live in stage 5. The two
+routes that did work were the two that wait idly for input, so anyone stopping mid-work hit a dead
+end and anyone refusing the camera prompt hit it without touching anything.
+
+The fix is structural rather than three patches. `toExports(...omissions)` is the single door out
+of the gathering stages: it records the omissions, stamps `finishedAt` and moves to stage 5. It is
+idempotent through the existing `ranRef` set, which matters because the sweep notices an abort
+*after* its current step finishes — without the guard a late notification could drag a run
+backwards out of `reading`.
+
+The stepper was flattering the result in the same way. `state` was derived from position alone
+(`phase === "done" || mine < order`), so at the end of a run every stage was behind the pointer
+and every stage wore a green tick — including a camera sweep that never ran because the prompt was
+refused. Stages now carry a recorded mark (`done` / `skipped` / `stopped` / `failed`) written at
+the moment they end, and a recorded mark always beats position. A run that skipped half of itself
+now looks like one.
 
 ### 6b.3 The archive is opt-in, and the crash has to testify
 
