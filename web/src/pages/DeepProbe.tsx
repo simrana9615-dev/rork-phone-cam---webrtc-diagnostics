@@ -497,6 +497,13 @@ export default function DeepProbe() {
       });
       capturesRef.current = [...capturesRef.current];
       setMatrix(report);
+      if (report.stillsStoppedForMemory) {
+        addLog("warn", report.stillsStoppedForMemory);
+        omissionsRef.current.push({
+          stage: "Camera sweep stills (later rows)",
+          reason: report.stillsStoppedForMemory,
+        });
+      }
       setSweepPct(100);
       setSweepMessage("");
       const granted = report.rows.filter((r) => r.ok).length;

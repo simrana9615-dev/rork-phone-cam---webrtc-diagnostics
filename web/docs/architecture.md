@@ -116,7 +116,9 @@ belonging to other apps).
    rate reported next to the requested one.
 3. **Camera sweep** — `lib/deep-probe/camera-matrix.ts`, with live photo / byte / elapsed
    counters and a stop button. Watches `PressureObserver` where available and surfaces a
-   load warning explicitly labelled as load, not temperature.
+   load warning explicitly labelled as load, not temperature. The byte counter is the
+   *smaller* of this stage's two memory costs — see §6b.2 — so the sweep enforces its own
+   ceiling rather than trusting what is on screen.
 4. **Manual shots** — every named camera in the pinned viewfinder plus three zoom steps each,
    then both facings through all three camera-app handoffs.
 5. **Archive** — `lib/deep-probe/raw-pack.ts`, then every capture is carved back out of the
@@ -181,6 +183,7 @@ renders the read-only session summary.
 | `deep-probe/permissions.ts` | The tiered permission registry (`standard` ⊂ `extended` ⊂ `everything`) — every request a site can make, each carrying its API name, what it reaches, how long the grant lasts, its `permissions.query` name, whether the browser demands a fresh gesture (and why), a feature probe and a runner that releases whatever it was granted in the same tick. `runRequest()` queries permission state either side of the ask and converts every throw into a recorded outcome; `unavailable` is decided by probe *before* firing so it can never be confused with a refusal |
 | `deep-probe/passive.ts` | Everything readable with no prompt at all: identity strings, hardware, GPU, network, power, locale/storage, display preferences, codec support, API surface, plus `permissions.query` for every name any browser answers to. Deliberately computes **no** uniqueness/fingerprint score — that would need a population this app cannot see |
 | `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
+| `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
 | `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
 | `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time. Picker-only engines are excluded — they cannot promise a fresh photo, so asking for one here would mislead |
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
@@ -266,6 +269,7 @@ question: not *is this capture authentic* but *what did this device actually han
 | `environment/passive-dump.txt` / `.json` | Everything readable with **no prompt at all**, plus `permissions.query` for every name any browser answers to |
 | `sensors/*.csv` | One commented CSV per granted sensor, each stating the measured rate beside the requested one |
 | `camera/matrix.txt` / `.json` | Every asked-versus-granted pair across every camera, resolution, ratio, frame rate and control mode, plus the `stillPolicy` statement of which steps were expected to produce a photo |
+| `camera/memory-policy.txt` | The run's real memory figures — bytes held, the device's ceiling, the largest canvas used — and whether stills stopped early. Keeps the three causes of an empty capture list apart: never expected, attempted and failed, or stopped for memory |
 | `camera/surface.json` | `track.getSettings()`, `getCapabilities()` and `getConstraints()` **verbatim** per camera — key order preserved, nested `{min,max}` ranges intact — plus `track.id` / `label` / `readyState`, `stream.id`, the `<video>` element's `videoWidth`/`videoHeight`, the measured `getUserMedia` open time, and `ImageCapture.getPhotoCapabilities()` / `getPhotoSettings()`. Read on the track the sweep already had open, so it costs no extra prompt and no extra camera cycle |
 | `camera/devices.json` | Three `enumerateDevices()` snapshots with full untruncated IDs and every kind included: before any permission was requested, before the sweep opened anything, and after it finished. Two snapshots would be ambiguous about which moment they captured |
 | `camera/files.json` | The `File` object as a site receives it — name, size, type, `lastModified` as the raw epoch value, `webkitRelativePath` — in arrival order, so the step between consecutive shots stays visible instead of hiding behind a formatted date |
@@ -335,6 +339,40 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.2 Sweep memory — the costs a byte counter cannot see
+
+A run died mid-sweep at 106 photos with 129.75 MB of captures held. That figure is the proof
+rather than the cause: 130 MB of blobs is survivable, and the on-screen counter was reporting
+the only cost that was not dangerous. Two larger ones were never counted.
+
+**Canvas backing store.** A canvas sized to a 4K video frame holds 3840 × 2160 × 4 = **31.6
+MiB** of pixels; an 8K frame holds **126.6 MiB**. The sweep takes a canvas still at the native
+maximum, at every landscape rung and at every aspect ratio — roughly 14 per camera, so ~56 on
+a four-camera phone. Allocating a fresh canvas per still, as the sweep did, asks for **1.77
+GiB** in about two minutes. A detached canvas is reclaimed whenever the collector chooses, and
+WebKit caps *total* canvas memory per tab separately from the JS heap, so nothing about the
+run gave it a chance to keep up. One canvas is now reused for the entire run and its pixels
+are released the instant each encode resolves — peak cost is one frame instead of one per
+photo, and `releaseCanvas` sets the dimensions to zero because dropping the reference alone
+leaves tens of megabytes resident for an unpredictable stretch.
+
+**Image decoding for two numbers.** Width and height were read by loading each platform still
+into an `Image` — a complete 4K decode, another ~31.6 MiB, held in the engine's cache well past
+the read. Both numbers are written in the file's header, so they are now parsed from it. That
+is not only cheaper but *more accurate*: the header reports what the file declares, where a
+decode reports what the decoder produced after applying orientation. Unrecognised containers
+still fall back to a decode, and the reading records which method produced it.
+
+**The ceiling, and what it gives up first.** Held bytes now have a declared ceiling. When it is
+reached the sweep keeps making every request and recording every asked-versus-granted row —
+those cost nothing to hold and are the actual product of this stage — and stops only taking
+stills. Spending the last of the memory on more near-identical frames while abandoning the
+cheap complete record would be precisely the wrong trade. The ceilings sit well above what a
+full sweep produces, because a bound set near the observed 130 MB would cut off healthy runs
+that were never the problem. It is reported as a warning, a named omission and a line in
+`camera/memory-policy.txt` — and the video dimensions are still read for skipped rows, since
+that reading costs nothing and its absence would make a row look less complete than it is.
 
 ### 6b.1 `device-spec.md` — the distinctive-facts summary
 

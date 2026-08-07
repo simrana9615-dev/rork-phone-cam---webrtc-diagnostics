@@ -300,6 +300,8 @@ describe("buildMimicSpec", () => {
       stillPolicy: "",
       notes: [],
       aborted: false,
+      stillsStoppedForMemory: null,
+      memory: { heldBytes: 0, ceilingBytes: 320 * 1024 * 1024, peakCanvasBytes: 0 },
       surface: [],
       devicesBefore: [],
       devicesAfter: [],

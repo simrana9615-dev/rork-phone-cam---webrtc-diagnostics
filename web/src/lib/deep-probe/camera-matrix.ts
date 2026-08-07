@@ -18,6 +18,16 @@
 
 import type { PackOrigin } from "../evidence-pack";
 import { type CameraDeviceInfo, classifyCameraLabel } from "../device-camera";
+import { drawVideoStill, heldBytesCeiling, readPixelSize, releaseScratchCanvas } from "./capture-memory";
+import { readMemoryHints } from "./hex-budget";
+
+/**
+ * Quality passed to `toBlob` for the frames this app encodes. Recorded as a
+ * constant because the value is itself evidence: it is one of the numbers that
+ * distinguishes an app-encoded frame from a camera original, and a reader
+ * comparing quantisation tables needs to know which figure produced them.
+ */
+export const CANVAS_ENCODE_QUALITY = 0.95;
 
 /** One capture produced anywhere in the run, with its provenance already settled. */
 export type ProbeCapture = {
@@ -119,6 +129,14 @@ export type CameraMatrixReport = {
   notes: string[];
   /** True when the user stopped the sweep before it finished. */
   aborted: boolean;
+  /**
+   * Set when the held-bytes ceiling stopped stills part way through. The sweep
+   * carries on mapping when this happens, so the rows stay complete while the
+   * captures do not — a difference the archive has to state rather than imply.
+   */
+  stillsStoppedForMemory: string | null;
+  /** Peak capture bytes held at once, and the ceiling it was measured against. */
+  memory: { heldBytes: number; ceilingBytes: number; peakCanvasBytes: number };
   /** The verbatim JS-visible surface of each camera. */
   surface: CameraSurfaceRecord[];
   /** `enumerateDevices()` before the sweep opened anything, full IDs, untruncated. */
@@ -320,44 +338,20 @@ function detachVideo(video: HTMLVideoElement | null): void {
   video.remove();
 }
 
-async function canvasStill(video: HTMLVideoElement): Promise<{ blob: Blob; width: number; height: number } | null> {
-  const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95));
-  return blob ? { blob, width: canvas.width, height: canvas.height } : null;
-}
-
 async function platformStill(track: MediaStreamTrack): Promise<{ blob: Blob; width: number; height: number } | null> {
   const Ctor = imageCaptureCtor();
   if (!Ctor || track.readyState !== "live") return null;
   try {
     const capture = new Ctor(track);
     const blob = await capture.takePhoto();
-    const size = await blobSize(blob);
-    return { blob, width: size.width, height: size.height };
+    // Dimensions come from the file's own header. Decoding the whole picture to
+    // read two numbers cost ~31.6 MiB a photo and was a direct cause of the
+    // sweep running out of memory.
+    const size = await readPixelSize(blob);
+    return { blob, width: size?.width ?? 0, height: size?.height ?? 0 };
   } catch {
     return null;
   }
-}
-
-function blobSize(blob: Blob): Promise<{ width: number; height: number }> {
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      resolve({ width: img.naturalWidth, height: img.naturalHeight });
-      URL.revokeObjectURL(url);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve({ width: 0, height: 0 });
-    };
-    img.src = url;
-  });
 }
 
 type StepPlan = {
@@ -492,10 +486,51 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   let devicesBefore: { kind: string; deviceId: string; groupId: string; label: string }[] = [];
   let devicesAfter: { kind: string; deviceId: string; groupId: string; label: string }[] = [];
 
+  // Bytes held is tracked here rather than only on screen, because the sweep is
+  // what has to act on it. Reaching the ceiling stops stills and keeps mapping:
+  // the asked-versus-granted rows are the product of this stage and cost nothing
+  // to hold, so spending the remaining memory on more near-identical frames
+  // would be the wrong way round.
+  const memoryHints = readMemoryHints();
+  const ceilingBytes = heldBytesCeiling(memoryHints);
+  let heldBytes = 0;
+  let peakCanvasBytes = 0;
+  let stillsStoppedForMemory: string | null = null;
+
+  const recordCapture = (capture: ProbeCapture): void => {
+    captures.push(capture);
+    heldBytes += capture.blob.size;
+    options.onCapture(capture);
+  };
+
+  /** True while there is still room to hold another still. */
+  const stillsAllowed = (): boolean => {
+    if (stillsStoppedForMemory != null) return false;
+    if (heldBytes < ceilingBytes) return true;
+    stillsStoppedForMemory =
+      `Capture bytes held reached ${(heldBytes / 1024 / 1024).toFixed(1)} MB, at or above this device's ${(ceilingBytes / 1024 / 1024).toFixed(0)} MB ceiling, so the sweep stopped taking stills. Every remaining request was still made and every asked-versus-granted row below is complete — only the photographs stop. Rows after this point have an empty capture list for that reason and no other.`;
+    notes.push(stillsStoppedForMemory);
+    return false;
+  };
+
   if (!navigator.mediaDevices?.getUserMedia) {
     notes.push("This browser exposes no navigator.mediaDevices, so no camera could be opened. Nothing below is a refusal — the API is simply absent.");
     return {
-      report: { startedAt, finishedAt: new Date().toISOString(), durationMs: 0, inventory: [], rows, stillPolicy: STILL_POLICY, notes, aborted, surface, devicesBefore, devicesAfter },
+      report: {
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        durationMs: 0,
+        inventory: [],
+        rows,
+        stillPolicy: STILL_POLICY,
+        notes,
+        aborted,
+        stillsStoppedForMemory: null,
+        memory: { heldBytes: 0, ceilingBytes: heldBytesCeiling(readMemoryHints()), peakCanvasBytes: 0 },
+        surface,
+        devicesBefore,
+        devicesAfter,
+      },
       captures,
     };
   }
@@ -583,7 +618,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
 
       const captureSlugs: string[] = [];
       let videoDims: { width: number; height: number } | null = null;
-      if (step.takeStills && track) {
+      if (step.takeStills && track && stillsAllowed()) {
         const video = await attachVideo(stream);
         if (video) videoDims = { width: video.videoWidth, height: video.videoHeight };
 
@@ -608,12 +643,12 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             granted: settingsText(settings),
             takenAt: new Date().toISOString(),
           };
-          captures.push(capture);
-          options.onCapture(capture);
+          recordCapture(capture);
         }
 
         if (video) {
-          const drawn = await canvasStill(video);
+          const drawn = await drawVideoStill(video, CANVAS_ENCODE_QUALITY);
+          if (drawn) peakCanvasBytes = Math.max(peakCanvasBytes, drawn.canvasBytes);
           if (drawn) {
             const slug = nextSlug("canvas");
             captureSlugs.push(slug);
@@ -634,9 +669,17 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
               granted: settingsText(settings),
               takenAt: new Date().toISOString(),
             };
-            captures.push(capture);
-            options.onCapture(capture);
+            recordCapture(capture);
           }
+          detachVideo(video);
+        }
+      } else if (step.takeStills && track) {
+        // Read the video dimensions anyway: it is the one reading that costs no
+        // memory, and losing it would make the row less complete than it needs
+        // to be just because the photograph was skipped.
+        const video = await attachVideo(stream);
+        if (video) {
+          videoDims = { width: video.videoWidth, height: video.videoHeight };
           detachVideo(video);
         }
       }
@@ -754,6 +797,11 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
 
   if (aborted) notes.push("You stopped the sweep before it finished. Every row above really ran; the rows that never ran are simply absent, and the archive is marked partial.");
 
+  // The shared canvas is no longer needed; drop its last frame rather than
+  // leaving it resident through the archive build, which is the other memory-
+  // hungry phase of the run.
+  releaseScratchCanvas();
+
   try {
     const after = await navigator.mediaDevices.enumerateDevices();
     devicesAfter = after.map((d) => ({ kind: d.kind, deviceId: d.deviceId, groupId: d.groupId ?? "", label: d.label ?? "" }));
@@ -771,6 +819,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       stillPolicy: STILL_POLICY,
       notes,
       aborted,
+      stillsStoppedForMemory,
+      memory: { heldBytes, ceilingBytes, peakCanvasBytes },
       surface,
       devicesBefore,
       devicesAfter,

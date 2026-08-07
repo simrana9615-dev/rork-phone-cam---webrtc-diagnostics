@@ -389,6 +389,25 @@ whole policy, the complete-versus-windowed counts, and the `xxd` command that re
 skipped range from the original — which is present and byte-identical regardless. What a
 window omits is entropy-coded scan data: incompressible noise with nothing structural in it.
 
+**Sweep memory — why the byte counter was the wrong thing to watch.** A run died mid-sweep at
+106 photos with 129.75 MB held. That number exonerates the captures rather than explaining the
+crash: 130 MB of blobs is survivable, and the counter on screen was tracking the one cost that
+was not dangerous. Two larger ones went uncounted. A canvas sized to a 4K frame holds 31.6 MiB
+of pixels (8K: 126.6 MiB), and the sweep allocated a fresh one per still — ~14 per camera, ~56
+across four cameras, **1.77 GiB** requested in two minutes, against a WebKit tab that caps total
+canvas memory separately from the JS heap and reclaims detached canvases whenever it likes. And
+reading each still's width and height by loading it into an `Image` decoded the entire photo —
+another 31.6 MiB — for two numbers written in its header. So: one canvas reused for the whole
+run with its pixels freed the instant each encode resolves, and dimensions parsed from the
+header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF), which is also the more accurate of
+the two since it reports what the file declares rather than what a decoder produced after
+applying orientation. Held bytes now have a ceiling, and when it is hit the sweep keeps making
+every request and recording every asked-versus-granted row while stopping only the stills —
+those rows are the product of the stage and cost nothing to hold. Encoded bytes are unaffected
+throughout: same context, same draw, same encode quality. `camera/memory-policy.txt` carries the
+run's real figures and keeps the three causes of an empty capture list apart — never expected,
+attempted and failed, or stopped for memory.
+
 **Crash surface.** A single throw in any screen used to unmount the tree and leave a blank
 page. For a diagnostic tool that is the worst available failure mode, because a blank page is
 indistinguishable from a genuine "this device refused everything" result. An error boundary now

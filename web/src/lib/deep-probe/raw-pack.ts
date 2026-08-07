@@ -21,11 +21,12 @@ import { buildZip, crcHex, isDeflateSupported, safeZipPath, verifyBytes, type Zi
 import { briefChecklist, buildCorrelationBrief, type BriefCapture } from "./correlation-brief";
 import { readExifIfds, ifdText, type ExifIfdReport } from "./exif-ifd";
 import { hashBlob, type FileHashes } from "./hashes";
-import { hexPolicyText, hexTextBytesFor, memoryPressure, perCaptureHexBudget, HEX_MIN_PER_CAPTURE, HEX_PRESSURE_LIMIT } from "./hex-budget";
+import { hexPolicyText, hexTextBytesFor, memoryPressure, perCaptureHexBudget, readMemoryHints, HEX_MIN_PER_CAPTURE, HEX_PRESSURE_LIMIT } from "./hex-budget";
 import { encoderText, readJpegEncoderBytes, type JpegEncoderReport } from "./jpeg-encoder";
 import { buildMimicSpec, STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
 import { hexDumpBlob, structureText, walkStructure } from "./raw-bytes";
 import { matrixText, type CameraMatrixReport, type ProbeCapture } from "./camera-matrix";
+import { capturePolicyText } from "./capture-memory";
 import { passiveText, type PassiveGroup } from "./passive";
 import { seriesCsv, type SensorSeries } from "./sensors";
 import { OUTCOME_LABEL, TIER_INFO, type PermissionRecord, type PermissionTier } from "./permissions";
@@ -380,6 +381,8 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
     "                         camera/files.json.",
     "raw/hex-budget.txt       Why some hex dumps are windowed: the budget, the equal per-capture share, what",
     "                         a window omits, and how to dump the missing range yourself.",
+    "camera/memory-policy.txt The two memory costs a byte counter cannot see \u2014 canvas backing store and image",
+    "                         decoding \u2014 with this run's real figures and whether stills stopped early.",
     "raw/segments/            Metadata regions carved out whole — EXIF block, maker note, colour profile,",
     "                         embedded thumbnails — each at its exact position in the original.",
     "checksums/               MD5, SHA-1, SHA-256 and CRC-32 for every capture, plus digest files in the",
@@ -765,6 +768,19 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
         null,
         2
       ),
+      compress: true,
+    });
+    entries.push({
+      path: "camera/memory-policy.txt",
+      data: capturePolicyText(
+        {
+          heldBytes: input.matrix.memory.heldBytes,
+          ceilingBytes: input.matrix.memory.ceilingBytes,
+          peakCanvasBytes: input.matrix.memory.peakCanvasBytes,
+          stillsStoppedForMemory: input.matrix.stillsStoppedForMemory,
+        },
+        readMemoryHints()
+      ).join("\n"),
       compress: true,
     });
   } else {
