@@ -21,6 +21,8 @@
  *     scan is aborted. This module demonstrates access, it does not keep it.
  */
 
+import { isCameraTimeout, openMediaWithDeadline, PROMPT_ANSWER_TIMEOUT_MS } from "./camera-timeout";
+
 /** How far the sweep reaches. Each tier is a superset of the one before it. */
 export type PermissionTier = "standard" | "extended" | "everything";
 
@@ -340,11 +342,22 @@ export function buildRegistry(): ProbeRequest[] {
       gestureReason: webkit ? gestureNoteWebKit : undefined,
       available: () => typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia,
       run: async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        const data = summariseTracks(stream);
-        const label = stream.getVideoTracks()[0]?.label || "(unnamed)";
-        stopStream(stream);
-        return { outcome: "granted", detail: `A live video track opened on "${label}" and was stopped immediately.`, data };
+        // The deadline here is long on purpose: this clock is mostly a person
+        // reading a dialog, and a short cap would file "still reading" as "said
+        // no" — then skip both camera stages on the strength of it.
+        try {
+          const stream = await openMediaWithDeadline({ video: true, audio: false }, { timeoutMs: PROMPT_ANSWER_TIMEOUT_MS, what: "the camera prompt" });
+          const data = summariseTracks(stream);
+          const label = stream.getVideoTracks()[0]?.label || "(unnamed)";
+          stopStream(stream);
+          return { outcome: "granted", detail: `A live video track opened on "${label}" and was stopped immediately.`, data };
+        } catch (err) {
+          if (!isCameraTimeout(err)) throw err;
+          return {
+            outcome: "dismissed",
+            detail: `No answer arrived within ${(PROMPT_ANSWER_TIMEOUT_MS / 1000).toFixed(0)} seconds, so the request was abandoned and the run moved on. This is not a refusal — the prompt may never have appeared, or the camera may have been held by another app. If a stream arrived afterwards it was closed immediately rather than left running.`,
+          };
+        }
       },
     },
     {
@@ -359,11 +372,19 @@ export function buildRegistry(): ProbeRequest[] {
       gestureReason: webkit ? gestureNoteWebKit : undefined,
       available: () => typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia,
       run: async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        const data = summariseTracks(stream);
-        const label = stream.getAudioTracks()[0]?.label || "(unnamed)";
-        stopStream(stream);
-        return { outcome: "granted", detail: `A live audio track opened on "${label}" and was stopped immediately.`, data };
+        try {
+          const stream = await openMediaWithDeadline({ audio: true, video: false }, { timeoutMs: PROMPT_ANSWER_TIMEOUT_MS, what: "the microphone prompt" });
+          const data = summariseTracks(stream);
+          const label = stream.getAudioTracks()[0]?.label || "(unnamed)";
+          stopStream(stream);
+          return { outcome: "granted", detail: `A live audio track opened on "${label}" and was stopped immediately.`, data };
+        } catch (err) {
+          if (!isCameraTimeout(err)) throw err;
+          return {
+            outcome: "dismissed",
+            detail: `No answer arrived within ${(PROMPT_ANSWER_TIMEOUT_MS / 1000).toFixed(0)} seconds, so the request was abandoned and the run moved on. This is not a refusal. If a stream arrived afterwards it was closed immediately rather than left running.`,
+          };
+        }
       },
     },
     {

@@ -215,6 +215,13 @@ export type FactsOptions = {
    * problem this pass exists to avoid.
    */
   release: boolean;
+  /**
+   * Captures to hold on to even under `release`. A tiny, named set — the
+   * camera-app originals — because they are the only files in a run the camera
+   * itself wrote, and dropping them to save a few megabytes throws away the
+   * most valuable evidence of the lot. Everything not named here still goes.
+   */
+  keepSlugs?: ReadonlySet<string>;
   onProgress?: FactsProgress;
   /** Called before each unit of work, so the crash trail can record it. */
   onStep?: (step: string) => void;
@@ -227,6 +234,10 @@ export type FactsResult = {
   warnings: string[];
   /** True when the bytes were dropped, so no archive can be built from this run. */
   released: boolean;
+  /** The captures named by `keepSlugs`, still holding their bytes. */
+  kept: ProbeCapture[];
+  /** Bytes still held after the pass, which is the kept set and nothing else. */
+  keptBytes: number;
   /** Total capture bytes walked, whether or not they were kept. */
   bytesRead: number;
   /** How many times control went back to the browser during the pass. */
@@ -244,6 +255,8 @@ export type FactsResult = {
 export async function readCaptureFacts(captures: ProbeCapture[], options: FactsOptions): Promise<FactsResult> {
   const facts: CaptureFacts[] = [];
   const warnings: string[] = [];
+  const kept: ProbeCapture[] = [];
+  const keepSlugs = options.keepSlugs ?? new Set<string>();
   const queue = options.release ? captures : [...captures];
   const total = queue.length;
   const breather = breatheEvery();
@@ -297,7 +310,12 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
     await breather.tick();
 
     bytesRead += capture.blob.size;
-    if (options.release) {
+    // The keep set is taken before the release, and its bytes are deliberately
+    // NOT subtracted: they really are still held, and a counter that said
+    // otherwise would be reporting the memory it wished it had used.
+    const keeping = keepSlugs.has(capture.slug);
+    if (keeping) kept.push(capture);
+    if (options.release && !keeping) {
       heldBytes = Math.max(0, heldBytes - capture.blob.size);
       options.onHeldBytes?.(heldBytes);
     }
@@ -370,5 +388,13 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
     await breather.tick();
   }
 
-  return { facts, warnings, released: options.release, bytesRead, yields: breather.yields() };
+  return {
+    facts,
+    warnings,
+    released: options.release,
+    kept,
+    keptBytes: kept.reduce((sum, capture) => sum + capture.blob.size, 0),
+    bytesRead,
+    yields: breather.yields(),
+  };
 }

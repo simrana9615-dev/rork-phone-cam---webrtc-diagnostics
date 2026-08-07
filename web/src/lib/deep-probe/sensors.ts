@@ -12,6 +12,8 @@
  * listeners, including on the abort path.
  */
 
+import { openMediaWithDeadline } from "./camera-timeout";
+
 export type SensorSeries = {
   id: string;
   label: string;
@@ -308,7 +310,9 @@ export async function recordMicrophoneLevel(ms: number, onProgress?: SensorProgr
   let stoppedEarly = false;
 
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // The permission answer is already in by this stage, so a request that does
+    // not settle here is a wedged device rather than a person deciding.
+    stream = await openMediaWithDeadline({ audio: true, video: false }, { what: "the microphone" });
     const Ctor = (window as unknown as { AudioContext?: typeof AudioContext; webkitAudioContext?: typeof AudioContext }).AudioContext ??
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctor) throw new Error("No AudioContext implementation exists here.");

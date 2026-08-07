@@ -23,6 +23,8 @@
  * canvas fallback runs), never "camera-file".
  */
 
+import { CAMERA_OPEN_TIMEOUT_MS, openMediaWithDeadline, PROMPT_ANSWER_TIMEOUT_MS } from "./deep-probe/camera-timeout";
+
 /** Which side of the device a camera sits on, as far as the label reveals. */
 export type CameraFacing = "front" | "back" | "external" | "unknown";
 
@@ -212,7 +214,9 @@ export async function probeCameraInventory(facing: "user" | "environment", onSte
   let granted = false;
   try {
     onStep?.("getUserMedia() requested", `facingMode ideal "${facing}" — this is the prompt the user sees; the site holds a live camera track only while the sheet is open`);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: facing } } });
+    // The long allowance, not the ten-second one: this call may be showing a
+    // permission dialog, and a person reading it is not a hung camera.
+    const stream = await openMediaWithDeadline({ audio: false, video: { facingMode: { ideal: facing } } }, { timeoutMs: PROMPT_ANSWER_TIMEOUT_MS, what: "the camera prompt" });
     granted = true;
     stream.getTracks().forEach((t) => t.stop());
     onStep?.("Permission granted", "grant stream stopped immediately — it existed only to unlock the device list");
@@ -299,7 +303,11 @@ export async function openDeviceSession(
       : `facingMode ideal "${target.facing}" — no specific device chosen, the platform picks its default for that side`
   );
 
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
+  // Permission is already settled by the time a specific camera is opened, so a
+  // request that does not answer here is a wedged camera and nothing else. It
+  // gets the short deadline, and a stream that turns up late is closed rather
+  // than left running behind the rest of the session.
+  const stream = await openMediaWithDeadline({ audio: false, video }, { timeoutMs: CAMERA_OPEN_TIMEOUT_MS, what: target.deviceId ? "this camera" : `the ${target.facing} camera` });
   const track = stream.getVideoTracks()[0];
   if (!track) {
     stream.getTracks().forEach((t) => t.stop());

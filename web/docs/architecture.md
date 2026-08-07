@@ -118,7 +118,8 @@ belonging to other apps).
    counters and a stop button. Watches `PressureObserver` where available and surfaces a
    load warning explicitly labelled as load, not temperature. The byte counter is the
    *smaller* of this stage's two memory costs — see §6b.2 — so the sweep enforces its own
-   ceiling rather than trusting what is on screen.
+   ceiling rather than trusting what is on screen. Every camera request runs under the
+   ten-second deadline of §6b.6.
 4. **Manual shots** — two library picks first, then every named camera in the pinned viewfinder
    plus three zoom steps each, then both facings through all three camera-app handoffs. The
    picks lead because they need no camera, no permission and no good light, and they are the
@@ -131,7 +132,9 @@ belonging to other apps).
    could no longer be acted on. Every stage that did not run is listed on this screen with its
    reason before the choice is confirmed.
 6. **Sheets** — `lib/deep-probe/capture-facts.ts` then `lib/deep-probe/sheets.ts`. One walk
-   over each capture, then every sheet written from the result. Nothing large is held.
+   over each capture, then every sheet written from the result. Nothing large is held except
+   the two camera-app originals of §6b.7, which are named before the pass starts and offered
+   as plain downloads afterwards.
 7. **Archive** *(only if ticked)* — `lib/deep-probe/raw-pack.ts`, then every capture is carved
    back out of the finished blob and compared byte-for-byte, with the result shown on screen.
    The stepper omits this stage entirely when it was not asked for.
@@ -217,6 +220,8 @@ renders the read-only session summary.
 | `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
 | `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
 | `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
+| `deep-probe/camera-timeout.ts` | The ten-second deadline on every camera request, the sixty-second one on a prompt, and the adoption that stops a stream arriving after its deadline instead of leaving a camera lit behind the run (§6b.6) |
+| `deep-probe/originals.ts` | Chooses the back and front camera-app files, names the downloads and states why a missing one is missing. Only a real camera-app file qualifies (§6b.7) |
 | `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time, plus the two library picks. A pick still cannot promise a fresh photo, so it is never offered as one — it is asked for explicitly as a library file and filed as `picker-file`. The pair differs only in `accept`, which is the measurement (§6b.5) |
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
@@ -378,6 +383,68 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.6 The camera deadline — `lib/deep-probe/camera-timeout.ts`
+
+`getUserMedia` has no timeout of its own. A camera that is busy, mid-rotation or simply
+confused by the two hundredth constraint change in a row does not reject — it never settles,
+and every stage queued behind it waits for ever. That is the shape of a run that appears to
+freeze on one camera with no error and no way forward.
+
+Every camera request in Deep Probe now runs under a deadline. `CAMERA_OPEN_TIMEOUT_MS` is ten
+seconds and applies wherever the permission answer is already in: each sweep step, the
+control-mode reopen, `openDeviceSession` behind the viewfinder, `ImageCapture.takePhoto()`
+(which hangs on the same devices and for the same reasons as the open does) and the
+microphone open in the sensor stage.
+
+Two rules keep the deadline honest.
+
+**A timeout is a result, not a refusal.** It is written into the row as what it is and never
+rewritten as something the device said. `OverconstrainedError` is a camera stating a limit and
+is the point of the sweep; a timeout is the request being abandoned so the sweep could
+continue, and `matrixText` prints `CAMERA_DEADLINE_POLICY` above the rows to say so in as many
+words. The timeouts are counted and summarised in the notes, so a run that mapped little
+because the hardware kept stalling cannot read as a run that mapped little because the hardware
+refused.
+
+**The abandoned request is adopted, not orphaned.** A `getUserMedia` promise that resolves
+after the deadline hands over a *live* camera, and dropping the reference leaves the sensor
+running and the privacy indicator lit for the rest of the session. Every late stream is stopped
+the moment it arrives, the late answer is recorded with the time it actually took, and a
+rejection that lands after the deadline is swallowed rather than raised a second time.
+
+The permission prompt is deliberately excluded from the ten seconds and given
+`PROMPT_ANSWER_TIMEOUT_MS` (sixty) instead. That clock is mostly a person reading a dialog, and
+a ten-second cap there would file "still reading" as "said no" — then skip both camera stages
+on the strength of it, which is precisely the dead end §6b.4 exists to prevent. The long
+allowance exists only so a genuinely hung prompt cannot strand the run for ever; when it
+expires the outcome is `dismissed` with a detail that states plainly this was not a refusal.
+
+### 6b.7 The two originals that survive the release — `lib/deep-probe/originals.ts`
+
+A run without the archive ticked drops each photo's bytes the moment its facts are read. That
+is what keeps a two-hundred-photo sweep inside a phone browser's memory, and it is the right
+default — but it also threw away the two most valuable files in the run.
+
+The camera-app handoffs are the only path that yields a file the *camera* wrote: its own
+quantisation tables, its own maker note, its own colour profile, its own EXIF. Everything else
+is a canvas encode (no metadata at all, by construction) or a platform still (almost none). So
+the back-camera and front-camera files are held back from the release and offered as plain
+downloads — the `File` object the OS handed over, saved with not one byte altered: not
+re-encoded, not re-compressed, not stripped, not stamped, not wrapped in a container. The
+checksums already in the sheets therefore describe the file on disk exactly.
+
+`readCaptureFacts` takes a `keepSlugs` set and returns the captures it held, and their bytes are
+deliberately *not* subtracted from the held-bytes counter — they really are still held, and a
+counter that said otherwise would be reporting the memory it wished it had used.
+
+The selection rule carries the weight. Only `path === "camera-file"` **and**
+`origin === "camera-file"` qualifies, both checked rather than either: the two are declared
+independently at the moment of capture, and a disagreement means something is wrong upstream.
+A library pick has metadata every bit as rich — that is exactly why §6b.5 takes two of them —
+and is still never eligible, because a button reading "camera original" over a file chosen from
+the library is the precise lie this module exists to prevent. A facing that produced nothing
+says so, with a reason, and refuses to guess whether the shot was skipped or failed.
 
 ### 6b.5 The library pick — the missing half of the central comparison
 

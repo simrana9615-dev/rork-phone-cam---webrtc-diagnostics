@@ -292,7 +292,9 @@ count, minutes, photo count, archive size — before anything runs.
    delivering a different size is the more revealing case, so the two are never merged.
    **Rejections are results**, exactly as in §4. Stills are taken at a declared subset of
    steps and `stillPolicy` states which, so an empty capture list reads as designed. The
-   torch is always left off.
+   torch is always left off. Every request runs under a **ten-second deadline**, and a
+   timed-out row says only that — it is never presented as a refusal or as a limit the
+   camera stated.
 5. **Manual shots.** Two library picks, then every named camera in a pinned viewfinder plus
    three zoom steps each (resolved against that camera's own reported range, not a hardcoded
    factor), then both facings through all three camera-app handoffs — the paths that yield
@@ -446,6 +448,37 @@ levels and a thousand iterations of that clamp is four seconds on its own). And 
 work is gone: the encoder parse, the IFD walk and the tag dump share one read of the bytes instead
 of three, carved segments are lazy `Blob.slice` views the writer reads once each, and the
 byte-identity re-check streams rather than materialising the archive a second time.
+
+**A camera that never answers.** `getUserMedia` has no timeout of its own, so a camera that is
+busy, mid-rotation or confused by the two hundredth constraint change in a row does not fail —
+it never replies at all, and the whole run waits behind it with no error and no way forward.
+Every camera request now has ten seconds: each sweep step, the control-mode reopen, the
+viewfinder, the platform photo call and the microphone open. A timed-out row is written as what
+it is and counted separately, because a run that mapped little because the hardware kept
+stalling must not read as a run that mapped little because the hardware refused.
+
+The abandoned request is still watched rather than forgotten. A camera that answers late hands
+over a *live* stream, and simply dropping it would leave the sensor running and the indicator
+lit for the rest of the session — so every late stream is closed on arrival and the late answer
+is recorded with the time it really took. The permission prompt is the one exception, and is
+allowed sixty seconds: that clock is mostly a person reading a dialog, and capping it at ten
+would file "still reading" as "said no" and then skip both camera stages on the strength of it.
+
+**The camera's own two files, kept back from the release.** A run without the archive drops each
+photo's bytes as soon as its facts are read — which is what keeps a two-hundred-photo sweep
+inside a phone browser, and which also threw away the two best files in the run. The camera-app
+handoffs are the only path that yields a file the *camera* wrote: its own quantisation tables,
+maker note, colour profile and EXIF. Everything else is a canvas encode, which carries no
+metadata by construction, or a platform still, which carries almost none.
+
+So the back-camera and front-camera files survive the release and are offered as plain
+downloads — the file the operating system handed over, saved with not one byte altered: not
+re-encoded, not re-compressed, not stripped, not stamped, not wrapped in a container, so the
+checksums in the sheets describe the file on disk exactly. Only a genuine camera-app file
+qualifies, and both of its independent declarations must agree. A library pick carries metadata
+every bit as rich and is still never eligible, because a button reading "camera original" over a
+file chosen from the library would be the one lie this whole report is built to avoid. A facing
+that produced nothing says so, and does not guess whether the shot was skipped or failed.
 
 **The one gap that mattered.** The brief opens by stating that a canvas-path photo carries no
 EXIF while a file-input photo carries the full tag set — and the run had abundant evidence for the

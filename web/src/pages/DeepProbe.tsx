@@ -39,6 +39,16 @@ import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, t
 import { useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
 import { buildManualShotList, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
+import {
+  collectOriginals,
+  FACING_LABEL,
+  missingOriginalReason,
+  ORIGINAL_FACINGS,
+  originalKeepSlugs,
+  originalsPolicyText,
+  type KeptOriginal,
+  type OriginalCandidate,
+} from "@/lib/deep-probe/originals";
 import { collectPassive, type PassiveGroup } from "@/lib/deep-probe/passive";
 import {
   OUTCOME_LABEL,
@@ -209,6 +219,8 @@ export default function DeepProbe() {
   const [buildPct, setBuildPct] = useState<number>(0);
   const [pack, setPack] = useState<RawPackResult | null>(null);
   const [sheets, setSheets] = useState<SheetSet | null>(null);
+  /** The camera-app files held back from the release, offered as raw downloads. */
+  const [originals, setOriginals] = useState<KeptOriginal[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [archiveFatal, setArchiveFatal] = useState<string | null>(null);
   /**
@@ -226,6 +238,12 @@ export default function DeepProbe() {
   const [elapsed, setElapsed] = useState<number>(0);
 
   const capturesRef = useRef<ProbeCapture[]>([]);
+  /**
+   * Which manual shots could become an original, declared as each one lands.
+   * Recorded here rather than worked out later from a slug, because the facing
+   * and the production path are only known for certain at the moment of capture.
+   */
+  const originalCandidatesRef = useRef<OriginalCandidate[]>([]);
   const passiveRef = useRef<PassiveGroup[]>([]);
   const statesBeforeRef = useRef<{ name: string; state: string | null }[]>([]);
   const statesAfterRef = useRef<{ name: string; state: string | null }[]>([]);
@@ -725,6 +743,11 @@ export default function DeepProbe() {
           takenAt: new Date().toISOString(),
         };
         capturesRef.current.push(capture);
+        // Declared here, where the facing and the production path are both known
+        // for certain. A library pick never qualifies, however rich its metadata.
+        if (!isLibrary && spec.facing != null) {
+          originalCandidatesRef.current.push({ slug: capture.slug, facing: spec.facing, path: capture.path, origin: capture.origin });
+        }
         setPhotoCount(capturesRef.current.length);
         setByteCount((b) => b + result.file.size);
         addLog(
@@ -790,8 +813,14 @@ export default function DeepProbe() {
             : `Reading the facts of ${captureCount} capture(s). Each photo's bytes are released the moment its facts are read, so nothing large is held while the sheets are written.`
         );
         mark(`Reading the facts of ${captureCount} capture(s), ${Math.round(captureBytes / 1024 / 1024)} MB`);
+        // Two files survive the release whatever else happens: the back and
+        // front camera-app originals. They are the only bytes in the run the
+        // CAMERA wrote, and dropping them to save a few megabytes would throw
+        // away the most valuable evidence of the lot.
+        const keepSlugs = originalKeepSlugs(originalCandidatesRef.current);
         const result = await readCaptureFacts(capturesRef.current, {
           release: !wants.archive,
+          keepSlugs,
           onProgress: (message, done, total) => {
             setBuildMessage(message);
             setBuildPct(Math.min(96, Math.round((done / Math.max(total, 1)) * 100)));
@@ -808,8 +837,19 @@ export default function DeepProbe() {
           "success",
           `Read ${result.facts.length} capture(s), ${formatBytes(result.bytesRead)} walked. Control went back to the browser ${result.yields} time(s) during the pass, which is what keeps the page answering instead of being killed for going quiet.`
         );
+        const keptOriginals = collectOriginals(result.kept, originalCandidatesRef.current);
+        setOriginals(keptOriginals);
         if (result.released) {
-          addLog("info", "The photo bytes have been released. No archive can be built from this run — that is the trade you chose, and it is why the memory figure above is now zero.");
+          addLog(
+            "info",
+            keptOriginals.length > 0
+              ? `The photo bytes have been released apart from ${keptOriginals.length} camera original(s), ${formatBytes(result.keptBytes)} in total. No archive can be built from this run — that is the trade you chose — but the camera's own files are still here and are offered below.`
+              : "The photo bytes have been released. No archive can be built from this run — that is the trade you chose, and it is why the memory figure above is now zero."
+          );
+        }
+        addLog(keptOriginals.length > 0 ? "success" : "info", originalsPolicyText(keptOriginals, result.released));
+        for (const facing of ORIGINAL_FACINGS) {
+          if (!keptOriginals.some((o) => o.facing === facing)) addLog("warn", missingOriginalReason(facing));
         }
 
         mark("Writing the sheets");
@@ -1359,6 +1399,41 @@ export default function DeepProbe() {
             </div>
           ) : null}
 
+          {sheets ? (
+            <div className="diag-card p-3.5">
+              <h2 className="section-title">The camera's own files</h2>
+              <p className="section-sub mt-1">
+                Raw, exactly as the camera app handed them over — not re-encoded, not compressed, not zipped.
+              </p>
+              {originals.map((original) => (
+                <Button
+                  key={original.slug}
+                  variant="outline"
+                  className="mt-2 h-11 w-full justify-start gap-1.5 px-3 text-left"
+                  onClick={() => downloadBlob(original.blob, original.fileName)}
+                >
+                  <Camera className="h-4 w-4 shrink-0" />
+                  <span className="truncate">
+                    {FACING_LABEL[original.facing]} original · {formatBytes(original.bytes)}
+                    {original.sourceName ? ` · ${original.sourceName}` : ""}
+                  </span>
+                </Button>
+              ))}
+              {ORIGINAL_FACINGS.filter((facing) => !originals.some((o) => o.facing === facing)).map((facing) => (
+                <p key={facing} className="mt-2 rounded-xl border border-border/60 bg-background/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                  {missingOriginalReason(facing)}
+                </p>
+              ))}
+              {originals.length > 0 ? (
+                <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">
+                  These are the only files in the run the camera itself wrote — its own quantisation tables, maker note, colour profile and EXIF. Every
+                  other photo here is a canvas encode, which carries no metadata at all, or a platform still, which carries almost none. They are held
+                  back from the memory release for that reason, and their checksums in the sheets describe these exact bytes.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
           {sheets && choice.viewer ? <SheetViewer sections={sheets.sections} /> : null}
 
           {archiveFatal ? (
@@ -1428,8 +1503,11 @@ export default function DeepProbe() {
           {!choice.archive && sheets ? (
             <div className="diag-card p-3">
               <p className="text-[10.5px] leading-relaxed text-muted-foreground">
-                You did not ask for the archive, so the photo bytes were released as they were read and none is held now. That is why this run used a
-                fraction of the memory. To get a byte-for-byte dump you would need to run again with the archive ticked.
+                You did not ask for the archive, so the photo bytes were released as they were read. That is why this run used a fraction of the memory.
+                {originals.length > 0
+                  ? ` The ${originals.length === 1 ? "one exception is the camera original" : "only exceptions are the two camera originals"} above, ${formatBytes(originals.reduce((sum, o) => sum + o.bytes, 0))} in total, which are still held so you can save them.`
+                  : " Nothing is held now."}{" "}
+                To get a byte-for-byte dump of everything you would need to run again with the archive ticked.
               </p>
             </div>
           ) : null}

@@ -18,6 +18,7 @@
 
 import type { PackOrigin } from "../evidence-pack";
 import { type CameraDeviceInfo, classifyCameraLabel } from "../device-camera";
+import { CAMERA_DEADLINE_POLICY, CAMERA_OPEN_TIMEOUT_MS, isCameraTimeout, openMediaWithDeadline, withCameraDeadline, type LateArrival } from "./camera-timeout";
 import { drawVideoStill, heldBytesCeiling, readPixelSize, releaseScratchCanvas } from "./capture-memory";
 import { readMemoryHints } from "./hex-budget";
 
@@ -343,7 +344,9 @@ async function platformStill(track: MediaStreamTrack): Promise<{ blob: Blob; wid
   if (!Ctor || track.readyState !== "live") return null;
   try {
     const capture = new Ctor(track);
-    const blob = await capture.takePhoto();
+    // takePhoto() hangs on the same devices, and for the same reasons, as the
+    // open does. Without a deadline one wedged still stalls the whole sweep.
+    const blob = await withCameraDeadline(capture.takePhoto(), { what: "the platform photo pipeline" });
     // Dimensions come from the file's own header. Decoding the whole picture to
     // read two numbers cost ~31.6 MiB a photo and was a direct cause of the
     // sweep running out of memory.
@@ -497,6 +500,17 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   let peakCanvasBytes = 0;
   let stillsStoppedForMemory: string | null = null;
 
+  // Timeouts are counted rather than only written into their rows, so the
+  // summary can say how much of the sweep was abandoned rather than answered.
+  let timeouts = 0;
+  const noteLate = (late: LateArrival): void => {
+    notes.push(
+      `${late.what} answered ${(late.arrivedAtMs / 1000).toFixed(1)}s after the request — past the ${(late.waitedMs / 1000).toFixed(0)}s deadline, so the sweep had already moved on. ` +
+        `${late.streamClosed ? "The stream it handed over was closed immediately, so the camera did not stay open behind the run. " : ""}` +
+        `The row for that step stays as a timeout: it is a record of what happened, not a judgement about the camera.`
+    );
+  };
+
   const recordCapture = (capture: ProbeCapture): void => {
     captures.push(capture);
     heldBytes += capture.blob.size;
@@ -587,8 +601,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       const stepStart = performance.now();
       let stream: MediaStream | null = null;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: step.constraints });
+        stream = await openMediaWithDeadline({ audio: false, video: step.constraints }, { what: `${name} (${step.asked})`, onLate: noteLate });
       } catch (err) {
+        if (isCameraTimeout(err)) timeouts += 1;
         rows.push({
           deviceId: device.deviceId,
           deviceLabel: name,
@@ -720,8 +735,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     } else {
       let stream: MediaStream | null = null;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { deviceId: { exact: device.deviceId } } });
+        stream = await openMediaWithDeadline({ audio: false, video: { deviceId: { exact: device.deviceId } } }, { what: `${name} (control-mode reopen)`, onLate: noteLate });
       } catch (err) {
+        if (isCameraTimeout(err)) timeouts += 1;
         notes.push(`${name}: could not reopen for control-mode testing (${errorName(err)}).`);
       }
       const track = stream?.getVideoTracks()[0] ?? null;
@@ -796,6 +812,12 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   }
 
   if (aborted) notes.push("You stopped the sweep before it finished. Every row above really ran; the rows that never ran are simply absent, and the archive is marked partial.");
+  if (timeouts > 0) {
+    notes.push(
+      `${timeouts} request(s) passed the ${(CAMERA_OPEN_TIMEOUT_MS / 1000).toFixed(0)}-second camera deadline without answering and were abandoned so the sweep could continue. ` +
+        "Those rows say TIMED OUT and mean only that. They are not refusals, they are not limits the camera stated, and nothing about the hardware should be read from them."
+    );
+  }
 
   // The shared canvas is no longer needed; drop its last frame rather than
   // leaving it resident through the archive build, which is the other memory-
@@ -847,6 +869,10 @@ export function matrixText(report: CameraMatrixReport): string {
     "A REJECTED row is a result, not an error. OverconstrainedError means the camera stated a limit, which",
     "is exactly what this sweep is for. Nothing here is an app fault, and nothing here is evidence about",
     "you — it is a map of the hardware.",
+    "",
+    "THE CAMERA DEADLINE",
+    "-".repeat(78),
+    CAMERA_DEADLINE_POLICY,
     "",
     "STILL POLICY",
     "-".repeat(78),
