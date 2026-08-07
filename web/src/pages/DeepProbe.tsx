@@ -29,6 +29,7 @@ import { formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
+import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
 import { buildManualShotList, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
 import { collectPassive, type PassiveGroup } from "@/lib/deep-probe/passive";
 import {
@@ -68,8 +69,12 @@ const STAGES: { phase: Phase; label: string; icon: typeof ShieldQuestion }[] = [
 const COUNTDOWN_SECONDS = 4;
 /** How often a paused stage re-checks whether you have resumed. */
 const PAUSE_POLL_MS = 200;
-/** Source bytes allowed a complete hex rendering before the dumps switch to windows. */
-const HEX_BUDGET = 192 * 1024 * 1024;
+/**
+ * Source bytes allowed a hex rendering, sized to what this device can actually
+ * survive. A hex dump is 4.94 characters per source byte, so this figure is the
+ * single biggest lever on peak memory during the build — see `hex-budget.ts`.
+ */
+const HEX_BUDGET = hexBudgetForDevice(readMemoryHints());
 
 const OUTCOME_STYLE: Record<PermissionOutcome, string> = {
   granted: "border-emerald-500/45 bg-emerald-500/10 text-emerald-300",
@@ -1128,11 +1133,16 @@ function Setup({ tier, setTier, onStart }: { tier: PermissionTier; setTier: (t: 
   const requestCount = useMemo(() => requestsForTier(tier).length, [tier]);
   const estimate = useMemo(() => {
     const promptMinutes = Math.ceil(requestCount * 0.2);
+    // Photos dominate the archive; hex text is capped by the device budget rather
+    // than scaling with the number of captures, which is what keeps the total
+    // predictable instead of open-ended.
+    const hexText = hexTextBytesFor(HEX_BUDGET);
     return {
       prompts: requestCount,
       minutes: `${promptMinutes + 12}–${promptMinutes + 22}`,
       photos: "60–150 automatic, plus up to 22 you take yourself",
-      size: "300 MB – 1.5 GB, depending on how many cameras this device has",
+      size: `250 MB – 700 MB, depending on how many cameras this device has`,
+      hex: `Hex dumps add at most ${formatBytes(hexText)} on this device — capped on purpose, because rendering every byte of every photo would exhaust this browser's memory before the archive finished. Anything windowed says exactly which bytes it skipped, and the complete photo is always in the archive.`,
     };
   }, [requestCount]);
 
@@ -1192,9 +1202,8 @@ function Setup({ tier, setTier, onStart }: { tier: PermissionTier; setTier: (t: 
           </div>
           <div className="col-span-2 rounded-xl border border-border/60 bg-background/40 p-2.5">
             <div className="text-[11.5px] font-semibold">{estimate.size}</div>
-            <div className="mt-0.5 text-[9.5px] uppercase tracking-wide text-muted-foreground">
-              archive size — every byte of every photo is also rendered as hex, which is what makes it large
-            </div>
+            <div className="mt-0.5 text-[9.5px] uppercase tracking-wide text-muted-foreground">archive size</div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">{estimate.hex}</p>
           </div>
         </div>
       </div>

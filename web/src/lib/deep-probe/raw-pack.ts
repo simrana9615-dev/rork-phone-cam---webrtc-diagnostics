@@ -21,6 +21,7 @@ import { buildZip, crcHex, isDeflateSupported, safeZipPath, verifyBytes, type Zi
 import { briefChecklist, buildCorrelationBrief, type BriefCapture } from "./correlation-brief";
 import { readExifIfds, ifdText, type ExifIfdReport } from "./exif-ifd";
 import { hashBlob, type FileHashes } from "./hashes";
+import { hexPolicyText, hexTextBytesFor, memoryPressure, perCaptureHexBudget, HEX_MIN_PER_CAPTURE, HEX_PRESSURE_LIMIT } from "./hex-budget";
 import { encoderText, readJpegEncoderBytes, type JpegEncoderReport } from "./jpeg-encoder";
 import { buildMimicSpec, STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
 import { hexDumpBlob, structureText, walkStructure } from "./raw-bytes";
@@ -46,7 +47,11 @@ export type RawPackInput = {
   logs: LogEntry[];
   /** Stages that never ran — named, with the reason, so the archive is never quietly partial. */
   omissions: StageOmission[];
-  /** Total source bytes allowed to receive a complete hex dump. */
+  /**
+   * Total source bytes allowed a hex rendering across the whole run. Shared out
+   * equally per capture rather than spent in arrival order — see `hex-budget.ts`
+   * for why, and for the memory arithmetic that sets the figure.
+   */
   hexBudgetBytes: number;
   /**
    * `enumerateDevices()` taken before any permission was requested. Kept apart
@@ -373,6 +378,8 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
     "camera/surface.json      track.getSettings/getCapabilities/getConstraints verbatim, plus the three",
     "                         enumerateDevices snapshots and the File objects, in camera/devices.json and",
     "                         camera/files.json.",
+    "raw/hex-budget.txt       Why some hex dumps are windowed: the budget, the equal per-capture share, what",
+    "                         a window omits, and how to dump the missing range yourself.",
     "raw/segments/            Metadata regions carved out whole — EXIF block, maker note, colour profile,",
     "                         embedded thumbnails — each at its exact position in the original.",
     "checksums/               MD5, SHA-1, SHA-256 and CRC-32 for every capture, plus digest files in the",
@@ -554,7 +561,16 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     onProgress(message, done, total);
   };
 
+  // Equal share per capture. Spending the budget first-come made the
+  // completeness of a dump a fact about when a photo was taken rather than about
+  // the photo, and let one early large file starve every capture after it.
+  const perCaptureHex = perCaptureHexBudget(input.hexBudgetBytes, input.captures.length);
+  // Deliberately the caller's own array: an omission discovered here has to reach
+  // the on-screen list too, not just the archive.
+  const omissions = input.omissions;
   let hexSpent = 0;
+  let hexWindowed = 0;
+  let pressureThrottled = false;
 
   for (const capture of input.captures) {
     const folder = folderFor(capture);
@@ -604,11 +620,27 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     }
     tick(`Carving segments from ${capture.slug}`);
 
-    const remaining = Math.max(0, input.hexBudgetBytes - hexSpent);
-    const hex = await hexDumpBlob(capture.blob, capture.label, remaining);
+    // Where the browser reports heap use, back off before it kills the tab.
+    // Losing the whole archive to render bytes nobody reads would be a poor
+    // trade, and the throttle is reported rather than applied quietly.
+    const pressure = memoryPressure();
+    const throttled = pressure != null && pressure > HEX_PRESSURE_LIMIT;
+    if (throttled && !pressureThrottled) {
+      pressureThrottled = true;
+      warnings.push(
+        `Memory use reached ${Math.round((pressure ?? 0) * 100)}% of this browser's heap limit while building. Hex dumps from ${capture.slug} onward drop to the minimum window so the archive finishes instead of the tab being killed. Every capture is still present and complete in captures/ — only the hex rendering is shortened.`
+      );
+      omissions.push({
+        stage: "Full hex dumps for later captures",
+        reason: `The browser reported heap use above ${Math.round(HEX_PRESSURE_LIMIT * 100)}% during the build, so hex rendering was reduced to the minimum window from ${capture.slug} onward. The captures themselves are unaffected and byte-identical.`,
+      });
+    }
+    const allowance = throttled ? HEX_MIN_PER_CAPTURE : perCaptureHex;
+    const hex = await hexDumpBlob(capture.blob, capture.label, allowance);
     hexSpent += hex.bytesRendered;
     entries.push({ path: `raw/${capture.slug}.hex.txt`, data: hex.blob, compress: true });
     if (hex.truncated) {
+      hexWindowed += 1;
       warnings.push(`${capture.slug}: the hex dump is windowed, not complete — ${hex.note}`);
     }
 
@@ -666,6 +698,26 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   }
 
   // Reports
+  if (input.captures.length > 0) {
+    entries.push({
+      path: "raw/hex-budget.txt",
+      data: [
+        ...hexPolicyText(input.hexBudgetBytes, perCaptureHex, input.captures.length),
+        "WHAT HAPPENED IN THIS RUN",
+        "-".repeat(78),
+        `  Complete dumps            ${input.captures.length - hexWindowed} of ${input.captures.length}`,
+        `  Windowed dumps            ${hexWindowed} of ${input.captures.length}`,
+        `  Source bytes rendered     ${hexSpent.toLocaleString("en-US")}`,
+        `  Hex text produced         ~${hexTextBytesFor(hexSpent).toLocaleString("en-US")} bytes`,
+        pressureThrottled
+          ? "  Throttled                 YES \u2014 the browser reported heap pressure mid-build and later dumps\n                            dropped to the minimum window. Named in READ-ME.txt too."
+          : "  Throttled                 no",
+        "",
+      ].join("\n"),
+      compress: true,
+    });
+  }
+
   entries.push({ path: "permissions/ledger.txt", data: permissionLedgerText(input), compress: true });
   entries.push({
     path: "permissions/ledger.json",

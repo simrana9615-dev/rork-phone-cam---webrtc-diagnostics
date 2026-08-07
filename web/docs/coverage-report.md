@@ -371,6 +371,31 @@ metadata regions, and a CRC-32 re-check of any file (or all of them) against the
 stored inside. The viewer is explicitly not the authority — when it and `unzip` disagree,
 `unzip` wins.
 
+**The hex budget, and why it is a correctness matter rather than a size preference.**
+One source byte becomes 4.94 characters of text, so the dumps are the largest thing in the
+archive — larger than the photos they describe. A 150-photo run at 3 MB a photo is 450 MB of
+source and therefore 2.2 GB of hex, alive as blobs at the same time as the captures, the
+DEFLATE output and the assembled archive, against an iOS Safari tab that is terminated around
+1–1.5 GB. An earlier 192 MB allowance did not produce a large archive; it killed the build.
+So the allowance is derived from `deviceMemory` and the heap ceiling where those exist, and
+the unmeasurable case — WebKit, which reports neither and is also strictest about killing
+tabs — is deliberately treated as the *small* case rather than the generous one. The allowance
+is then shared **equally per capture** rather than first-come, because spending it in arrival
+order made the completeness of a dump a fact about when a photo was taken instead of about the
+photo. A floor keeps every capture's header region rendered however many there are; crossing
+70% of a reported heap limit mid-build shortens the remaining dumps and writes both a warning
+and a named omission, which reaches the on-screen list too. `raw/hex-budget.txt` states the
+whole policy, the complete-versus-windowed counts, and the `xxd` command that recovers any
+skipped range from the original — which is present and byte-identical regardless. What a
+window omits is entropy-coded scan data: incompressible noise with nothing structural in it.
+
+**Crash surface.** A single throw in any screen used to unmount the tree and leave a blank
+page. For a diagnostic tool that is the worst available failure mode, because a blank page is
+indistinguishable from a genuine "this device refused everything" result. An error boundary now
+reports the error name, message and component stack, states that an unfinished run was held in
+memory only and did not survive, and recognises an out-of-memory signature well enough to
+suggest a narrower scope or an earlier stop.
+
 **Interruption:** Pause and Stop are available throughout. A pause always lands *between*
 steps — the recording or constraint in flight completes first, because a half-recorded
 sensor window or a half-applied constraint would describe a paused device rather than the

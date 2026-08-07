@@ -185,6 +185,7 @@ renders the read-only session summary.
 | `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time. Picker-only engines are excluded — they cannot promise a fresh photo, so asking for one here would mislead |
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
+| `deep-probe/hex-budget.ts` | How much of a run may be rendered as hex and why. Holds the 4.94-characters-per-byte constant measured against `hexLines` itself, the device-derived total allowance, the equal per-capture share with its floor and ceiling, the heap-pressure threshold, and the policy statement written into the archive. Pure and fully unit-tested, because getting this number wrong does not degrade the archive — it destroys the run |
 | `deep-probe/raw-pack.ts` | The raw dump archive: captures stored verbatim (`captures/` vs `rendered-frames/` by declared origin), per-capture hex dump + structure map + full tag listing **including undocumented entries** (`includeUnknown`), carved segments, four checksums plus `md5sum`/`sha256sum`-format digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session log, byte-identity data and an HTML overview. Post-build it re-carves every capture from the finished blob and compares. Names the file `…-PARTIAL.zip` and lists every omission when a stage did not run |
 | `deep-probe/jpeg-encoder.ts` | The encoder signature: all 64 DQT coefficients per table (printed in both natural and file zig-zag order), DHT code-length counts compared against all four ITU T.81 Annex K tables to separate *standard* from *optimised*, frame mode (baseline vs progressive), chroma subsampling derived from the per-component sampling factors, SOS scan count, DRI restart interval, APP segments in file order with lengths and signatures, the embedded thumbnail parsed as the complete second JPEG it is (its own dimensions and table sums), a full ICC header parse (desc name, class, spaces, creator, intent, the profile's own embedded ID), and any bytes after EOI. The libjpeg quality estimate is **withheld** where the tables are not a scaled Annex K table — Apple's encoder is that case, and the refusal is itself the finding |
 | `deep-probe/exif-ifd.ts` | A raw TIFF/IFD walk reporting every entry **as stored**: tag ID, TIFF type, component count, byte length, inline-vs-offset, and the undecoded value — rationals as `num/den` rather than decimals, ASCII with its length and NUL-termination stated, UNDEFINED as hex. Also the structure a tag list cannot express: byte order, magic, directory order, IFD1 presence, MakerNote length and signature, `ColorSpace 65535` and `InteroperabilityIndex` as first-class fields, and the GPS block with every Ref resolved. Undocumented tags are reported with a null name, never dropped |
@@ -271,7 +272,8 @@ question: not *is this capture authentic* but *what did this device actually han
 | `correlation-brief.md` | Item-by-item answers to the forensic request, each pointing at the file that holds the evidence, headed by the capture-path table |
 | `captures/` | Photos whose bytes the app did **not** author (camera files, platform stills), stored uncompressed |
 | `rendered-frames/` | Frames the app encoded itself — kept out of `captures/` for the same reason `rendered-frames/` exists in the evidence pack |
-| `raw/<slug>.hex.txt` | Complete `xxd`-layout hex + ASCII of every byte, or an explicitly-labelled `WINDOWED` dump naming the exact skipped-byte count |
+| `raw/<slug>.hex.txt` | `xxd`-layout hex + ASCII — complete when the capture fits its share of the budget, otherwise an explicitly-labelled `WINDOWED` dump naming the exact skipped-byte count |
+| `raw/hex-budget.txt` | The budget itself: total allowance, equal per-capture share, complete-vs-windowed counts, whether heap pressure throttled the build, what a window omits and the `xxd` command to recover any skipped range |
 | `raw/<slug>.structure.txt` | Real container parse: every section's identifier, meaning, offset and length |
 | `raw/<slug>.tags.txt` | Full tag listing **including undocumented entries** — the ones ordinary viewers hide |
 | `raw/<slug>.encoder.txt` | The JPEG encoder signature: all 64 quantisation coefficients per table, Huffman tables marked standard or optimised, subsampling, frame mode, scan count, restart interval, APP order, thumbnail tables, ICC header, bytes after EOI |
@@ -304,8 +306,35 @@ Three things this archive is careful **not** to do:
 
 Size control: captures are always stored (method 0) so they stay carvable, while the bulky
 derived text opts into DEFLATE. Hex dumps compress heavily, which is what keeps a run with
-100+ photos inside the ZIP format's 4 GiB ceiling. Beyond a source-byte budget the dumps
-switch to head+tail windows and say so, both in the file and in the on-screen warnings.
+100+ photos inside the ZIP format's 4 GiB ceiling.
+
+The hex budget is not a size preference — it is what stops the tab being killed, and
+`deep-probe/hex-budget.ts` holds the whole of it. One source byte becomes **4.94 characters**
+of text, so a 150-photo run at 3 MB a photo (450 MB of source) is 2.2 GB of hex. Those dumps
+are alive as blobs at the same time as the captures they describe, the DEFLATE output and the
+assembled archive, and iOS Safari terminates a tab somewhere around 1–1.5 GB resident. An
+earlier 192 MB budget therefore crashed the build outright rather than producing a large
+archive. Three rules follow:
+
+- **The allowance is device-derived, and "unmeasurable" means "assume little."** `deviceMemory`
+  and `performance.memory.jsHeapSizeLimit` set it where present; WebKit reports neither and is
+  also the strictest about killing tabs, so the unknown case is deliberately *not* the most
+  generous. Hex text may claim at most 6% of a known heap ceiling.
+- **The budget is shared equally per capture, never first-come.** Spending it in arrival order
+  gave the earliest photos complete dumps and windowed the rest, which made the completeness
+  of a dump a fact about *when a photo was taken* instead of about the photo. A floor keeps
+  every capture's whole header region rendered however many there are; a ceiling stops one
+  large file consuming a share it cannot justify.
+- **Backing off is reported, not silent.** Where the browser exposes heap use, crossing 70%
+  mid-build drops the remaining dumps to the minimum window and writes both a warning and a
+  named omission — which reaches the on-screen list too, not just the archive.
+
+What a window omits is worth stating precisely: the middle of a JPEG is entropy-coded scan
+data, incompressible noise with nothing structural in it. Every region a forensic reader wants
+— SOI, the APP segments, EXIF in full, the quantisation and Huffman tables, the ICC profile,
+the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
+always rendered. The complete file is present and byte-identical in `captures/` either way, so
+a window costs a convenience rather than evidence.
 
 ### 6b.1 `device-spec.md` — the distinctive-facts summary
 
