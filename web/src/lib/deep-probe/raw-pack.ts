@@ -18,7 +18,10 @@ import ExifReader from "exifreader";
 
 import { downloadBlob, formatBytes, type LogEntry } from "../camera-diagnostics";
 import { buildZip, crcHex, isDeflateSupported, safeZipPath, verifyBytes, type ZipEntry, type ZipEntryInfo } from "../zip-writer";
+import { briefChecklist, buildCorrelationBrief, type BriefCapture } from "./correlation-brief";
+import { readExifIfds, ifdText, type ExifIfdReport } from "./exif-ifd";
 import { hashBlob, type FileHashes } from "./hashes";
+import { encoderText, readJpegEncoderBytes, type JpegEncoderReport } from "./jpeg-encoder";
 import { buildMimicSpec, STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
 import { hexDumpBlob, structureText, walkStructure } from "./raw-bytes";
 import { matrixText, type CameraMatrixReport, type ProbeCapture } from "./camera-matrix";
@@ -45,6 +48,12 @@ export type RawPackInput = {
   omissions: StageOmission[];
   /** Total source bytes allowed to receive a complete hex dump. */
   hexBudgetBytes: number;
+  /**
+   * `enumerateDevices()` taken before any permission was requested. Kept apart
+   * from the sweep's own snapshots because "before permission" and "before the
+   * sweep" are different moments and only one of them shows the pre-grant state.
+   */
+  devicesBeforePermission: { kind: string; deviceId: string; groupId: string; label: string }[];
 };
 
 export type RawPackProgress = (message: string, done: number, total: number) => void;
@@ -355,8 +364,15 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
           "                         Kept separate so they can never be mistaken for camera output.",
         ]
       : []),
+    "correlation-brief.md     Item-by-item answers to the forensic request: capture paths, encoder tables,",
+    "                         raw directory entries, colour profile, JS surface and motion precision.",
     "raw/                     Per capture: the complete hex + ASCII dump, the structural map of the container,",
-    "                         and the full tag listing including undocumented entries.",
+    "                         the full tag listing including undocumented entries, the JPEG encoder signature",
+    "                         (quantisation and Huffman tables), and a raw EXIF directory walk reporting every",
+    "                         entry's tag ID, type, count and stored value.",
+    "camera/surface.json      track.getSettings/getCapabilities/getConstraints verbatim, plus the three",
+    "                         enumerateDevices snapshots and the File objects, in camera/devices.json and",
+    "                         camera/files.json.",
     "raw/segments/            Metadata regions carved out whole — EXIF block, maker note, colour profile,",
     "                         embedded thumbnails — each at its exact position in the original.",
     "checksums/               MD5, SHA-1, SHA-256 and CRC-32 for every capture, plus digest files in the",
@@ -529,6 +545,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   const records: CaptureRecord[] = [];
   const capturePaths = new Map<string, ProbeCapture>();
   const specCaptures: MimicCaptureFact[] = [];
+  const briefCaptures: BriefCapture[] = [];
 
   const total = input.captures.length * 4 + 12;
   let done = 0;
@@ -552,17 +569,38 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     const hashes = await hashBlob(capture.blob);
     tick(`Checksumming ${capture.slug}`);
 
+    // One read of the bytes feeds both deep parsers.
+    let encoder: JpegEncoderReport | null = null;
+    let ifd: ExifIfdReport | null = null;
+    try {
+      const bytes = new Uint8Array(await capture.blob.arrayBuffer());
+      encoder = readJpegEncoderBytes(bytes);
+      ifd = readExifIfds(bytes);
+    } catch (err) {
+      warnings.push(`${capture.slug}: the encoder and directory parses could not read the bytes (${err instanceof Error ? err.message : String(err)}). Reported rather than skipped silently.`);
+    }
+    if (encoder) entries.push({ path: `raw/${capture.slug}.encoder.txt`, data: encoderText(encoder, capture.label), compress: true });
+    if (ifd) entries.push({ path: `raw/${capture.slug}.ifd.txt`, data: ifdText(ifd, capture.label), compress: true });
+
     const structure = await walkStructure(capture.blob);
     entries.push({ path: `raw/${capture.slug}.structure.txt`, data: structureText(structure, capture.label), compress: true });
+    let iccMd5: string | null = null;
     for (const segment of structure.segments) {
       if (segment.offset < 0 || segment.length <= 0 || segment.offset + segment.length > capture.blob.size) {
         warnings.push(`Segment "${segment.name}" of ${capture.slug} reported an out-of-range position and was not carved. The hex dump still covers those bytes.`);
         continue;
       }
-      entries.push({
-        path: `raw/segments/${capture.slug}/${safeZipPath(segment.name)}.bin`,
-        data: capture.blob.slice(segment.offset, segment.offset + segment.length),
-      });
+      const carved = capture.blob.slice(segment.offset, segment.offset + segment.length);
+      entries.push({ path: `raw/segments/${capture.slug}/${safeZipPath(segment.name)}.bin`, data: carved });
+      // The exact colour-profile bytes get their own checksum, since the request
+      // is specifically for the profile's MD5 rather than the whole file's.
+      if (segment.name === "icc-profile") {
+        try {
+          iccMd5 = (await hashBlob(carved)).md5;
+        } catch {
+          iccMd5 = null;
+        }
+      }
     }
     tick(`Carving segments from ${capture.slug}`);
 
@@ -606,6 +644,25 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
       tagKeys: tags.keys,
       stableTags: tags.stableTags,
     });
+
+    briefCaptures.push({
+      slug: capture.slug,
+      archivePath: path,
+      label: capture.label,
+      path: capture.path,
+      origin: capture.origin,
+      deviceLabel: capture.deviceLabel,
+      fileName: capture.fileName,
+      fileLastModified: capture.fileLastModified,
+      fileRelativePath: capture.fileRelativePath,
+      bytes: capture.blob.size,
+      mime: capture.blob.type,
+      width: capture.width,
+      height: capture.height,
+      encoder,
+      ifd,
+      iccMd5,
+    });
   }
 
   // Reports
@@ -644,6 +701,20 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   if (input.matrix) {
     entries.push({ path: "camera/matrix.txt", data: matrixText(input.matrix), compress: true });
     entries.push({ path: "camera/matrix.json", data: JSON.stringify({ kind: "deep-probe-camera-matrix", version: 1, ...input.matrix }, null, 2), compress: true });
+    entries.push({
+      path: "camera/surface.json",
+      data: JSON.stringify(
+        {
+          kind: "deep-probe-camera-surface",
+          version: 1,
+          note: "track.getSettings(), getCapabilities() and getConstraints() exactly as the browser returned them, with key order preserved. Key order is itself an engine trait, so nothing here was sorted, renamed or rounded.",
+          cameras: input.matrix.surface,
+        },
+        null,
+        2
+      ),
+      compress: true,
+    });
   } else {
     entries.push({
       path: "camera/NOT-RUN.txt",
@@ -651,6 +722,49 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     });
   }
   tick("Writing the camera matrix");
+
+  entries.push({
+    path: "camera/devices.json",
+    data: JSON.stringify(
+      {
+        kind: "deep-probe-device-enumeration",
+        version: 1,
+        note: "Three enumerateDevices() snapshots, full IDs, every kind included. Two would be ambiguous about when they were taken: beforeAnyPermission is the genuinely pre-grant state, beforeSweep is after the stage-one grant but before any camera was opened, afterSweep is the end state. Blank labels in the first are the privacy rule working, not a fault.",
+        beforeAnyPermission: input.devicesBeforePermission,
+        beforeSweep: input.matrix?.devicesBefore ?? [],
+        afterSweep: input.matrix?.devicesAfter ?? [],
+      },
+      null,
+      2
+    ),
+    compress: true,
+  });
+
+  const fileCaptures = input.captures.filter((c) => c.fileName != null);
+  entries.push({
+    path: "camera/files.json",
+    data: JSON.stringify(
+      {
+        kind: "deep-probe-file-objects",
+        version: 1,
+        note: "The File object as a site receives it, in arrival order. lastModified is the raw epoch value, deliberately unformatted: the step between consecutive shots is the informative part and a formatted date would hide it.",
+        files: fileCaptures.map((c) => ({
+          slug: c.slug,
+          name: c.fileName,
+          size: c.blob.size,
+          type: c.blob.type,
+          lastModified: c.fileLastModified,
+          webkitRelativePath: c.fileRelativePath,
+          receivedAt: c.takenAt,
+          producedBy: c.asked,
+        })),
+      },
+      null,
+      2
+    ),
+    compress: true,
+  });
+  tick("Writing the device and file surface");
 
   entries.push({ path: "checksums/checksums.txt", data: checksumsText(records), compress: true });
   entries.push({ path: "checksums/checksums.md5", data: records.map((r) => `${r.hashes.md5}  ${r.path}`).join("\n") });
@@ -671,6 +785,22 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   });
   tick("Writing the session log");
 
+  // Both renderings come from one registry, so the checklist at the top of the
+  // spec cannot drift from the document it summarises.
+  const correlationInput = {
+    generatedAt: input.finishedAt,
+    passive: input.passive,
+    sensors: input.sensors,
+    matrix: input.matrix,
+    captures: briefCaptures,
+    devicesBeforePermission: input.devicesBeforePermission,
+    permissionStatesBefore: input.permissionStatesBefore,
+    permissionStatesAfter: input.permissionStatesAfter,
+    omissions: input.omissions,
+  };
+  entries.push({ path: "correlation-brief.md", data: buildCorrelationBrief(correlationInput), compress: true });
+  tick("Writing the correlation brief");
+
   const specMarkdown = buildMimicSpec({
     generatedAt: input.finishedAt,
     tier: input.tier,
@@ -681,6 +811,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     matrix: input.matrix,
     captures: specCaptures,
     omissions: input.omissions,
+    briefChecklist: briefChecklist(correlationInput),
   });
   entries.push({ path: "device-spec.md", data: specMarkdown, compress: true });
   tick("Writing the device spec");

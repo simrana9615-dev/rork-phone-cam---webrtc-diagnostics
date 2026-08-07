@@ -56,6 +56,19 @@ function n(value: number | null | undefined, digits = 4): string {
   return value == null || Number.isNaN(value) ? "" : value.toFixed(digits);
 }
 
+/**
+ * Writes a reading at full precision, with no rounding of our own.
+ *
+ * Used for every sensor axis, because the *quantisation step* between distinct
+ * readings is a hardware trait worth measuring — and rounding to a fixed number
+ * of decimals first would replace the device's real step with our formatting
+ * choice. A spec that reported "step 0.0001" when the true step was 0.000004
+ * would be describing this function, not the accelerometer.
+ */
+function exact(value: number | null | undefined): string {
+  return value == null || Number.isNaN(value) ? "" : String(value);
+}
+
 /** Records `devicemotion` for a fixed window at whatever rate the device supplies. */
 export function recordMotion(ms: number, onProgress?: SensorProgress, shouldStop?: SensorStop): Promise<SensorSeries> {
   return new Promise((resolve) => {
@@ -68,15 +81,15 @@ export function recordMotion(ms: number, onProgress?: SensorProgress, shouldStop
     const handler = (ev: DeviceMotionEvent) => {
       rows.push([
         (performance.now() - t0).toFixed(1),
-        n(ev.acceleration?.x),
-        n(ev.acceleration?.y),
-        n(ev.acceleration?.z),
-        n(ev.accelerationIncludingGravity?.x),
-        n(ev.accelerationIncludingGravity?.y),
-        n(ev.accelerationIncludingGravity?.z),
-        n(ev.rotationRate?.alpha, 3),
-        n(ev.rotationRate?.beta, 3),
-        n(ev.rotationRate?.gamma, 3),
+        exact(ev.acceleration?.x),
+        exact(ev.acceleration?.y),
+        exact(ev.acceleration?.z),
+        exact(ev.accelerationIncludingGravity?.x),
+        exact(ev.accelerationIncludingGravity?.y),
+        exact(ev.accelerationIncludingGravity?.z),
+        exact(ev.rotationRate?.alpha),
+        exact(ev.rotationRate?.beta),
+        exact(ev.rotationRate?.gamma),
         ev.interval != null ? String(ev.interval) : "",
       ]);
     };
@@ -113,7 +126,7 @@ export function recordMotion(ms: number, onProgress?: SensorProgress, shouldStop
         note:
           rows.length === 0
             ? `No devicemotion events arrived at all during the window. Either permission was not actually in force, or this device delivers nothing on that event.${earlyNote(stoppedEarly)}`
-            : `${rows.length} samples in ${(elapsed / 1000).toFixed(1)}s — a measured ${hz ?? "?"} Hz.${reported ? ` The event reports its own interval as ${reported} ms, i.e. ${Math.round(1000 / Number(reported))} Hz nominal.` : ""} The measured figure is the one to trust; browsers throttle this event and the nominal rate is often optimistic.${earlyNote(stoppedEarly)}`,
+            : `${rows.length} samples in ${(elapsed / 1000).toFixed(1)}s — a measured ${hz ?? "?"} Hz.${reported ? ` The event reports its own interval as ${reported} ms, i.e. ${Math.round(1000 / Number(reported))} Hz nominal.` : ""} The measured figure is the one to trust; browsers throttle this event and the nominal rate is often optimistic. Axis values are written at full precision with no rounding applied here, so the smallest step between distinct readings is the device's own quantisation rather than an artefact of this file.${earlyNote(stoppedEarly)}`,
       });
     };
 
@@ -145,12 +158,12 @@ export function recordOrientation(ms: number, onProgress?: SensorProgress, shoul
       rows.push([
         (performance.now() - t0).toFixed(1),
         source,
-        n(ev.alpha, 3),
-        n(ev.beta, 3),
-        n(ev.gamma, 3),
+        exact(ev.alpha),
+        exact(ev.beta),
+        exact(ev.gamma),
         String(ev.absolute),
-        n(withHeading.webkitCompassHeading, 2),
-        n(withHeading.webkitCompassAccuracy, 2),
+        exact(withHeading.webkitCompassHeading),
+        exact(withHeading.webkitCompassAccuracy),
       ]);
     };
 

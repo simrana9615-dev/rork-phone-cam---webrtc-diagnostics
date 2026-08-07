@@ -99,6 +99,13 @@ export type MimicSpecInput = {
   matrix: CameraMatrixReport | null;
   captures: MimicCaptureFact[];
   omissions: StageOmission[];
+  /**
+   * The correlation answer key, rendered from the same registry as
+   * `correlation-brief.md`. Placed at the very top of the spec because the
+   * capture-path caveat it carries changes how every capture fact below it
+   * should be read.
+   */
+  briefChecklist?: string;
 };
 
 /**
@@ -215,6 +222,39 @@ const KEY_MAP: Record<string, string> = {
   "Storage estimate": "storage.estimate",
   "Local storage": "storage.localStorage",
   IndexedDB: "storage.indexedDb",
+  "Device model": "hints.model",
+  "Platform version": "hints.platformVersion",
+  "CPU architecture": "hints.architecture",
+  "CPU bitness": "hints.bitness",
+  "Full browser version": "hints.uaFullVersion",
+  "Full version list": "hints.fullVersionList",
+  "Form factors": "hints.formFactors",
+  "WebGL extension names": "gpu.extensions",
+  "WebGL generation": "gpu.generation",
+  "Shading language": "gpu.glsl",
+  "WebGPU adapter vendor": "gpu.webgpu.vendor",
+  "WebGPU adapter architecture": "gpu.webgpu.architecture",
+  "WebGPU adapter device": "gpu.webgpu.device",
+  "Canvas 2D signature": "signature.canvas2d",
+  "WebGL render signature": "signature.webgl",
+  "Audio DSP signature": "signature.audio",
+  "Audio DSP sum": "signature.audioSum",
+  "WebRTC SDP signature": "signature.sdp",
+  "Audio sample rate": "audio.sampleRate",
+  "Audio base latency": "audio.baseLatency",
+  "Audio output latency": "audio.outputLatency",
+  "Audio max channels": "audio.maxChannels",
+  "Fonts present": "fonts.present",
+  "Fonts absent": "fonts.absent",
+  "MediaRecorder encoders": "codec.encoders",
+  "Speech voice names": "voices.names",
+  "Speech voice count": "voices.count",
+  "WebRTC codecs offered": "rtc.codecs",
+  "WebRTC header extensions": "rtc.extensions",
+  "Clock resolution": "engine.clockResolution",
+  "Math signature": "engine.math",
+  "JS heap limit": "engine.heapLimit",
+  "Safe-area insets": "screen.safeArea",
   "Colour scheme": "pref.colorScheme",
   "Reduced motion": "pref.reducedMotion",
   "Reduced transparency": "pref.reducedTransparency",
@@ -238,6 +278,32 @@ const STABILITY_MAP: Record<string, Stability> = {
   "Device pixel ratio": "HW",
   "Maximum touch points": "HW",
   "Colour depth": "HW",
+  // Signatures move with a driver or browser update, so they are not hardware
+  // facts — pinning one to the hardware would misdescribe how long it holds.
+  "Canvas 2D signature": "OS",
+  "WebGL render signature": "OS",
+  "Audio DSP signature": "OS",
+  "Audio DSP sum": "OS",
+  "WebRTC SDP signature": "OS",
+  "Audio context state": "VAR",
+  "Visual viewport": "VAR",
+  "Screen extended": "VAR",
+  "Clock resolution": "OS",
+  "Error stack format": "OS",
+  "Timezone display name": "SET",
+  "Date part order": "SET",
+  "Number formatting": "SET",
+  "Collation order": "SET",
+  "Intl detail": "SET",
+  "Safe-area insets": "HW",
+  "Audio sample rate": "HW",
+  "Audio max channels": "HW",
+  "JS heap limit": "HW",
+  "Fonts present": "SET",
+  "Fonts absent": "SET",
+  "Speech voice names": "SET",
+  "Speech voice count": "SET",
+  "Speech voice languages": "SET",
 };
 
 const SECTION_STABILITY: Record<string, Stability> = {
@@ -250,6 +316,30 @@ const SECTION_STABILITY: Record<string, Stability> = {
   "Display preferences": "SET",
   "Media format support": "OS",
   "API surface": "OS",
+  "Device model strings": "HW",
+  "Graphics detail": "HW",
+  "Rendering signatures": "OS",
+  "Audio stack": "HW",
+  Fonts: "SET",
+  "Codec detail": "HW",
+  "Installed voices": "SET",
+  "Real-time stack": "OS",
+  "Engine behaviour": "OS",
+  "Deep passive probes": "OS",
+};
+
+/**
+ * Passive groups the spec renders through a dedicated collapser instead of the
+ * plain key/value path. Everything *not* listed here flows through generically,
+ * so a newly-added collector cannot be silently dropped from the spec.
+ */
+const SPECIALLY_HANDLED_GROUPS: string[] = ["Media format support", "API surface"];
+
+/** Section heading for a passive group, where the spec prefers a shorter one. */
+const SECTION_TITLE: Record<string, string> = {
+  "Identity strings": "Identity",
+  "Locale, time and storage": "Locale, time, storage",
+  "Display preferences": "User settings",
 };
 
 function keyFor(label: string): string {
@@ -489,16 +579,11 @@ function buildSections(input: MimicSpecInput): BuiltSpec {
   const sections: SpecSection[] = [];
   const droppedAsCommon: string[] = [];
 
-  const plainGroups = ["Identity strings", "Hardware", "Graphics", "Network", "Power", "Locale, time and storage", "Display preferences"];
-  const titleFor: Record<string, string> = {
-    "Identity strings": "Identity",
-    Hardware: "Hardware",
-    Graphics: "Graphics",
-    Network: "Network",
-    Power: "Power",
-    "Locale, time and storage": "Locale, time, storage",
-    "Display preferences": "User settings",
-  };
+  // Derived from what was actually collected rather than a fixed list: a
+  // hardcoded roster silently drops any collector added later, which is the
+  // worst failure mode here — the data is gathered, the archive holds it, and
+  // only the spec quietly omits it.
+  const plainGroups = input.passive.map((g) => g.title).filter((title) => !SPECIALLY_HANDLED_GROUPS.includes(title));
 
   for (const groupTitle of plainGroups) {
     const rows = rowsOf(input.passive, groupTitle);
@@ -517,7 +602,7 @@ function buildSections(input: MimicSpecInput): BuiltSpec {
         deviates: common != null,
       });
     }
-    if (facts.length > 0) sections.push({ title: titleFor[groupTitle] ?? groupTitle, facts });
+    if (facts.length > 0) sections.push({ title: SECTION_TITLE[groupTitle] ?? groupTitle, facts });
   }
 
   // Codecs and API surface collapse to yes/no lists — 26 individual lines of
@@ -639,6 +724,8 @@ export function buildMimicSpec(input: MimicSpecInput): string {
     LEGEND,
     "",
   ];
+
+  if (input.briefChecklist) lines.push(input.briefChecklist, "");
 
   if (deviations.length > 0) {
     lines.push(

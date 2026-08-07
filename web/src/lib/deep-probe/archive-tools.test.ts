@@ -300,6 +300,9 @@ describe("buildMimicSpec", () => {
       stillPolicy: "",
       notes: [],
       aborted: false,
+      surface: [],
+      devicesBefore: [],
+      devicesAfter: [],
       rows: [
         {
           deviceId: "abcdef1234",

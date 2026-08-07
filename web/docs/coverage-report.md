@@ -247,11 +247,38 @@ count, minutes, photo count, archive size — before anything runs.
    - Coverage is explicitly a floor, not a ceiling: the permission surface differs per
      browser and grows every release, and the ledger says so rather than implying it
      asked for everything that exists.
-2. **Passive dump.** Everything readable with no prompt at all — identity strings,
-   hardware, GPU, network, power, locale, storage, display preferences, codec support,
-   API surface — plus `permissions.query` for every name any browser answers to.
-   Deliberately computes **no** uniqueness score: that would need a population this app
-   cannot see, so it would be a guess dressed as a measurement.
+2. **Passive dump.** Everything readable with no prompt at all, in two layers. The
+   one-line reads: identity strings, hardware, GPU, network, power, locale, storage,
+   display preferences, codec support, API surface, plus `permissions.query` for every
+   name any browser answers to. Then the reads that take real work, which is where most
+   of the prompt-free surface actually lives:
+   - **High-entropy client hints** — on Android these name the exact handset, the OS
+     version and the CPU architecture with no prompt of any kind. This is the single most
+     identifying prompt-free read on the platform.
+   - **Graphics detail** — the full driver parameter set, shader precision formats and the
+     **named** extension list (a count collapses a genuinely discriminating list into one
+     weak number), plus WebGPU adapter vendor/architecture/device, features and limits.
+   - **Rendering signatures** — canvas 2D, WebGL and audio-DSP hashes.
+   - **Audio stack** — output sample rate, base and output latency, channel count. No
+     permission is involved; this is not microphone access.
+   - **Fonts** — detected by measuring text width, which needs no permission at all. The
+     `local-fonts` prompt in tier 3 governs *enumerating* the whole list, not probing for
+     known names.
+   - **Hardware codec support** — `decodingInfo` reports which formats decode *in hardware*
+     rather than merely decoding, which tracks the chipset rather than the browser, plus
+     the `MediaRecorder` encoder set.
+   - **Installed speech voices**, a local **WebRTC offer's** codec and header-extension
+     list (never sent anywhere), and **engine behaviour**: clock resolution, `Math`
+     last-bit results, `Intl` formatting and collation, a `CSS.supports` battery, JS heap
+     limit, safe-area insets and a wider media-query set.
+
+   Two limits are stated in the file itself. **This is a floor, not a ceiling** — a reading
+   absent here may be absent from the platform, absent from this browser, or simply not yet
+   known to this app, and those three are not the same thing. And the rendering signatures
+   are hashes of *this app's own* test patterns: stable per device + browser + driver, which
+   is what makes them trackable, but comparable only to another Deep Probe run, never to a
+   third-party fingerprint database. Still **no uniqueness score**: that would need a
+   population this app cannot see, so it would be a guess dressed as a measurement.
 3. **Sensor recordings.** For each granted sensor, a real timed sample rather than a
    note that a grant exists: motion, orientation/compass, geolocation watched until the
    accuracy figure settles, microphone loudness (level only — no audio is retained), and
@@ -279,6 +306,50 @@ including undocumented entries, four checksums per file plus `md5sum`/`sha256sum
 digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session
 log and byte-identity data. Stopping early keeps everything gathered; the archive is
 named `…-PARTIAL.zip` and lists every omitted stage with its reason.
+
+**Two deeper parses per capture.** Beyond the friendly tag listing, each file gets:
+
+- **The encoder signature** (`raw/<slug>.encoder.txt`). All 64 quantisation coefficients
+  per table, printed both in reading order and in the file's own zig-zag order — these are
+  the compressor's own state rather than a metadata field, which makes them the strongest
+  fingerprint in the file and nearly the only part nobody thinks to edit. Plus Huffman
+  tables marked *standard Annex K* or *optimised*, chroma subsampling from the sampling
+  factors, baseline versus progressive, scan count, restart interval, APP segments in file
+  order (including whether an APP0/JFIF header exists at all), the embedded thumbnail
+  parsed as the complete second JPEG it is, a full ICC header parse, and any bytes after
+  EOI. The approximate libjpeg quality is **withheld** where the tables are not a scaled
+  Annex K table — Apple's camera encoder is exactly that case, and refusing to state a
+  number there is more informative than inventing one.
+- **The raw directory walk** (`raw/<slug>.ifd.txt`). Every EXIF entry as physically stored:
+  tag ID, TIFF type, component count, byte length, inline-or-offset, and the undecoded
+  value. Rationals stay as `num/den`, because `1/60` and `0.016667` are the same reading
+  and different bytes — a library that helpfully normalises them has destroyed the detail.
+  Also byte order, directory order, IFD1 presence, MakerNote length and signature,
+  `ColorSpace 65535` and `InteroperabilityIndex` as first-class fields, and the GPS block
+  with every Ref resolved. Undocumented tags appear with a null name rather than being
+  dropped.
+
+**The verbatim JS surface.** `camera/surface.json` holds `getSettings()`,
+`getCapabilities()` and `getConstraints()` exactly as the browser returned them — key order
+preserved, since the order itself is an engine trait — with track and stream IDs, the
+`<video>` element's dimensions, the measured open time and the `ImageCapture` photo
+interrogation. `camera/devices.json` carries three `enumerateDevices()` snapshots rather
+than two, because "before permission" and "before the sweep" are different moments.
+`camera/files.json` records each `File` object with `lastModified` as a raw epoch value, so
+the step between consecutive shots stays visible.
+
+**Third export — `correlation-brief.md`.** Item-by-item answers to a specific forensic
+request, each pointing at the file holding the evidence, with the reproduction commands
+written against this archive's own paths. It leads with the fact that changes how
+everything else should be read: **the target is different per capture path, and two of them
+are opposites.** A photo reaching a server through `getUserMedia` → canvas → `toBlob` has
+*no* EXIF — canvas destroys all of it — while one arriving through `<input type=file>` from
+the camera roll carries the full set. So rich camera EXIF on a canvas-path file makes it
+*more* detectable, not less: it is metadata no browser can produce. Statuses are four, not
+two — `captured`, `partial`, `not-run` (a gap in this observation) and `not-obtainable` (a
+limit of what a page can read) — because collapsing the last two would be the most useful
+lie such a document could tell. The same registry renders the compact answer key at the top
+of `device-spec.md`, so the summary cannot drift from the document.
 
 **Second export — `device-spec.md`.** A few pages instead of a few hundred megabytes,
 offered on its own and also written into the archive. It answers the narrower question

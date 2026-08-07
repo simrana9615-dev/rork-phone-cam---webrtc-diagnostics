@@ -172,6 +172,12 @@ export default function DeepProbe() {
   const passiveRef = useRef<PassiveGroup[]>([]);
   const statesBeforeRef = useRef<{ name: string; state: string | null }[]>([]);
   const statesAfterRef = useRef<{ name: string; state: string | null }[]>([]);
+  /**
+   * `enumerateDevices()` before a single permission has been requested. This is
+   * the only moment the genuinely pre-grant state is observable, so it is taken
+   * here rather than reconstructed later from the camera sweep's own snapshots.
+   */
+  const devicesBeforeRef = useRef<{ kind: string; deviceId: string; groupId: string; label: string }[]>([]);
   const omissionsRef = useRef<StageOmission[]>([]);
   const startedAtRef = useRef<string>("");
   const startedMsRef = useRef<number>(0);
@@ -285,6 +291,17 @@ export default function DeepProbe() {
     addLog("info", `Deep Probe started at the ${TIER_INFO[tier].label} scope.`);
     addLog("debug", "Reading everything available without a prompt first, so the passive baseline predates every request.");
     statesBeforeRef.current = await queryAllPermissions();
+    try {
+      const devices = (await navigator.mediaDevices?.enumerateDevices?.()) ?? [];
+      devicesBeforeRef.current = devices.map((d) => ({ kind: d.kind, deviceId: d.deviceId, groupId: d.groupId ?? "", label: d.label ?? "" }));
+      const named = devicesBeforeRef.current.filter((d) => d.label !== "").length;
+      addLog(
+        "debug",
+        `enumerateDevices() before any prompt: ${devicesBeforeRef.current.length} device(s), ${named} of them named. Blank labels here are the privacy rule working, not a fault.`
+      );
+    } catch {
+      devicesBeforeRef.current = [];
+    }
     passiveRef.current = await collectPassive();
     const total = passiveRef.current.reduce((sum, g) => sum + g.rows.length, 0);
     addLog("warn", `${total} facts were readable with no prompt, no indicator and no way to decline.`);
@@ -520,6 +537,8 @@ export default function DeepProbe() {
           width: shot.width,
           height: shot.height,
           fileName: null,
+          fileLastModified: null,
+          fileRelativePath: null,
           asked: `manual shot, ${step.zoom ? `zoom ${step.zoom}` : "default zoom"}`,
           granted: shot.granted + (shot.zoomNote ? ` · ${shot.zoomNote}` : ""),
           takenAt: new Date().toISOString(),
@@ -542,6 +561,8 @@ export default function DeepProbe() {
           width: 0,
           height: 0,
           fileName: result.file.name,
+          fileLastModified: result.file.lastModified,
+          fileRelativePath: result.file.webkitRelativePath ?? "",
           asked: `${step.spec.engine}, facing ${step.spec.facing}`,
           granted: `file "${result.file.name}", ${result.file.size.toLocaleString("en-US")} bytes, last modified ${new Date(result.file.lastModified).toISOString()}${result.changeIsTrusted === undefined ? "" : ` · change event trusted: ${result.changeIsTrusted}`}`,
           takenAt: new Date().toISOString(),
@@ -603,6 +624,7 @@ export default function DeepProbe() {
             logs: suspensionLogs(logs, suspensionsRef.current),
             omissions: omissionsRef.current,
             hexBudgetBytes: HEX_BUDGET,
+            devicesBeforePermission: devicesBeforeRef.current,
           },
           (message, done, total) => {
             setBuildMessage(message);

@@ -13,6 +13,8 @@
  * measurement.
  */
 
+import { collectDeepPassive } from "./passive-deep";
+
 export type PassiveGroup = {
   title: string;
   note: string;
@@ -263,6 +265,19 @@ export async function collectPassive(): Promise<PassiveGroup[]> {
     rows: apis,
   });
 
+  // The deeper reads — client hints, driver limits, rendering signatures, font
+  // metrics, hardware codec support, engine behaviour. Individually guarded, so
+  // a failure here degrades the dump rather than losing it.
+  try {
+    groups.push(...(await collectDeepPassive()));
+  } catch (err) {
+    groups.push({
+      title: "Deep passive probes",
+      note: "This group failed as a whole. It is recorded as a failed probe rather than dropped, because a missing section and an unsupported one must not look alike.",
+      rows: [{ label: "Status", value: `(threw: ${err instanceof Error ? err.name : "error"})` }],
+    });
+  }
+
   return groups;
 }
 
@@ -279,6 +294,16 @@ export function passiveText(groups: PassiveGroup[], permissionStates: { name: st
     "",
     "This app does not compute a uniqueness or fingerprint score. Any such number would depend on a",
     "population this app cannot see, so it would be a guess wearing the costume of a measurement.",
+    "",
+    "COVERAGE: this is a floor, not a ceiling. It is everything this app knows to ask for, which is not the",
+    "same as everything that exists. The readable surface differs between browsers and grows with every",
+    "release, so a reading absent here may be absent from the platform, absent from this browser, or simply",
+    "not yet known to this app — and those three are not the same thing. Nothing here should be read as a",
+    "complete inventory.",
+    "",
+    "The rendering signatures are hashes of THIS APP'S OWN test patterns. They are stable per device,",
+    "browser and driver, which is what makes them trackable, but they are comparable only to another Deep",
+    "Probe run — never to a third-party fingerprint database.",
     "",
   ];
   for (const group of groups) {

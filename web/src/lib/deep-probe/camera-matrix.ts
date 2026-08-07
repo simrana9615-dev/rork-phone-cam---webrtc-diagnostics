@@ -37,6 +37,14 @@ export type ProbeCapture = {
   height: number;
   /** Original file name, for the paths that supply one. */
   fileName: string | null;
+  /**
+   * `File.lastModified` exactly as delivered. Kept raw because the sequence
+   * across several shots in a row is the interesting part — how the number
+   * moves is a platform trait, and a formatted date would hide the step.
+   */
+  fileLastModified: number | null;
+  /** `File.webkitRelativePath`, which is empty on every path but a directory pick. */
+  fileRelativePath: string | null;
   /** What was asked for at this step, in words. */
   asked: string;
   /** What the track actually reported after the ask. */
@@ -63,6 +71,43 @@ export type MatrixRow = {
   captureSlugs: string[];
 };
 
+/**
+ * The objects a website actually receives from a live camera track, kept
+ * verbatim rather than summarised.
+ *
+ * Key order is preserved exactly as the browser produced it, because the order
+ * of keys in `getSettings()` is itself an engine trait — reserialising through a
+ * sorted structure would quietly destroy it. Nothing here is renamed,
+ * reformatted or rounded.
+ */
+export type CameraSurfaceRecord = {
+  deviceId: string;
+  deviceLabel: string;
+  /** How long getUserMedia took to resolve, in ms. */
+  openMs: number;
+  streamId: string;
+  trackId: string;
+  trackLabel: string;
+  trackKind: string;
+  trackReadyState: string;
+  trackMuted: boolean;
+  trackEnabled: boolean;
+  /** `track.getSettings()` as returned. */
+  settings: Record<string, unknown> | null;
+  /** `track.getCapabilities()` as returned, with its min/max ranges intact. */
+  capabilities: Record<string, unknown> | null;
+  /** `track.getConstraints()` after a typical request. */
+  constraints: Record<string, unknown> | null;
+  /** What a `<video>` element reads for this track. */
+  videoWidth: number | null;
+  videoHeight: number | null;
+  /** `ImageCapture.getPhotoCapabilities()`, when the class exists here. */
+  photoCapabilities: Record<string, unknown> | null;
+  photoSettings: Record<string, unknown> | null;
+  /** Stated when a reading could not be taken, so absence never reads as zero. */
+  notes: string[];
+};
+
 export type CameraMatrixReport = {
   startedAt: string;
   finishedAt: string;
@@ -74,6 +119,12 @@ export type CameraMatrixReport = {
   notes: string[];
   /** True when the user stopped the sweep before it finished. */
   aborted: boolean;
+  /** The verbatim JS-visible surface of each camera. */
+  surface: CameraSurfaceRecord[];
+  /** `enumerateDevices()` before the sweep opened anything, full IDs, untruncated. */
+  devicesBefore: { kind: string; deviceId: string; groupId: string; label: string }[];
+  /** The same call after the sweep, which is where labels and stable IDs appear. */
+  devicesAfter: { kind: string; deviceId: string; groupId: string; label: string }[];
 };
 
 export type MatrixProgress = (message: string, done: number, total: number) => void;
@@ -104,7 +155,11 @@ const STILL_POLICY =
   "A still was taken at the native maximum, at every landscape resolution rung, and at every aspect ratio — down BOTH available paths at each of those steps (the browser's own photo pipeline, and a frame this app encoded from the video track). Portrait variants, frame-rate steps and control-mode steps deliberately produce no still: they change how the track behaves, not what a photo of it looks like, and taking hundreds of near-identical frames would pad the archive without adding evidence. Rows with an empty capture list were never expected to have one.";
 
 type PhotoCaps = { imageWidth?: { max?: number }; imageHeight?: { max?: number } };
-type ImageCaptureLike = { takePhoto: (s?: { imageWidth?: number; imageHeight?: number }) => Promise<Blob>; getPhotoCapabilities: () => Promise<PhotoCaps> };
+type ImageCaptureLike = {
+  takePhoto: (s?: { imageWidth?: number; imageHeight?: number }) => Promise<Blob>;
+  getPhotoCapabilities: () => Promise<PhotoCaps>;
+  getPhotoSettings?: () => Promise<Record<string, unknown>>;
+};
 type ImageCaptureCtor = new (track: MediaStreamTrack) => ImageCaptureLike;
 
 function imageCaptureCtor(): ImageCaptureCtor | null {
@@ -136,6 +191,85 @@ function plainSettings(s: MediaTrackSettings | null): Record<string, unknown> | 
   } catch {
     return null;
   }
+}
+
+/**
+ * Copies a browser-produced object without touching key order or values.
+ *
+ * `getCapabilities()` returns nested `{min, max}` ranges that a naive spread
+ * would flatten, so this goes through a structured clone of the whole object.
+ */
+function verbatim(value: unknown): Record<string, unknown> | null {
+  if (value == null || typeof value !== "object") return null;
+  try {
+    return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads the whole JS-visible surface of one open track. */
+async function readSurface(
+  device: CameraDeviceInfo,
+  name: string,
+  stream: MediaStream,
+  track: MediaStreamTrack,
+  openMs: number,
+  videoDims: { width: number; height: number } | null
+): Promise<CameraSurfaceRecord> {
+  const notes: string[] = [];
+  let capabilities: Record<string, unknown> | null = null;
+  try {
+    capabilities = track.getCapabilities ? verbatim(track.getCapabilities()) : null;
+    if (!track.getCapabilities) notes.push("track.getCapabilities is not implemented in this browser, so no capability ranges could be read. This is an absence, not an empty range.");
+  } catch (err) {
+    notes.push(`track.getCapabilities() threw: ${errorName(err)}`);
+  }
+  let constraints: Record<string, unknown> | null = null;
+  try {
+    constraints = track.getConstraints ? verbatim(track.getConstraints()) : null;
+  } catch (err) {
+    notes.push(`track.getConstraints() threw: ${errorName(err)}`);
+  }
+
+  let photoCapabilities: Record<string, unknown> | null = null;
+  let photoSettings: Record<string, unknown> | null = null;
+  const Ctor = imageCaptureCtor();
+  if (!Ctor) {
+    notes.push("ImageCapture does not exist in this browser, so no photo capabilities were readable. Safari on iOS is in this position.");
+  } else {
+    try {
+      const capture = new Ctor(track);
+      photoCapabilities = verbatim(await capture.getPhotoCapabilities());
+      if (capture.getPhotoSettings) photoSettings = verbatim(await capture.getPhotoSettings());
+      else notes.push("ImageCapture exists but getPhotoSettings is not implemented on it.");
+    } catch (err) {
+      notes.push(`ImageCapture photo interrogation threw: ${errorName(err)}`);
+    }
+  }
+
+  if (!videoDims) notes.push("No <video> element could be attached, so videoWidth/videoHeight were not read.");
+
+  return {
+    deviceId: device.deviceId,
+    deviceLabel: name,
+    openMs: Math.round(openMs),
+    streamId: stream.id,
+    trackId: track.id,
+    trackLabel: track.label,
+    trackKind: track.kind,
+    trackReadyState: track.readyState,
+    trackMuted: track.muted,
+    trackEnabled: track.enabled,
+    settings: verbatim(track.getSettings?.() ?? null),
+    capabilities,
+    constraints,
+    videoWidth: videoDims?.width ?? null,
+    videoHeight: videoDims?.height ?? null,
+    photoCapabilities,
+    photoSettings,
+    notes,
+  };
 }
 
 function stop(stream: MediaStream | null): void {
@@ -354,10 +488,14 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   let aborted = false;
   let counter = 0;
 
+  const surface: CameraSurfaceRecord[] = [];
+  let devicesBefore: { kind: string; deviceId: string; groupId: string; label: string }[] = [];
+  let devicesAfter: { kind: string; deviceId: string; groupId: string; label: string }[] = [];
+
   if (!navigator.mediaDevices?.getUserMedia) {
     notes.push("This browser exposes no navigator.mediaDevices, so no camera could be opened. Nothing below is a refusal — the API is simply absent.");
     return {
-      report: { startedAt, finishedAt: new Date().toISOString(), durationMs: 0, inventory: [], rows, stillPolicy: STILL_POLICY, notes, aborted },
+      report: { startedAt, finishedAt: new Date().toISOString(), durationMs: 0, inventory: [], rows, stillPolicy: STILL_POLICY, notes, aborted, surface, devicesBefore, devicesAfter },
       captures,
     };
   }
@@ -365,6 +503,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   let inventory: CameraDeviceInfo[] = [];
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
+    // Full IDs, every kind, untruncated: a shortened deviceId cannot be compared
+    // against anything, and audio inputs share a groupId with their camera.
+    devicesBefore = devices.map((d) => ({ kind: d.kind, deviceId: d.deviceId, groupId: d.groupId ?? "", label: d.label ?? "" }));
     inventory = devices
       .filter((d) => d.kind === "videoinput")
       .map((d) => ({ deviceId: d.deviceId, groupId: d.groupId ?? "", label: d.label ?? "", ...classifyCameraLabel(d.label ?? "") }));
@@ -441,8 +582,10 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       }
 
       const captureSlugs: string[] = [];
+      let videoDims: { width: number; height: number } | null = null;
       if (step.takeStills && track) {
         const video = await attachVideo(stream);
+        if (video) videoDims = { width: video.videoWidth, height: video.videoHeight };
 
         const platform = await platformStill(track);
         if (platform) {
@@ -459,6 +602,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             width: platform.width,
             height: platform.height,
             fileName: null,
+            fileLastModified: null,
+            fileRelativePath: null,
             asked: step.asked,
             granted: settingsText(settings),
             takenAt: new Date().toISOString(),
@@ -483,6 +628,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
               width: drawn.width,
               height: drawn.height,
               fileName: null,
+              fileLastModified: null,
+              fileRelativePath: null,
               asked: step.asked,
               granted: settingsText(settings),
               takenAt: new Date().toISOString(),
@@ -508,6 +655,16 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         durationMs: Math.round(performance.now() - stepStart),
         captureSlugs,
       });
+
+      // Read the verbatim JS surface once per camera, on the track that is
+      // already open, so this costs no extra prompt and no extra camera cycle.
+      if (step.kind === "native-max" && track) {
+        try {
+          surface.push(await readSurface(device, name, stream, track, performance.now() - stepStart, videoDims));
+        } catch (err) {
+          notes.push(`${name}: the JS surface could not be read (${errorName(err)}).`);
+        }
+      }
       stop(stream);
     }
 
@@ -597,6 +754,13 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
 
   if (aborted) notes.push("You stopped the sweep before it finished. Every row above really ran; the rows that never ran are simply absent, and the archive is marked partial.");
 
+  try {
+    const after = await navigator.mediaDevices.enumerateDevices();
+    devicesAfter = after.map((d) => ({ kind: d.kind, deviceId: d.deviceId, groupId: d.groupId ?? "", label: d.label ?? "" }));
+  } catch (err) {
+    notes.push(`The closing enumerateDevices() call failed: ${errorName(err)}`);
+  }
+
   return {
     report: {
       startedAt,
@@ -607,6 +771,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       stillPolicy: STILL_POLICY,
       notes,
       aborted,
+      surface,
+      devicesBefore,
+      devicesAfter,
     },
     captures,
   };
