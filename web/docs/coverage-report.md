@@ -293,10 +293,10 @@ count, minutes, photo count, archive size — before anything runs.
    **Rejections are results**, exactly as in §4. Stills are taken at a declared subset of
    steps and `stillPolicy` states which, so an empty capture list reads as designed. The
    torch is always left off.
-5. **Manual shots.** Every named camera in a pinned viewfinder plus three zoom steps
-   each (resolved against that camera's own reported range, not a hardcoded factor), then
-   both facings through all three camera-app handoffs — the only path that yields real
-   camera EXIF. A camera with no zoom control produces a clearly-recorded unzoomed shot
+5. **Manual shots.** Two library picks, then every named camera in a pinned viewfinder plus
+   three zoom steps each (resolved against that camera's own reported range, not a hardcoded
+   factor), then both facings through all three camera-app handoffs — the paths that yield
+   real camera EXIF. A camera with no zoom control produces a clearly-recorded unzoomed shot
    rather than a fake one. Skips are recorded as skips.
 
 **Export:** one raw dump ZIP (layout in `architecture.md` §6b) with the untouched
@@ -446,6 +446,25 @@ levels and a thousand iterations of that clamp is four seconds on its own). And 
 work is gone: the encoder parse, the IFD walk and the tag dump share one read of the bytes instead
 of three, carved segments are lazy `Blob.slice` views the writer reads once each, and the
 byte-identity re-check streams rather than materialising the archive a second time.
+
+**The one gap that mattered.** The brief opens by stating that a canvas-path photo carries no
+EXIF while a file-input photo carries the full tag set — and the run had abundant evidence for the
+first half and none for the second. A library pick was the single `NOT RUN` item, excluded on the
+principle that a pick cannot promise a fresh photo. True of a pick dressed up as a camera handoff;
+irrelevant to one asked for as what it is. The manual stage now leads with two library picks,
+filed as library files and never as camera output, and the page no longer stamps every manual shot
+as a camera file — the shot itself decides, so a picker cannot inherit a camera's label by sharing
+a code path.
+
+The two picks differ only in what they say they accept, and that difference is the measurement:
+iOS converts HEIC to JPEG for an input asking for `image/*` and hands over the stored bytes to one
+that names HEIC. Asking twice for the same photo tells apart a library that genuinely holds JPEG
+from one holding HEIC that ordinary upload forms never see. What the run refuses to do is cash
+that in: the Photos storage setting is still reported as an inference, because it is never exposed
+to a web page and one photo's format is not a device-wide setting; the untouched-original item
+stays not-obtainable, because an unconverted HEIC is the nearest approximation and proves nothing
+about what happened before the library. Only the location question moved — a GPS directory in a
+picked photo answers it exactly as well as a camera file does.
 
 **The options nobody could see.** A report of "I can't see the deep probe various final options"
 turned out to be exactly literal, and the export screen was not the problem — three routes never

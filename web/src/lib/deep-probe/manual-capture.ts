@@ -13,6 +13,22 @@
  * that differ in name, timestamp and even encoder. Each returned file is
  * declared `camera-file` only where the engine really does open the camera app;
  * picker-based engines are never allowed to claim that.
+ *
+ * The stage also takes two LIBRARY picks, which are the opposite kind of
+ * evidence and are filed as such. A pick cannot promise a fresh photo, so it is
+ * never offered as one — but it is the only way to see what an ordinary upload
+ * form receives from the photo library, and the brief's central comparison
+ * (canvas path = no EXIF, file path = the full tag set) has no second half
+ * without it.
+ *
+ * The two picks differ only in their `accept` attribute, and that difference is
+ * the measurement. iOS transcodes HEIC to JPEG for an input that asks for
+ * `image/*`, and hands over the stored bytes to one that names HEIC explicitly.
+ * Asking twice for the same photo shows whether this device does that, which is
+ * the only direct evidence available for the Photos storage setting — and it
+ * separates "the library holds JPEG" from "the library holds HEIC and the
+ * browser converted it on the way in", two situations that look identical from
+ * a single upload.
  */
 
 import { CaptureCancelledError, capacitorCapturePhoto, inputAcceptAttr, inputCaptureAttr, type CaptureEngine } from "../capture-engine";
@@ -23,12 +39,23 @@ export type ManualShotSpec = {
   /** What the shot is for — shown before the camera opens. */
   purpose: string;
   engine: CaptureEngine;
-  facing: "user" | "environment";
+  /** Null on the library picks, where a facing would be a fiction. */
+  facing: "user" | "environment" | null;
+  /**
+   * Where the file comes from. `camera-app` hands off to the OS camera and the
+   * file is fresh; `library` opens the picker and the file is whatever was
+   * already stored. The two are never filed as each other.
+   */
+  source: "camera-app" | "library";
+  /** Overrides the engine's default accept attribute. The library picks rely on this. */
+  accept?: string;
 };
 
 export type ManualShotResult = {
   file: File;
   origin: PackOrigin;
+  /** The declared production path, decided by the spec rather than by the caller. */
+  path: "camera-file" | "picker-file";
   /** Whether the change event carried browser trust. Undefined = not observable on this path. */
   changeIsTrusted?: boolean;
   engine: CaptureEngine;
@@ -48,12 +75,16 @@ export const CAMERA_APP_ENGINES: CaptureEngine[] = ["native-camera", "capture-bo
  * file it returns. The change event's trust flag is captured at event time
  * rather than reconstructed afterwards.
  */
-function fileInputCapture(engine: CaptureEngine, facing: "user" | "environment"): Promise<ManualShotResult> {
+function fileInputCapture(spec: ManualShotSpec): Promise<ManualShotResult> {
+  const { engine, facing, source } = spec;
   return new Promise((resolve, reject) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = inputAcceptAttr(engine);
-    const capture = inputCaptureAttr(engine, facing);
+    input.accept = spec.accept ?? inputAcceptAttr(engine);
+    // A library pick must never carry a capture attribute: that attribute is
+    // what turns the picker into a camera, and this shot is asking for the
+    // opposite of a fresh photo.
+    const capture = source === "camera-app" && facing != null ? inputCaptureAttr(engine, facing) : undefined;
     if (capture === true) input.setAttribute("capture", "");
     else if (typeof capture === "string") input.setAttribute("capture", capture);
     input.style.cssText = "position:fixed;left:-9999px;width:1px;height:1px;opacity:0";
@@ -72,7 +103,13 @@ function fileInputCapture(engine: CaptureEngine, facing: "user" | "environment")
       settled = true;
       const trusted = ev.isTrusted === true;
       cleanup();
-      resolve({ file, origin: "camera-file", changeIsTrusted: trusted, engine });
+      resolve({
+        file,
+        origin: source === "camera-app" ? "camera-file" : "supplied-file",
+        path: source === "camera-app" ? "camera-file" : "picker-file",
+        changeIsTrusted: trusted,
+        engine,
+      });
     };
 
     // Returning to the page with no file means the camera was closed empty.
@@ -98,21 +135,51 @@ function fileInputCapture(engine: CaptureEngine, facing: "user" | "environment")
 
 /** Runs one manual shot through whichever engine the spec names. */
 export async function runManualShot(spec: ManualShotSpec): Promise<ManualShotResult> {
-  if (spec.engine === "capacitor") {
-    const result = await capacitorCapturePhoto(spec.facing);
+  if (spec.engine === "capacitor" && spec.source === "camera-app") {
+    const result = await capacitorCapturePhoto(spec.facing ?? "environment");
     return {
       file: result.file,
       origin: "camera-file",
+      path: "camera-file",
       changeIsTrusted: result.changeIsTrusted,
       engine: spec.engine,
     };
   }
-  return fileInputCapture(spec.engine, spec.facing);
+  return fileInputCapture(spec);
 }
+
+/**
+ * The two library picks. Same request, different `accept` — the first is what
+ * an ordinary upload form asks for, the second names HEIC so the device has no
+ * reason to convert. Picking the same photo twice is what makes the pair
+ * readable, so the wording asks for exactly that.
+ */
+export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
+  {
+    id: "library-plain",
+    engine: "system-picker",
+    facing: null,
+    source: "library",
+    accept: "image/*",
+    purpose:
+      "Pick any existing photo from your library — one taken by this phone's camera app, ideally a recent one. This is the plain upload path every website uses, and unlike the sweep's frames the file arrives with whatever metadata the camera originally wrote. Nothing about it is treated as a fresh photo: it is filed as a library pick, because that is all it can be.",
+  },
+  {
+    id: "library-original",
+    engine: "system-picker",
+    facing: null,
+    source: "library",
+    accept: "image/*,image/heic,image/heif,.heic,.heif",
+    purpose:
+      "Now pick the SAME photo again. The only difference is that this request names HEIC, so the phone has no reason to convert it on the way in. If the first file came back JPEG and this one comes back HEIC, you have just watched the browser transcode your photo — which is the one honest way to tell whether the library really holds JPEG or holds HEIC and hides it from ordinary upload forms.",
+  },
+];
 
 /** Builds the full manual shot list for the run: both facings through every camera-app handoff. */
 export function buildManualShotList(): ManualShotSpec[] {
-  const shots: ManualShotSpec[] = [];
+  // Library picks lead: they need no camera, no permission and no good light,
+  // and they close the one requested item that nothing else in the run can.
+  const shots: ManualShotSpec[] = [...LIBRARY_PICK_SHOTS];
   const engineName: Record<string, string> = {
     "native-camera": "the direct capture attribute",
     "capture-boolean": "the bare boolean capture attribute",
@@ -124,6 +191,7 @@ export function buildManualShotList(): ManualShotSpec[] {
         id: `${engine}-${facing}`,
         engine,
         facing,
+        source: "camera-app",
         purpose: `${facing === "environment" ? "Back" : "Front"} camera via ${engineName[engine] ?? engine}. This one goes through the phone's own camera app, so the file should come back with real camera metadata attached — that is the whole point of taking it by hand.`,
       });
     }

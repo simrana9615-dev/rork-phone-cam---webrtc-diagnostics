@@ -9,6 +9,7 @@ import {
   Download,
   Fingerprint,
   Hand,
+  Images,
   Loader2,
   Minus,
   FileCode,
@@ -142,7 +143,7 @@ function levelFor(outcome: PermissionOutcome): LogLevel {
 
 type ManualStep = {
   id: string;
-  kind: "viewfinder" | "camera-app";
+  kind: "viewfinder" | "camera-app" | "library";
   title: string;
   purpose: string;
   deviceId: string | null;
@@ -701,7 +702,9 @@ export default function DeepProbe() {
         addLog("success", `${step.title}: ${shot.width}×${shot.height}, ${formatBytes(shot.blob.size)} via ${shot.path === "image-capture" ? "the platform photo pipeline" : "a canvas encode by this app"}.`);
         if (shot.zoomNote) addLog("debug", shot.zoomNote);
       } else if (step.spec) {
-        const result = await runManualShot(step.spec);
+        const spec = step.spec;
+        const result = await runManualShot(spec);
+        const isLibrary = result.path === "picker-file";
         const capture: ProbeCapture = {
           slug: `manual-${String(manualIndex + 1).padStart(2, "0")}-${step.id}`,
           label: step.title,
@@ -709,20 +712,27 @@ export default function DeepProbe() {
           origin: result.origin,
           stage: "manual",
           deviceLabel: null,
-          path: "camera-file",
+          path: result.path,
           width: 0,
           height: 0,
           fileName: result.file.name,
           fileLastModified: result.file.lastModified,
           fileRelativePath: result.file.webkitRelativePath ?? "",
-          asked: `${step.spec.engine}, facing ${step.spec.facing}`,
-          granted: `file "${result.file.name}", ${result.file.size.toLocaleString("en-US")} bytes, last modified ${new Date(result.file.lastModified).toISOString()}${result.changeIsTrusted === undefined ? "" : ` · change event trusted: ${result.changeIsTrusted}`}`,
+          asked: isLibrary
+            ? `${spec.engine}, no capture attribute, accept="${spec.accept ?? "image/*"}" — a library pick, not a fresh photo`
+            : `${spec.engine}, facing ${spec.facing ?? "unspecified"}`,
+          granted: `file "${result.file.name}", type "${result.file.type || "(none declared)"}", ${result.file.size.toLocaleString("en-US")} bytes, last modified ${new Date(result.file.lastModified).toISOString()}${result.changeIsTrusted === undefined ? "" : ` · change event trusted: ${result.changeIsTrusted}`}`,
           takenAt: new Date().toISOString(),
         };
         capturesRef.current.push(capture);
         setPhotoCount(capturesRef.current.length);
         setByteCount((b) => b + result.file.size);
-        addLog("success", `${step.title}: "${result.file.name}", ${formatBytes(result.file.size)} — a real camera file, so it should carry the camera's own metadata.`);
+        addLog(
+          "success",
+          isLibrary
+            ? `${step.title}: "${result.file.name}", type "${result.file.type || "none declared"}", ${formatBytes(result.file.size)}. Filed as a library pick — the metadata is whatever was already on it, and nothing here treats it as a photo taken just now.`
+            : `${step.title}: "${result.file.name}", ${formatBytes(result.file.size)} — a real camera file, so it should carry the camera's own metadata.`
+        );
       }
     } catch (err) {
       if (err instanceof CaptureCancelledError) {
@@ -1205,8 +1215,14 @@ export default function DeepProbe() {
                     className="h-12 bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400"
                     onClick={() => void takeManual()}
                   >
-                    {manualBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="mr-1.5 h-4 w-4" />}
-                    {manualBusy ? "" : "Take it"}
+                    {manualBusy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : manualStep.kind === "library" ? (
+                      <Images className="mr-1.5 h-4 w-4" />
+                    ) : (
+                      <Camera className="mr-1.5 h-4 w-4" />
+                    )}
+                    {manualBusy ? "" : manualStep.kind === "library" ? "Pick one" : "Take it"}
                   </Button>
                   <Button variant="outline" disabled={manualBusy || paused} className="h-12" onClick={skipManual}>
                     Skip
@@ -1454,13 +1470,16 @@ function buildManualSteps(inventory: CameraDeviceInfo[]): ManualStep[] {
     }
   }
   for (const spec of buildManualShotList()) {
+    const isLibrary = spec.source === "library";
     steps.push({
       id: spec.id,
-      kind: "camera-app",
-      title: `Camera app — ${spec.facing === "environment" ? "back" : "front"} via ${spec.engine}`,
+      kind: isLibrary ? "library" : "camera-app",
+      title: isLibrary
+        ? `Photo library — ${spec.id === "library-original" ? "the same photo, asking for the original bytes" : "an ordinary upload"}`
+        : `Camera app — ${spec.facing === "environment" ? "back" : "front"} via ${spec.engine}`,
       purpose: spec.purpose,
       deviceId: null,
-      deviceLabel: "the phone's own camera app",
+      deviceLabel: isLibrary ? "the photo library" : "the phone's own camera app",
       zoom: null,
       spec,
     });

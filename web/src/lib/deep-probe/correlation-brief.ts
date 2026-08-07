@@ -95,6 +95,54 @@ function byPath(captures: BriefCapture[], path: BriefCapture["path"]): BriefCapt
   return captures.filter((c) => c.path === path);
 }
 
+/**
+ * The stored image family, from the declared type first and the file extension
+ * second. Deliberately coarse: the only distinction that carries meaning here is
+ * HEIC versus JPEG, and a finer reading would invite conclusions the evidence
+ * does not support.
+ */
+export function imageFamily(capture: Pick<BriefCapture, "mime" | "fileName">): "heic" | "jpeg" | "png" | "other" {
+  const probe = `${capture.mime} ${capture.fileName ?? ""}`.toLowerCase();
+  if (/hei[cf]/.test(probe)) return "heic";
+  if (/jpe?g/.test(probe)) return "jpeg";
+  if (/png/.test(probe)) return "png";
+  return "other";
+}
+
+/** One capture described the way a requester needs it: name, declared type, size. */
+function describeFile(capture: BriefCapture): string {
+  const tags = capture.ifd?.found === true ? `${capture.ifd.blocks.reduce((n, b) => n + b.entries.length, 0)} EXIF tag(s)` : "no EXIF directory";
+  return `"${capture.fileName ?? "(unnamed)"}" · declared type ${capture.mime || "(none)"} · ${capture.bytes.toLocaleString("en-US")} bytes · ${tags}`;
+}
+
+/**
+ * What the two library picks show when read against each other. Both are needed
+ * for the comparison to mean anything, and where one is missing that is said
+ * rather than worked around.
+ */
+function transcodeNote(plain: BriefCapture | null, original: BriefCapture | null): string {
+  if (plain == null || original == null) {
+    return "Only one of the two picks completed, so the pair cannot be read against each other and no conversion claim is made either way.";
+  }
+  const a = imageFamily(plain);
+  const b = imageFamily(original);
+  if (a === b) {
+    return `Both requests received ${a.toUpperCase()}, so nothing converted on the way in — on the assumption the same photo was picked twice, which this app cannot verify.`;
+  }
+  return `The two requests received different formats — ${a.toUpperCase()} for the plain one, ${b.toUpperCase()} where HEIC was named — which is a conversion performed by the browser during upload, observed directly rather than assumed. If the same photo was picked both times, the plain file is not the stored file.`;
+}
+
+/** The 0.9 inference, stated at the strength the evidence actually supports. */
+function transcodeVerdict(plain: BriefCapture | null, original: BriefCapture | null, heicSeen: boolean): string {
+  if (plain != null && original != null && imageFamily(plain) !== imageFamily(original)) {
+    return `The two library picks came back in different formats, which is a browser-side conversion caught in the act. Where the HEIC-accepting request received HEIC, the library is holding HEIC — the High Efficiency setting — and every ordinary upload form on this device would have seen JPEG and concluded the opposite. That is the confound this pair exists to expose; it is still an inference about one photo, not a reading of the setting.`;
+  }
+  if (heicSeen) {
+    return "HEIC reached this page uncoverted, which the camera writes only under High Efficiency. It remains an inference about the photos seen here: a file received from another device would look the same.";
+  }
+  return "No HEIC arrived. That is consistent with Most Compatible, and equally consistent with High Efficiency plus a transcode on every path tried — the two cannot be told apart from what this run holds, so neither is asserted.";
+}
+
 /** iOS version as the user-agent states it. There is no better source on Safari. */
 function iosVersionFrom(ua: string | null): string | null {
   if (!ua) return null;
@@ -144,14 +192,19 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
   const canvas = byPath(input.captures, "canvas");
   const platform = byPath(input.captures, "image-capture");
   const ua = passiveValue(input.passive, "User agent");
+  /** Every capture that arrived as a real file rather than as something this app drew. */
+  const fileCaptures = [...cameraFiles, ...pickerFiles];
+  const pickPlain = pickerFiles.find((c) => c.slug.includes("library-plain")) ?? null;
+  const pickOriginal = pickerFiles.find((c) => c.slug.includes("library-original")) ?? null;
 
   items.push({
     section: "0.1",
     ask: "Native Camera app photo → AirDrop/Files, as an untouched reference",
     status: "not-obtainable",
     answer:
-      "A web page cannot produce this. Every file a browser can reach has already passed through a browser input, which is the exact transform the reference is meant to exclude. It has to be sideloaded by hand — AirDrop the original to a Mac and dump it there. Nothing in this archive should be treated as a substitute, and none of the files here claims to be one.",
-    where: "",
+      "A web page cannot produce this, and no file in this archive claims to be one. What the run does hold is the nearest lawful approximation, and its limits are worth stating precisely: the library pick made with HEIC named in the accept attribute receives the stored bytes with no conversion asked for, so where that file came back as HEIC it is the camera's own file rather than anything this page made. That is still not the requested reference — it proves nothing about what happened to the photo between the shutter and the library, and a device that transcodes regardless would look identical. For a true untouched original, AirDrop it to a Mac and dump it there." +
+      (pickerFiles.length > 0 ? "" : " No library pick happened in this run, so even the approximation is absent."),
+    where: pickerFiles.length > 0 ? pickerFiles.map((c) => c.archivePath).join(", ") : "",
   });
   items.push({
     section: "0.2",
@@ -159,8 +212,8 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
     status: pickerFiles.length > 0 ? "captured" : "not-run",
     answer:
       pickerFiles.length > 0
-        ? `${pickerFiles.length} file(s) on this path. This is the library-pick path, so the bytes are whatever Photos handed over — this app cannot know what happened to them beforehand and does not guess.`
-        : "No library pick happened in this run. The manual stage offers the camera-app handoffs; a plain library pick was not among them.",
+        ? `${pickerFiles.length} file(s) on this path, taken twice on purpose: once with the plain \`accept="image/*"\` an ordinary upload form uses, and once with HEIC named explicitly so the device has no reason to convert. ${pickerFiles.map(describeFile).join(" — ")}. ${transcodeNote(pickPlain, pickOriginal)} The bytes are whatever the library handed over: this app cannot know what happened to them before that and does not guess, and nothing on this path is treated as a fresh photo.`
+        : "The manual stage offers two library picks and neither was completed — skipped, or the stage was not reached. This is the gap that matters most in this run: it is the only path here that shows what an ordinary upload form receives from the photo library, and without it the comparison at the top of this document has evidence for one side only.",
     where: pickerFiles.map((c) => c.archivePath).join(", "),
   });
   items.push({
@@ -237,16 +290,16 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
     where: "environment/passive-dump.txt · device-spec.md",
   });
 
-  const heicSeen = input.captures.some((c) => /heic|heif/i.test(c.mime) || /\.heic$/i.test(c.fileName ?? ""));
-  const jpegFromCamera = cameraFiles.some((c) => /jpe?g/i.test(c.mime) || /\.jpe?g$/i.test(c.fileName ?? ""));
+  const heicSeen = fileCaptures.some((c) => imageFamily(c) === "heic");
+  const jpegSeen = fileCaptures.some((c) => imageFamily(c) === "jpeg");
   items.push({
     section: "0.9",
     ask: 'Photos setting: "Most Compatible" vs "High Efficiency"',
-    status: cameraFiles.length > 0 ? "partial" : "not-run",
+    status: fileCaptures.length === 0 ? "not-run" : "partial",
     answer:
-      cameraFiles.length === 0
-        ? "No camera-app file was obtained, so there is nothing to infer from."
-        : `Not a readable setting — only an inference from what came back, and a confounded one. This run received ${heicSeen ? "at least one HEIC/HEIF file, which points to High Efficiency" : jpegFromCamera ? "JPEG only, which points to Most Compatible" : "no clearly-typed image file"}. The confound: Safari transcodes HEIC to JPEG on some upload paths, so JPEG arriving is consistent with High Efficiency plus a transcode. The file types are listed verbatim rather than resolved into a setting.`,
+      fileCaptures.length === 0
+        ? "No file arrived from either the camera app or the library, so there is nothing to infer from."
+        : `Not a readable setting — it is never exposed to a web page — so this stays an inference, and it is reported as one. What this run received: ${heicSeen ? "at least one HEIC/HEIF file" : jpegSeen ? "JPEG only" : "no clearly-typed image file"}. ${transcodeVerdict(pickPlain, pickOriginal, heicSeen)} File types are listed verbatim in the manifest rather than resolved into a setting, because one photo's format is not a device-wide setting and this run cannot see the setting itself.`,
     where: "MANIFEST.txt · raw/*.structure.txt",
   });
 
@@ -254,10 +307,10 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
   items.push({
     section: "0.10",
     ask: "Whether Location was on for Camera",
-    status: cameraFiles.length > 0 ? (withGps.length > 0 ? "captured" : "partial") : "not-run",
+    status: fileCaptures.length > 0 ? (withGps.length > 0 ? "captured" : "partial") : "not-run",
     answer:
-      cameraFiles.length === 0
-        ? "No camera-app file was obtained."
+      fileCaptures.length === 0
+        ? "No file arrived from either the camera app or the library, so no GPS directory could be looked for."
         : withGps.length > 0
           ? `A GPS directory is present in ${withGps.length} capture(s), so location was on for the camera when those were taken. Every sub-tag is listed with its reference tag.`
           : "No GPS directory in any capture. That single observation is produced by three different situations — location off for the camera, location on but withheld, or the block stripped in transit — and they cannot be told apart from the file. No conclusion is drawn.",

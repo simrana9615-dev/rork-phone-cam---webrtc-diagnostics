@@ -119,8 +119,11 @@ belonging to other apps).
    load warning explicitly labelled as load, not temperature. The byte counter is the
    *smaller* of this stage's two memory costs — see §6b.2 — so the sweep enforces its own
    ceiling rather than trusting what is on screen.
-4. **Manual shots** — every named camera in the pinned viewfinder plus three zoom steps each,
-   then both facings through all three camera-app handoffs.
+4. **Manual shots** — two library picks first, then every named camera in the pinned viewfinder
+   plus three zoom steps each, then both facings through all three camera-app handoffs. The
+   picks lead because they need no camera, no permission and no good light, and they are the
+   only evidence in the run for what an ordinary upload form receives from the photo library
+   (§6b.5). They are filed as `picker-file` and never as camera output.
 5. **Exports** — the four tick boxes of `lib/deep-probe/export-choice.ts`, the archive **off**
    by default (§6b.3), arriving pre-filled from the dashboard card and the setup screen. Kept
    here as the last checkpoint rather than the first sighting, because with the archive
@@ -214,7 +217,7 @@ renders the read-only session summary.
 | `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
 | `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
 | `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
-| `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time. Picker-only engines are excluded — they cannot promise a fresh photo, so asking for one here would mislead |
+| `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time, plus the two library picks. A pick still cannot promise a fresh photo, so it is never offered as one — it is asked for explicitly as a library file and filed as `picker-file`. The pair differs only in `accept`, which is the measurement (§6b.5) |
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
 | `deep-probe/hex-budget.ts` | How much of a run may be rendered as hex and why. Holds the 4.94-characters-per-byte constant measured against `hexLines` itself, the device-derived total allowance, the equal per-capture share with its floor and ceiling, the heap-pressure threshold, and the policy statement written into the archive. Pure and fully unit-tested, because getting this number wrong does not degrade the archive — it destroys the run |
@@ -375,6 +378,38 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.5 The library pick — the missing half of the central comparison
+
+The correlation brief opens with one claim above all others: a photo reaching a server through
+`getUserMedia` → canvas → `toBlob` has **no EXIF at all**, while one arriving through
+`<input type=file>` carries the full tag set. The run had rich evidence for the first half — every
+sweep frame is a canvas encode — and, for the library half, nothing. Item 0.2 was the run's only
+`NOT RUN`, and it was the one the headline rested on.
+
+It was excluded on principle rather than by oversight: `manual-capture.ts` refused picker engines
+because a pick cannot promise a fresh photo. That reasoning holds for a shot *presented* as a
+camera handoff, and not at all for a shot asked for as what it is. The picks are now taken
+explicitly as library files, resolve with `origin: "supplied-file"` and `path: "picker-file"`, and
+the page no longer hardcodes `camera-file` for everything in the manual stage — the spec decides
+the path, so a picker can never inherit a camera's label by being routed through the same branch.
+A library spec also carries `facing: null`, because a facing on a picked file would be a fiction.
+
+There are two picks, and they differ only in the `accept` attribute — which is the measurement,
+not a detail. iOS transcodes HEIC to JPEG for an input asking for `image/*`, and hands over the
+stored bytes to one that names HEIC explicitly. Asking twice for the same photo separates two
+situations that are indistinguishable from a single upload: a library that really holds JPEG, and
+a library holding HEIC with the browser converting on the way in. Where the two come back in
+different formats the archive reports a browser-side conversion *observed*, not inferred.
+
+What this deliberately does not do is promote the conclusion. Item 0.9 ("Most Compatible" vs
+"High Efficiency") stays `partial` even when the transcode is caught in the act, because the
+setting is never exposed to a web page and one photo's format is not a device-wide setting. Item
+0.1 stays `not-obtainable` even when an untranscoded HEIC is in hand: it is the nearest lawful
+approximation and is described as one, since it proves nothing about what happened between the
+shutter and the library. Only 0.10 moves — a GPS directory in a picked photo answers the location
+question as well as a camera file does, so its gate widened from camera files to all file-path
+captures.
 
 ### 6b.4 One door out, and a stepper that does not flatter the run
 

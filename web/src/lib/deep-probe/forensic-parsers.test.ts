@@ -8,9 +8,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import { briefChecklist, briefItems, buildCorrelationBrief, type CorrelationInput } from "./correlation-brief";
+import { briefChecklist, briefItems, buildCorrelationBrief, imageFamily, type BriefCapture, type CorrelationInput } from "./correlation-brief";
 import { readExifIfds } from "./exif-ifd";
 import { readJpegEncoderBytes } from "./jpeg-encoder";
+import { buildManualShotList, LIBRARY_PICK_SHOTS } from "./manual-capture";
 
 /* ------------------------------------------------------------------ *
  * Byte builders
@@ -366,5 +367,142 @@ describe("correlation brief", () => {
     const devices = items.find((i) => i.section === "6.1");
     expect(devices?.status).toBe("captured");
     expect(devices?.answer).toMatch(/Three snapshots, not two/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Library pick — the missing half of the capture comparison
+ * ------------------------------------------------------------------ */
+
+function pick(overrides: Partial<BriefCapture> = {}): BriefCapture {
+  return {
+    slug: "manual-01-library-plain",
+    archivePath: "captures/manual-01-library-plain.jpg",
+    label: "Photo library",
+    path: "picker-file",
+    origin: "supplied-file",
+    deviceLabel: null,
+    fileName: "IMG_0001.JPG",
+    fileLastModified: 1_700_000_000_000,
+    fileRelativePath: "",
+    bytes: 2_400_000,
+    mime: "image/jpeg",
+    width: 4032,
+    height: 3024,
+    encoder: null,
+    ifd: null,
+    iccMd5: null,
+    ...overrides,
+  };
+}
+
+const ORIGINAL_PICK: Partial<BriefCapture> = {
+  slug: "manual-02-library-original",
+  archivePath: "captures/manual-02-library-original.heic",
+  fileName: "IMG_0001.HEIC",
+  mime: "image/heic",
+};
+
+describe("library pick shots", () => {
+  it("leads the manual stage, because it needs no camera and closes the one gap nothing else can", () => {
+    const list = buildManualShotList();
+    expect(list.slice(0, 2).map((s) => s.id)).toEqual(["library-plain", "library-original"]);
+    expect(list.length).toBe(LIBRARY_PICK_SHOTS.length + 6);
+  });
+
+  it("never claims a facing or a camera it did not use", () => {
+    for (const shot of LIBRARY_PICK_SHOTS) {
+      expect(shot.source).toBe("library");
+      expect(shot.facing).toBeNull();
+      expect(shot.purpose).not.toMatch(/fresh photo\b(?!:)/);
+    }
+    for (const shot of buildManualShotList().filter((s) => s.source === "camera-app")) {
+      expect(shot.facing).not.toBeNull();
+    }
+  });
+
+  it("differs only in the accept attribute — that difference is the whole measurement", () => {
+    const [plain, original] = LIBRARY_PICK_SHOTS;
+    expect(plain.accept).toBe("image/*");
+    expect(original.accept).toMatch(/heic/i);
+    expect(plain.engine).toBe(original.engine);
+  });
+
+  it("reads as captured once a pick lands, and names what arrived", () => {
+    const items = briefItems(correlationInput({ captures: [pick()] }));
+    const item = items.find((i) => i.section === "0.2");
+    expect(item?.status).toBe("captured");
+    expect(item?.answer).toContain("IMG_0001.JPG");
+    expect(item?.answer).toContain("image/jpeg");
+  });
+
+  it("says plainly what is lost when no pick happened, rather than listing it as a minor gap", () => {
+    const item = briefItems(correlationInput()).find((i) => i.section === "0.2");
+    expect(item?.status).toBe("not-run");
+    expect(item?.answer).toMatch(/evidence for one side only/);
+  });
+
+  it("calls a format change between the two picks a conversion, and a match no conversion", () => {
+    const converted = briefItems(correlationInput({ captures: [pick(), pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.2");
+    expect(converted?.answer).toMatch(/conversion performed by the browser/);
+
+    const matched = briefItems(
+      correlationInput({ captures: [pick(), pick({ ...ORIGINAL_PICK, fileName: "IMG_0001.JPG", mime: "image/jpeg" })] })
+    ).find((i) => i.section === "0.2");
+    expect(matched?.answer).toMatch(/nothing converted on the way in/);
+  });
+
+  it("refuses to compare a pair when only one pick completed", () => {
+    const item = briefItems(correlationInput({ captures: [pick()] })).find((i) => i.section === "0.2");
+    expect(item?.answer).toMatch(/cannot be read against each other/);
+  });
+
+  it("keeps the untouched reference not-obtainable even with the closest approximation in hand", () => {
+    const item = briefItems(correlationInput({ captures: [pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.1");
+    expect(item?.status).toBe("not-obtainable");
+    expect(item?.answer).toMatch(/still not the requested reference/);
+  });
+
+  it("never resolves the Photos setting into a reading, however strong the evidence", () => {
+    const withProof = briefItems(correlationInput({ captures: [pick(), pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.9");
+    expect(withProof?.status).toBe("partial");
+    expect(withProof?.answer).toMatch(/caught in the act/);
+    expect(withProof?.answer).toMatch(/not a reading of the setting/);
+
+    const noHeic = briefItems(correlationInput({ captures: [pick()] })).find((i) => i.section === "0.9");
+    expect(noHeic?.answer).toMatch(/neither is asserted/);
+  });
+
+  it("lets a library pick answer the location question, which only camera files could before", () => {
+    const gps = pick({
+      ifd: {
+        found: true,
+        tiffOffset: 12,
+        byteOrder: "II (little-endian)",
+        magic: 42,
+        blocks: [],
+        ifdOrder: ["IFD0", "GPS"],
+        hasIfd1: false,
+        makerNote: null,
+        colorSpace: null,
+        interopIndex: null,
+        gps: [{ tag: "GPSLatitude", value: "51.5" }],
+        warnings: [],
+      },
+    });
+    const item = briefItems(correlationInput({ captures: [gps] })).find((i) => i.section === "0.10");
+    expect(item?.status).toBe("captured");
+
+    const none = briefItems(correlationInput({ captures: [pick()] })).find((i) => i.section === "0.10");
+    expect(none?.status).toBe("partial");
+    expect(none?.answer).toMatch(/No conclusion is drawn/);
+  });
+
+  it("reads the stored family from the type first and the extension second", () => {
+    expect(imageFamily({ mime: "image/heic", fileName: null })).toBe("heic");
+    expect(imageFamily({ mime: "", fileName: "IMG.HEIF" })).toBe("heic");
+    expect(imageFamily({ mime: "image/jpeg", fileName: "x.jpg" })).toBe("jpeg");
+    expect(imageFamily({ mime: "", fileName: "x.png" })).toBe("png");
+    expect(imageFamily({ mime: "", fileName: null })).toBe("other");
   });
 });
