@@ -5,6 +5,7 @@ import { PhoneGate } from "@/components/PhoneGate";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+import ArchiveViewer from "./pages/ArchiveViewer";
 import Calibrate from "./pages/Calibrate";
 import Dashboard from "./pages/Dashboard";
 import DeepProbe from "./pages/DeepProbe";
@@ -32,6 +33,7 @@ const App = () => (
             <Route path="/advanced" element={<Index />} />
             <Route path="/device-spec" element={<DeviceSpec />} />
             <Route path="/deep-probe" element={<DeepProbe />} />
+            <Route path="/archive" element={<ArchiveViewer />} />
             <Route path="/calibrate" element={<Calibrate />} />
             <Route path="/shared" element={<SharedReport />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}

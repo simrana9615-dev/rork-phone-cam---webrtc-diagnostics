@@ -11,6 +11,8 @@ import {
   Hand,
   Loader2,
   Minus,
+  FileText,
+  FolderOpen,
   Package,
   Pause,
   Play,
@@ -42,7 +44,7 @@ import {
   type PermissionTier,
   type ProbeRequest,
 } from "@/lib/deep-probe/permissions";
-import { buildRawPack, downloadRawPack, type RawPackResult, type StageOmission } from "@/lib/deep-probe/raw-pack";
+import { buildRawPack, downloadDeviceSpec, downloadRawPack, type RawPackResult, type StageOmission } from "@/lib/deep-probe/raw-pack";
 import {
   recordGenericSensor,
   recordGeolocation,
@@ -968,6 +970,22 @@ export default function DeepProbe() {
                   <Download className="mr-1.5 h-4 w-4" />
                   Download the raw dump
                 </Button>
+                <Button variant="outline" className="mt-2 h-11 w-full" onClick={() => downloadDeviceSpec(pack)}>
+                  <FileText className="mr-1.5 h-4 w-4" />
+                  Device spec only (.md)
+                </Button>
+                <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                  The spec is a few pages instead of {formatBytes(pack.bytes)}: only the readings that differ between devices, each tagged as fixed
+                  hardware, tied to the OS version, a setting you chose, or something that changes every run. It is also inside the archive as
+                  device-spec.md.
+                </p>
+                <Link
+                  to="/archive"
+                  className="mt-2 flex h-11 w-full items-center justify-center gap-1.5 rounded-xl border border-border/70 bg-card text-[12px] font-semibold active:scale-95"
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  Open the archive here
+                </Link>
                 <div className="mt-3 space-y-1 rounded-xl border border-border/60 bg-background/40 p-2.5 text-[10.5px] leading-relaxed">
                   {pack.verification.length === 0 ? (
                     <p className="text-muted-foreground">No captures to verify — this run produced no photos.</p>

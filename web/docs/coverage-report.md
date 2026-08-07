@@ -280,6 +280,26 @@ digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, s
 log and byte-identity data. Stopping early keeps everything gathered; the archive is
 named `…-PARTIAL.zip` and lists every omitted stage with its reason.
 
+**Second export — `device-spec.md`.** A few pages instead of a few hundred megabytes,
+offered on its own and also written into the archive. It answers the narrower question
+*what about this device is not true of every other phone*: readings matching a published
+common-default table are dropped and named in an appendix, readings that **differ** from
+one are kept and flagged as the strongest rows in the file. Each fact is tagged `HW`
+(hardware), `OS` (browser version), `SET` (a setting you chose) or `VAR` (changes every
+run) — pinning a `VAR` value is as wrong as getting an `HW` value wrong. It covers the
+camera capability envelope including where the platform silently substituted a different
+mode, the per-origin capture and encoder signature, and measured sensor quantisation steps.
+Uniqueness is never claimed: the app sees one device and cannot observe a population, so it
+reports no entropy figure, no rarity and no fingerprint score, and it says as much in the
+file. Permission answers are excluded — they are decisions about the run, not properties of
+the device — as are per-shot values like exposure and timestamps.
+
+**Reading it back — `/archive`.** A downloaded archive opens again on the phone: file tree,
+image preview, windowed hex in the same layout the archive's own dumps use, the carved
+metadata regions, and a CRC-32 re-check of any file (or all of them) against the checksum
+stored inside. The viewer is explicitly not the authority — when it and `unzip` disagree,
+`unzip` wins.
+
 **Interruption:** Pause and Stop are available throughout. A pause always lands *between*
 steps — the recording or constraint in flight completes first, because a half-recorded
 sensor window or a half-applied constraint would describe a paused device rather than the

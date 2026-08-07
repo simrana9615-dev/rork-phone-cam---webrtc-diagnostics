@@ -32,6 +32,7 @@ app tests and proves see [`coverage-report.md`](./coverage-report.md).
 | `/advanced` | `Index` | Advanced camera & WebRTC diagnostics hub |
 | `/device-spec` | `DeviceSpec` | One-tap device camera spec battery with text + JSON export |
 | `/deep-probe` | `DeepProbe` | Maximum-demand run: tiered permission sweep, sensor recordings, exhaustive camera matrix, manual shot set, raw dump ZIP |
+| `/archive` | `ArchiveViewer` | Opens a downloaded Deep Probe archive back up on the phone: file tree, image preview, windowed hex, per-entry CRC re-check |
 | `/calibrate` | `Calibrate` | Threshold calibration: labelled genuine/screen/print captures, separation analysis, apply/export |
 | `/shared` | `SharedReport` | Read-only share-link viewer — **bypasses the phone gate** |
 | `*` | `NotFound` | Catch-all |
@@ -185,6 +186,8 @@ renders the read-only session summary.
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
 | `deep-probe/raw-pack.ts` | The raw dump archive: captures stored verbatim (`captures/` vs `rendered-frames/` by declared origin), per-capture hex dump + structure map + full tag listing **including undocumented entries** (`includeUnknown`), carved segments, four checksums plus `md5sum`/`sha256sum`-format digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session log, byte-identity data and an HTML overview. Post-build it re-carves every capture from the finished blob and compares. Names the file `…-PARTIAL.zip` and lists every omission when a stage did not run |
+| `deep-probe/mimic-spec.ts` | Reduces a whole run to `device-spec.md`: only readings that differ between devices, each tagged `HW` / `OS` / `SET` / `VAR` so a reader knows which to hold constant and which must vary. Filtering is by a published `COMMON_DEFAULTS` table — a match is dropped and listed in the appendix, a *deviation* is kept and flagged. Derives the camera capability envelope (granted mode list, constraint-solver snapping, refusal edges), the per-origin capture/encoder signature, and sensor quantisation steps. Ends with a canonical JSON block generated from the same objects as the prose, so the two cannot disagree. Never claims uniqueness or entropy |
+| `deep-probe/zip-reader.ts` | Dependency-free ZIP reader: central-directory parse (index only — opening a 400 MB archive reads a few KB), `payloadStart` resolved from the *local* header, direct `Blob.slice` windows for stored entries, early-stopping `inflatePrefix` for deflated ones that reports whether it reached the end, and `verifyEntry` recomputing CRC-32 against the archive's own record. ZIP64, encryption and multi-disk are reported, never half-parsed |
 | `zip-writer.ts` | Dependency-free ZIP writer, **store-only by default (method 0)** so archived media is byte-identical to the capture. Derived text may opt into DEFLATE via `compress: true` (platform `CompressionStream`, silently falling back to store when absent) — the CRC-32 in the header is always that of the *uncompressed* bytes, and `ZipEntryInfo.stored` records which entries can be carved directly. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. Returns an offset/size/CRC table for every entry, and a `finalize` hook lets a report cite the real offsets of the entries above it. Also exports `verifyBytes` (one-pass compare + CRC) and `crc32OfBlob`. UTF-8 name flag on every entry; per-entry **and** whole-archive 4 GiB overflow are refused rather than silently truncated. Covered by `zip-writer.test.ts` |
 | `evidence-pack.ts` | Evidence pack assembler: unaltered captures verbatim in `originals/`, app-encoded frames separated into `rendered-frames/`, derived renders with captions, per-file metadata **re-read from the archived bytes** (ExifReader + structural provenance walk), session log + capture ledger, deep report, threshold reference + engine docs, the byte-identity verification data, and the printable HTML/text overview that reconciles every score to its deductions. Declares each file's origin tier, verifies every archived payload against its source after the build, and records rather than hides anything it could not pack |
 | `session-store.ts` | IndexedDB session persistence (6 h TTL, survives native-camera tab eviction) |
@@ -266,6 +269,7 @@ question: not *is this capture authentic* but *what did this device actually han
 | `raw/<slug>.tags.txt` | Full tag listing **including undocumented entries** — the ones ordinary viewers hide |
 | `raw/segments/<slug>/*.bin` | Metadata regions carved out whole at their exact positions: EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA, Photoshop IRB |
 | `checksums/` | MD5, SHA-1, SHA-256 and CRC-32 per capture, plus `checksums.md5` / `.sha1` / `.sha256` in the exact format `md5sum -c` and `sha256sum -c` read |
+| `device-spec.md` | The distinctive-facts summary described below, also downloadable on its own |
 | `verification/byte-identity.txt` | Size, CRC-32, storage method and absolute payload offset for every entry, with four independent ways to re-check them |
 | `log/session-log.txt`, `MANIFEST.txt` | Full timeline; every path with its logical size, archived size and method |
 
@@ -285,6 +289,54 @@ Size control: captures are always stored (method 0) so they stay carvable, while
 derived text opts into DEFLATE. Hex dumps compress heavily, which is what keeps a run with
 100+ photos inside the ZIP format's 4 GiB ceiling. Beyond a source-byte budget the dumps
 switch to head+tail windows and say so, both in the file and in the on-screen warnings.
+
+### 6b.1 `device-spec.md` — the distinctive-facts summary
+
+The archive answers *what did this device hand over*. The spec answers the narrower
+question **what about this device is not true of every other phone**, in a few pages instead
+of a few hundred megabytes. Offered as its own download on the results screen and written
+into the archive.
+
+The entire value is in what it leaves out, which is also exactly where a tool like this
+would start lying — so three rules govern the filter:
+
+1. **"Distinctive" is a declared classification, not a measurement.** The app sees one
+   device and cannot observe a population, so it never reports entropy, rarity or a
+   fingerprint score. It says only that a value differs from a documented common default,
+   and it publishes that default list (`COMMON_DEFAULTS`) inside the file so the judgement
+   can be checked and overridden.
+2. **When in doubt the row is kept.** A dropped fact is invisible; a redundant one costs a
+   line. Only confidently near-universal readings are dropped, and every dropped one is
+   named in the appendix.
+3. **A deviation outranks an unusual-looking value.** A reading that differs from a common
+   default is flagged `!` and repeated in a "start here" block, because that is the strongest
+   evidence in the file.
+
+Every fact carries a stability tag, which is what makes the spec usable rather than merely
+accurate: `HW` fixed to the hardware, `OS` moves with the browser version, `SET` a user
+setting, `VAR` changes between runs. **Pinning a `VAR` value is as wrong as getting an `HW`
+value wrong** — a battery level that never moves describes a recording, not a phone.
+
+Two further exclusions worth naming. Permission *answers* are omitted entirely (a decision
+about the run, not a property of the device); only which permission names the browser
+implements is recorded. Per-shot metadata — exposure, ISO, timestamps — is excluded from the
+capture signature in favour of the device-constant tags and the tag *schema*, since copying
+per-shot values across every frame is itself a tell.
+
+### 6b.2 `/archive` — reading it back
+
+`ArchiveViewer` opens a downloaded archive on the phone through `zip-reader.ts`. It renders
+bytes with the same `hexLines` formatter the archive's own dumps use — two different hex
+layouts for one file would invite a reader to think they were looking at two files.
+
+The asymmetry between stored and deflated entries is surfaced rather than smoothed over,
+because it is the practical consequence of the archive's central design choice: a stored
+capture supports instant random access at any offset, while a deflated report must be
+inflated from the start every time. The viewer says which it is doing and why.
+
+It is deliberately **not** presented as the authority. The archive is built to outlive this
+app, every report inside it explains how to verify it with standard tools, and the viewer
+states that when it and `unzip` disagree, `unzip` wins.
 
 ## 7. Environment & configuration
 
@@ -307,6 +359,12 @@ switch to head+tail windows and say so, both in the file and in the on-screen wa
   what is there, segments proven never to run past end-of-file, hex dumps checked for exact
   `xxd` layout and for honest `WINDOWED` labelling, and the permission registry checked for
   unique ids, properly nested tiers, a stated reach/duration on every request, and a written
-  reason wherever it demands a tap.
+  reason wherever it demands a tap. `src/lib/deep-probe/archive-tools.test.ts` covers the
+  reader and the spec: the reader is checked *against the writer* (resolved payload offsets
+  must equal the offsets the writer recorded), a stored payload must return byte-for-byte
+  from an arbitrary window, and a single flipped byte inside a built archive must be caught
+  — a verifier that only ever says "fine" is worse than none. The spec is checked for
+  dropping boilerplate, keeping and flagging deviations, tagging volatile readings, keeping
+  camera originals separate from app-encoded frames, and never claiming uniqueness.
 - `bun run build` — production build to `dist/`.
 - Type checking is strict; lint via `bun run lint`.

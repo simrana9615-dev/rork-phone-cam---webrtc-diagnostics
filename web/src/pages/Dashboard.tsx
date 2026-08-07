@@ -6,6 +6,7 @@ import {
   ChevronRight,
   CreditCard,
   FlaskConical,
+  FolderOpen,
   Gauge,
   HeartPulse,
   MonitorSmartphone,
@@ -324,6 +325,23 @@ export default function Dashboard() {
             </p>
           </div>
           <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />
+        </Link>
+
+        <Link
+          to="/archive"
+          className="flex w-full items-center gap-3 rounded-2xl border border-border/70 bg-card p-3.5 text-left transition-all hover:border-fuchsia-400/50 active:scale-[0.985]"
+        >
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-fuchsia-500/40 bg-fuchsia-500/15 text-fuchsia-300">
+            <FolderOpen className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-[13.5px] font-semibold leading-tight">Archive Viewer</div>
+            <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+              Open a Deep Probe archive back up on the phone: browse the files, read the hex, view the carved metadata regions, and re-check any
+              file against the checksum stored inside. Nothing is uploaded and the archive is only ever read.
+            </p>
+          </div>
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
         </Link>
 
         <Link

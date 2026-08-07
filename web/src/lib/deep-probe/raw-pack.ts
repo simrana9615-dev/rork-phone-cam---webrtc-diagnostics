@@ -19,6 +19,7 @@ import ExifReader from "exifreader";
 import { downloadBlob, formatBytes, type LogEntry } from "../camera-diagnostics";
 import { buildZip, crcHex, isDeflateSupported, safeZipPath, verifyBytes, type ZipEntry, type ZipEntryInfo } from "../zip-writer";
 import { hashBlob, type FileHashes } from "./hashes";
+import { buildMimicSpec, STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
 import { hexDumpBlob, structureText, walkStructure } from "./raw-bytes";
 import { matrixText, type CameraMatrixReport, type ProbeCapture } from "./camera-matrix";
 import { passiveText, type PassiveGroup } from "./passive";
@@ -55,6 +56,12 @@ export type RawPackResult = {
   bytes: number;
   warnings: string[];
   verification: { path: string; ok: boolean; detail: string }[];
+  /**
+   * The device spec, also written into the archive as `device-spec.md`. Returned
+   * separately so it can be saved on its own without unpacking the archive.
+   */
+  specMarkdown: string;
+  specFileName: string;
 };
 
 const MIME_EXT: Record<string, string> = {
@@ -134,13 +141,15 @@ function tagValue(tag: unknown): string {
  * is the point of this function: the undocumented tags are exactly the ones a
  * normal viewer hides, and they are frequently the most device-specific.
  */
-async function tagDump(blob: Blob, label: string): Promise<{ text: string; count: number; unknown: number }> {
+async function tagDump(blob: Blob, label: string): Promise<{ text: string; count: number; unknown: number; keys: string[]; stableTags: Record<string, string> }> {
   const lines: string[] = [`TAG DUMP — ${label}`, "=".repeat(78), ""];
+  const keys: string[] = [];
+  const stableTags: Record<string, string> = {};
   let buffer: ArrayBuffer;
   try {
     buffer = await blob.arrayBuffer();
   } catch (err) {
-    return { text: `${lines.join("\n")}\nThe bytes could not be read: ${err instanceof Error ? err.message : String(err)}`, count: 0, unknown: 0 };
+    return { text: `${lines.join("\n")}\nThe bytes could not be read: ${err instanceof Error ? err.message : String(err)}`, count: 0, unknown: 0, keys, stableTags };
   }
 
   let count = 0;
@@ -167,7 +176,10 @@ async function tagDump(blob: Blob, label: string): Promise<{ text: string; count
         }
         const isUnknown = /^undefined-|^unknown/i.test(key) || /^\d+$/.test(key);
         if (isUnknown) unknown += 1;
-        lines.push(`  ${isUnknown ? "[undocumented] " : ""}${key} = ${tagValue(groupTags[key])}`);
+        const value = tagValue(groupTags[key]);
+        lines.push(`  ${isUnknown ? "[undocumented] " : ""}${key} = ${value}`);
+        if (!isUnknown) keys.push(key);
+        if (STABLE_TAG_KEYS.includes(key) && value.length > 0 && stableTags[key] == null) stableTags[key] = value;
         count += 1;
       }
     }
@@ -182,7 +194,7 @@ async function tagDump(blob: Blob, label: string): Promise<{ text: string; count
   } catch (err) {
     lines.push(`The metadata parser could not read this file: ${err instanceof Error ? err.message : String(err)}`);
   }
-  return { text: lines.join("\n"), count, unknown };
+  return { text: lines.join("\n"), count, unknown, keys, stableTags };
 }
 
 function permissionLedgerText(input: RawPackInput): string {
@@ -516,6 +528,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   const warnings: string[] = [];
   const records: CaptureRecord[] = [];
   const capturePaths = new Map<string, ProbeCapture>();
+  const specCaptures: MimicCaptureFact[] = [];
 
   const total = input.captures.length * 4 + 12;
   let done = 0;
@@ -574,6 +587,24 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
       hexTruncated: hex.truncated,
       segmentCount: structure.segments.length,
       container: structure.container,
+    });
+
+    specCaptures.push({
+      slug: capture.slug,
+      origin: capture.origin,
+      path: capture.path,
+      deviceLabel: capture.deviceLabel,
+      width: capture.width,
+      height: capture.height,
+      bytes: capture.blob.size,
+      mime: capture.blob.type,
+      container: structure.container,
+      markers: structure.nodes.filter((node) => node.depth === 0).map((node) => node.id).slice(0, 48),
+      segments: structure.segments.map((segment) => segment.name),
+      tagCount: tags.count,
+      unknownTagCount: tags.unknown,
+      tagKeys: tags.keys,
+      stableTags: tags.stableTags,
     });
   }
 
@@ -640,6 +671,20 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   });
   tick("Writing the session log");
 
+  const specMarkdown = buildMimicSpec({
+    generatedAt: input.finishedAt,
+    tier: input.tier,
+    passive: input.passive,
+    permissionStates: input.permissionStatesAfter,
+    permissions: input.permissions,
+    sensors: input.sensors,
+    matrix: input.matrix,
+    captures: specCaptures,
+    omissions: input.omissions,
+  });
+  entries.push({ path: "device-spec.md", data: specMarkdown, compress: true });
+  tick("Writing the device spec");
+
   const fileCount = entries.length + 5;
   entries.unshift({ path: "READ-ME.txt", data: readMe(input, records, fileCount) });
   entries.push({ path: "overview.html", data: overviewHtml(input, records, fileCount, 0), compress: true });
@@ -679,8 +724,19 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     );
   }
 
-  const fileName = `deep-probe-${stamp(new Date())}${input.omissions.length > 0 || input.matrix?.aborted ? "-PARTIAL" : ""}.zip`;
-  return { blob: built.blob, fileName, files: built.entries.length, bytes: built.blob.size, warnings, verification };
+  const suffix = stamp(new Date());
+  const partial = input.omissions.length > 0 || input.matrix?.aborted;
+  const fileName = `deep-probe-${suffix}${partial ? "-PARTIAL" : ""}.zip`;
+  return {
+    blob: built.blob,
+    fileName,
+    files: built.entries.length,
+    bytes: built.blob.size,
+    warnings,
+    verification,
+    specMarkdown,
+    specFileName: `device-spec-${suffix}${partial ? "-PARTIAL" : ""}.md`,
+  };
 }
 
 function verificationText(table: ZipEntryInfo[], capturePaths: Map<string, ProbeCapture>): string {
@@ -744,4 +800,9 @@ function manifestText(table: ZipEntryInfo[]): string {
 /** Saves the archive to the device. */
 export function downloadRawPack(result: RawPackResult): void {
   downloadBlob(result.blob, result.fileName);
+}
+
+/** Saves the device spec on its own, for the common case of wanting only that. */
+export function downloadDeviceSpec(result: RawPackResult): void {
+  downloadBlob(new Blob([result.specMarkdown], { type: "text/markdown;charset=utf-8" }), result.specFileName);
 }

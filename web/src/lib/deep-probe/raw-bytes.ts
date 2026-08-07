@@ -59,8 +59,13 @@ const ASCII: string[] = Array.from({ length: 256 }, (_, i) => (i >= 0x20 && i <=
 
 const HEX_SLICE = 512 * 1024;
 
-/** One `xxd`-style line per 16 bytes. */
-function hexLines(bytes: Uint8Array, baseOffset: number): string {
+/**
+ * One `xxd`-style line per 16 bytes. Exported so the in-app archive viewer
+ * renders bytes in exactly the same layout as the dumps inside the archive —
+ * two different hex formats for the same file would invite a reader to think
+ * they were looking at two different files.
+ */
+export function hexLines(bytes: Uint8Array, baseOffset: number): string {
   const out: string[] = [];
   for (let i = 0; i < bytes.length; i += 16) {
     const end = Math.min(i + 16, bytes.length);
