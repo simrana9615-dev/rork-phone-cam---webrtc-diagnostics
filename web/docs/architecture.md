@@ -31,6 +31,7 @@ app tests and proves see [`coverage-report.md`](./coverage-report.md).
 | `/verify/:templateId` | `Verify` | Guided template flow (presets + `custom` with query params) |
 | `/advanced` | `Index` | Advanced camera & WebRTC diagnostics hub |
 | `/device-spec` | `DeviceSpec` | One-tap device camera spec battery with text + JSON export |
+| `/deep-probe` | `DeepProbe` | Maximum-demand run: tiered permission sweep, sensor recordings, exhaustive camera matrix, manual shot set, raw dump ZIP |
 | `/calibrate` | `Calibrate` | Threshold calibration: labelled genuine/screen/print captures, separation analysis, apply/export |
 | `/shared` | `SharedReport` | Read-only share-link viewer — **bypasses the phone gate** |
 | `*` | `NotFound` | Catch-all |
@@ -48,8 +49,8 @@ desktop.
 ### `Dashboard.tsx`
 Entry screen: two pinned EyeDeeKit hero cards (amber licence / indigo passport), the six
 verification template cards, the Custom Flow builder (doc / capture / face / pages
-pickers producing `/verify/custom?...`), and the Advanced Tools, Device Spec and Threshold
-Calibration entries.
+pickers producing `/verify/custom?...`), and the Advanced Tools, Device Spec, Deep Probe and
+Threshold Calibration entries.
 
 ### `Calibrate.tsx`
 Threshold calibration screen. Captures labelled samples in three classes (genuine document,
@@ -97,6 +98,32 @@ matrix, BarcodeDetector formats) with a live progress bar, renders every section
 cards, and exports the report as readable text and structured JSON. Full battery
 description in `coverage-report.md` §4.
 
+### `DeepProbe.tsx` (`/deep-probe`)
+The maximum-demand run. Five stages behind a setup screen that states the cost up front
+(prompt count, minutes, photo count, archive size) and a three-position scope toggle
+(`standard` / `extended` / `everything`, the last one explicitly flagged as reaching data
+belonging to other apps).
+
+1. **Permission sweep** — one card per request, stating what the site can reach and how long
+   the grant lasts *before* it fires. Auto-advances on a 4 s countdown that pauses while the
+   page is hidden, and falls back to a tap target wherever the browser demands transient
+   activation (the card says which browser rule and why). Outcomes are `granted` / `denied` /
+   `dismissed` / `unavailable` / `skipped` / `error`; **`unavailable` is detected by feature
+   probe before firing**, so a missing API can never be recorded as a refusal. Nothing is
+   retried.
+2. **Sensor recordings** — for each granted sensor, a real timed sample with the *measured*
+   rate reported next to the requested one.
+3. **Camera sweep** — `lib/deep-probe/camera-matrix.ts`, with live photo / byte / elapsed
+   counters and a stop button. Watches `PressureObserver` where available and surfaces a
+   load warning explicitly labelled as load, not temperature.
+4. **Manual shots** — every named camera in the pinned viewfinder plus three zoom steps each,
+   then both facings through all three camera-app handoffs.
+5. **Archive** — `lib/deep-probe/raw-pack.ts`, then every capture is carved back out of the
+   finished blob and compared byte-for-byte, with the result shown on screen.
+
+Stopping at any point keeps everything gathered; the remaining stages are pushed onto the
+omission list with a reason and the archive is named `…-PARTIAL.zip`.
+
 ### `SharedReport.tsx`
 Decodes the share-link fragment (deflate-raw + base64url), enforces the 72 h TTL, and
 renders the read-only session summary.
@@ -117,6 +144,7 @@ renders the read-only session summary.
 | `LastPhotoExif.tsx` | Diagnostic-hub EXIF inspector for the newest captured photo: device / timestamp / GPS headline tiles with explicit not-in-file states, capture-parameter chips, and the complete raw tag dump (parsed locally); exports the reusable `ExifInspector` panel, also embedded in every session-gallery item, with a one-tap JSON download of the raw tags + the photo's observed capture timeline + screening verdict (heat-map image payloads excluded with an explicit note) |
 | `ReportView.tsx` | Forensic report renderer: verdict chip, category bars, finding rows (observed/expected/impact), heat-map visuals, technical appendix; exports `FindingRow` |
 | `CameraErrorHelp.tsx` | getUserMedia error classifier with actionable fixes |
+| `deep-probe/ProbeViewfinder.tsx` | Deep Probe's manual-shot viewfinder, pinned to one `deviceId` and holding one end of that camera's own reported zoom range (`min`/`mid`/`max` resolved against the range rather than a hardcoded factor). HUD states the granted size, which still path will run and that no camera EXIF exists on this path, all *before* the shutter. A camera with no zoom control produces a clearly-recorded unzoomed shot instead of a fake one. Mounted imperatively via `probeManualShot()`, rejecting with `CaptureCancelledError` on skip |
 | `PhoneGate.tsx` | Phones-only gate (see §2) |
 | `ui/*` | shadcn/ui primitives |
 
@@ -149,7 +177,15 @@ renders the read-only session summary.
 | `capture-engine.ts` | The seven capture engines, the persisted selection store, the input `accept`/`capture` attributes each implies, and `ENGINE_FACTS` — a per-engine record of the permission asked, what the site receives, camera-inventory reach, lens control, file metadata, byte origin and nearest native equivalent. Single source for the toggle UI, the session log and the pack |
 | `device-camera.ts` | Device-level (AVFoundation-class) capture: enumerates video inputs before **and** after the permission grant so the pack can show exactly what the browser withholds until the user says yes; classifies each platform label into a lens class and the matching `AVCaptureDevice.DeviceType` (unrecognised labels stay `unknown` with `classified: false`, never forced into a bucket); opens one camera by `deviceId: { exact }`, pushes it to its own reported maximum and reads the granted settings back; prefers `ImageCapture.takePhoto()` and falls back to a canvas encode that is labelled as such. `inventoryReport()` writes the full account, including a plain list of what this path cannot give (camera EXIF, sensor-native stills, per-format detail, RAW, depth) |
 | `device-spec.ts` | Device Camera Spec Report engine: environment collection, per-camera max-capability probes, measured fps, constraint suite runs, codec matrix, text + JSON report builders |
-| `zip-writer.ts` | Dependency-free ZIP writer, **store-only (method 0)** so archived media is byte-identical to the capture. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. Returns an offset/size/CRC table for every entry, and a `finalize` hook lets a report cite the real offsets of the entries above it. Also exports `verifyBytes` (one-pass compare + CRC) and `crc32OfBlob`. UTF-8 name flag on every entry; per-entry **and** whole-archive 4 GiB overflow are refused rather than silently truncated. Covered by `zip-writer.test.ts` |
+| `deep-probe/permissions.ts` | The tiered permission registry (`standard` ⊂ `extended` ⊂ `everything`) — every request a site can make, each carrying its API name, what it reaches, how long the grant lasts, its `permissions.query` name, whether the browser demands a fresh gesture (and why), a feature probe and a runner that releases whatever it was granted in the same tick. `runRequest()` queries permission state either side of the ask and converts every throw into a recorded outcome; `unavailable` is decided by probe *before* firing so it can never be confused with a refusal |
+| `deep-probe/passive.ts` | Everything readable with no prompt at all: identity strings, hardware, GPU, network, power, locale/storage, display preferences, codec support, API surface, plus `permissions.query` for every name any browser answers to. Deliberately computes **no** uniqueness/fingerprint score — that would need a population this app cannot see |
+| `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
+| `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
+| `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time. Picker-only engines are excluded — they cannot promise a fresh photo, so asking for one here would mislead |
+| `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
+| `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
+| `deep-probe/raw-pack.ts` | The raw dump archive: captures stored verbatim (`captures/` vs `rendered-frames/` by declared origin), per-capture hex dump + structure map + full tag listing **including undocumented entries** (`includeUnknown`), carved segments, four checksums plus `md5sum`/`sha256sum`-format digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session log, byte-identity data and an HTML overview. Post-build it re-carves every capture from the finished blob and compares. Names the file `…-PARTIAL.zip` and lists every omission when a stage did not run |
+| `zip-writer.ts` | Dependency-free ZIP writer, **store-only by default (method 0)** so archived media is byte-identical to the capture. Derived text may opt into DEFLATE via `compress: true` (platform `CompressionStream`, silently falling back to store when absent) — the CRC-32 in the header is always that of the *uncompressed* bytes, and `ZipEntryInfo.stored` records which entries can be carved directly. Blob parts are never concatenated (large clips stay on disk); CRC-32 streams 4 MB slices. Returns an offset/size/CRC table for every entry, and a `finalize` hook lets a report cite the real offsets of the entries above it. Also exports `verifyBytes` (one-pass compare + CRC) and `crc32OfBlob`. UTF-8 name flag on every entry; per-entry **and** whole-archive 4 GiB overflow are refused rather than silently truncated. Covered by `zip-writer.test.ts` |
 | `evidence-pack.ts` | Evidence pack assembler: unaltered captures verbatim in `originals/`, app-encoded frames separated into `rendered-frames/`, derived renders with captions, per-file metadata **re-read from the archived bytes** (ExifReader + structural provenance walk), session log + capture ledger, deep report, threshold reference + engine docs, the byte-identity verification data, and the printable HTML/text overview that reconciles every score to its deductions. Declares each file's origin tier, verifies every archived payload against its source after the build, and records rather than hides anything it could not pack |
 | `session-store.ts` | IndexedDB session persistence (6 h TTL, survives native-camera tab eviction) |
 | `share-link.ts` | Compressed, self-expiring (72 h), fragment-only share links — no server storage |
@@ -209,6 +245,47 @@ self-proving; the log states whether its 300-entry buffer actually truncated rat
 implying it always does; and a single missing artefact never fails the export — it is named
 in the overview's completeness section and pushed to the log as a warning.
 
+## 6b. Deep Probe raw dump export
+
+`/deep-probe` produces a second, much larger archive from `lib/deep-probe/raw-pack.ts`. It
+reuses the same ZIP writer and the same byte-identity discipline, but answers a different
+question: not *is this capture authentic* but *what did this device actually hand over*.
+
+| Path | Contents |
+|---|---|
+| `READ-ME.txt` | What each folder is, what the archive does and does not prove, and — when a stage did not run — exactly which one and why |
+| `overview.html` | Readable summary: outcome counts, the full request table, a passive-dump extract, sweep totals, sensor rates, the photo table with SHA-256, and the re-verification instructions |
+| `permissions/ledger.txt` / `.json` | Every request: API name, the moment it fired, your response time, what it reaches, how long the grant lasts, what came back, and the browser's own permission state before and after |
+| `environment/passive-dump.txt` / `.json` | Everything readable with **no prompt at all**, plus `permissions.query` for every name any browser answers to |
+| `sensors/*.csv` | One commented CSV per granted sensor, each stating the measured rate beside the requested one |
+| `camera/matrix.txt` / `.json` | Every asked-versus-granted pair across every camera, resolution, ratio, frame rate and control mode, plus the `stillPolicy` statement of which steps were expected to produce a photo |
+| `captures/` | Photos whose bytes the app did **not** author (camera files, platform stills), stored uncompressed |
+| `rendered-frames/` | Frames the app encoded itself — kept out of `captures/` for the same reason `rendered-frames/` exists in the evidence pack |
+| `raw/<slug>.hex.txt` | Complete `xxd`-layout hex + ASCII of every byte, or an explicitly-labelled `WINDOWED` dump naming the exact skipped-byte count |
+| `raw/<slug>.structure.txt` | Real container parse: every section's identifier, meaning, offset and length |
+| `raw/<slug>.tags.txt` | Full tag listing **including undocumented entries** — the ones ordinary viewers hide |
+| `raw/segments/<slug>/*.bin` | Metadata regions carved out whole at their exact positions: EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA, Photoshop IRB |
+| `checksums/` | MD5, SHA-1, SHA-256 and CRC-32 per capture, plus `checksums.md5` / `.sha1` / `.sha256` in the exact format `md5sum -c` and `sha256sum -c` read |
+| `verification/byte-identity.txt` | Size, CRC-32, storage method and absolute payload offset for every entry, with four independent ways to re-check them |
+| `log/session-log.txt`, `MANIFEST.txt` | Full timeline; every path with its logical size, archived size and method |
+
+Three things this archive is careful **not** to do:
+
+1. **It never merges "you refused" with "your browser has no such API."** Availability is
+   decided by feature probe before a request fires, so an absent API is recorded as never
+   asked. Both the ledger and the overview keep the two visually distinct.
+2. **It never claims exhaustive coverage.** The permission surface differs per browser and
+   grows every release, so `permissions/ledger.txt` states plainly that it is a floor rather
+   than a ceiling.
+3. **It never implies a photo exists where none was expected.** The sweep takes stills at a
+   declared subset of steps and says which, so an empty capture list on a frame-rate row
+   reads as designed rather than as a failure.
+
+Size control: captures are always stored (method 0) so they stay carvable, while the bulky
+derived text opts into DEFLATE. Hex dumps compress heavily, which is what keeps a run with
+100+ photos inside the ZIP format's 4 GiB ceiling. Beyond a source-byte budget the dumps
+switch to head+tail windows and say so, both in the file and in the on-screen warnings.
+
 ## 7. Environment & configuration
 
 - `EXPO_PUBLIC_TOOLKIT_URL` + `EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY` — Rork Toolkit proxy
@@ -224,6 +301,12 @@ in the overview's completeness section and pushed to the log as a warning.
 
 - `bun run test` — vitest unit tests plus a Playwright-driven browser config
   (`vitest.browser.config.ts`). `src/lib/zip-writer.test.ts` guards the evidence pack's
-  byte-identity guarantee (see §6).
+  byte-identity guarantee (see §6); `src/lib/deep-probe/deep-probe.test.ts` holds the raw
+  dump to account — MD5 against the published RFC 1321 vectors (plus multi-block and
+  all-256-byte-values cases), structural offsets checked by seeking to them and asserting
+  what is there, segments proven never to run past end-of-file, hex dumps checked for exact
+  `xxd` layout and for honest `WINDOWED` labelling, and the permission registry checked for
+  unique ids, properly nested tiers, a stated reach/duration on every request, and a written
+  reason wherever it demands a tap.
 - `bun run build` — production build to `dist/`.
 - Type checking is strict; lint via `bun run lint`.

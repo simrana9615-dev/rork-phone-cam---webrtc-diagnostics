@@ -94,6 +94,10 @@ sharpness ≥30, brightness 55–235, steadiness ≤6.
   with auto-screening, Fraud Lab, debug console.
 - **Device Camera Spec Report** (`/device-spec`) — one tap runs the complete spec
   battery and exports it (see §4).
+- **Deep Probe** (`/deep-probe`) — the maximum-demand run: a tiered permission sweep,
+  real sensor recordings, an exhaustive per-camera constraint matrix and a manual shot
+  set, ending in a raw dump archive (see §4b). Diagnostic only — it produces **no
+  verdict, no score and no finding**, and nothing it records feeds the forensic engine.
 
 ---
 
@@ -220,6 +224,61 @@ One tap runs the complete spec-wise battery against the phone's cameras
 **Exports:** readable text (`device-spec-report-<timestamp>.txt`, with an
 interpretation guide) and structured JSON (`device-spec-report-<timestamp>.json`,
 `kind: "device-camera-spec-report"`), both built entirely on-device.
+
+---
+
+## 4b. Deep Probe (`/deep-probe`)
+
+Where the Spec Report answers *what can this camera do*, Deep Probe answers *what did
+this device hand over*. It scores nothing and accuses nobody; every output is a record.
+
+**Scope toggle** (`standard` ⊂ `extended` ⊂ `everything`), stated with its cost — prompt
+count, minutes, photo count, archive size — before anything runs.
+
+1. **Permission sweep.** Every request the registry knows how to make at the chosen
+   scope, one card at a time, each stating what it reaches and how long the grant lasts
+   *before* firing. Auto-advances on a 4 s countdown that pauses while the page is
+   hidden; falls back to a tap wherever the browser demands transient activation, naming
+   the rule. Outcomes: allowed / denied / dismissed / **not implemented here** /
+   skipped / errored.
+   - Availability is decided by feature probe **before** the request fires, so a missing
+     API is recorded as never asked — it can never be confused with a refusal.
+   - Nothing is retried. A refusal is final.
+   - Coverage is explicitly a floor, not a ceiling: the permission surface differs per
+     browser and grows every release, and the ledger says so rather than implying it
+     asked for everything that exists.
+2. **Passive dump.** Everything readable with no prompt at all — identity strings,
+   hardware, GPU, network, power, locale, storage, display preferences, codec support,
+   API surface — plus `permissions.query` for every name any browser answers to.
+   Deliberately computes **no** uniqueness score: that would need a population this app
+   cannot see, so it would be a guess dressed as a measurement.
+3. **Sensor recordings.** For each granted sensor, a real timed sample rather than a
+   note that a grant exists: motion, orientation/compass, geolocation watched until the
+   accuracy figure settles, microphone loudness (level only — no audio is retained), and
+   the generic sensors. Each series reports the **measured** rate beside the requested
+   one, because browsers throttle these events and quoting the request back would be
+   repeating an intention as a reading.
+4. **Camera matrix.** Per camera: native max, the full resolution ladder in landscape
+   **and** portrait, six aspect ratios, five frame rates, then every advertised focus /
+   exposure / white-balance / resize mode, zoom extremes and torch applied to a live
+   track. Asked vs granted recorded for every row — a request that succeeds while quietly
+   delivering a different size is the more revealing case, so the two are never merged.
+   **Rejections are results**, exactly as in §4. Stills are taken at a declared subset of
+   steps and `stillPolicy` states which, so an empty capture list reads as designed. The
+   torch is always left off.
+5. **Manual shots.** Every named camera in a pinned viewfinder plus three zoom steps
+   each (resolved against that camera's own reported range, not a hardcoded factor), then
+   both facings through all three camera-app handoffs — the only path that yields real
+   camera EXIF. A camera with no zoom control produces a clearly-recorded unzoomed shot
+   rather than a fake one. Skips are recorded as skips.
+
+**Export:** one raw dump ZIP (layout in `architecture.md` §6b) with the untouched
+captures stored uncompressed, a complete hex + ASCII dump of every byte, a real
+structural parse of each container, carved metadata regions, the full tag listing
+including undocumented entries, four checksums per file plus `md5sum`/`sha256sum`-format
+digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session
+log and byte-identity data. Stopping early keeps everything gathered; the archive is
+named `…-PARTIAL.zip` and lists every omitted stage with its reason.
 
 ---
 

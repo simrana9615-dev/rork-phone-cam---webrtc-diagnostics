@@ -16,6 +16,14 @@
  * (bit 11) is set on every entry, so non-ASCII names survive. ZIP64 is not
  * emitted — entries above 4 GiB are rejected with a clear error instead of
  * silently producing a corrupt archive.
+ *
+ * Compression is opt-in per entry and OFF by default. Evidence payloads must
+ * never be deflated: byte identity is proved by carving them out of the
+ * archive at a known offset, which only works while they sit there verbatim.
+ * Bulky *derived* text — hex dumps especially — may set `compress: true`, in
+ * which case DEFLATE runs through the platform `CompressionStream`. The CRC-32
+ * written into the header is always the checksum of the UNCOMPRESSED bytes, as
+ * the format requires, so `unzip -t` still validates them.
  */
 
 const LOCAL_SIG = 0x04034b50;
@@ -26,6 +34,7 @@ const VERSION = 20;
 /** General purpose bit 11: file name is UTF-8. */
 const FLAG_UTF8 = 0x0800;
 const METHOD_STORE = 0;
+const METHOD_DEFLATE = 8;
 const MAX_ENTRY_BYTES = 0xffffffff;
 /** EOCD stores the central-directory offset in 32 bits, so the whole archive must fit too. */
 const MAX_ARCHIVE_BYTES = 0xffffffff;
@@ -78,6 +87,13 @@ export type ZipEntry = {
   data: Blob | Uint8Array | ArrayBuffer | string;
   /** Modification stamp written into the entry (defaults to now). */
   date?: Date;
+  /**
+   * Opt in to DEFLATE for this entry. Only ever set this on derived text a
+   * reader does not need to carve out byte-for-byte — never on a capture.
+   * Ignored when the platform has no CompressionStream, in which case the
+   * entry is stored and `ZipEntryInfo.stored` reports that truthfully.
+   */
+  compress?: boolean;
 };
 
 export type ZipProgress = {
@@ -127,6 +143,34 @@ export async function crc32OfBlob(blob: Blob): Promise<number> {
 /** CRC-32 as the 8-digit lowercase hex string that zip/crc32 tools print. */
 export function crcHex(crc: number): string {
   return (crc >>> 0).toString(16).padStart(8, "0");
+}
+
+type CompressionStreamCtor = new (format: string) => ReadableWritablePair<Uint8Array, Uint8Array>;
+
+function compressionStreamCtor(): CompressionStreamCtor | null {
+  if (typeof globalThis === "undefined") return null;
+  return (globalThis as unknown as { CompressionStream?: CompressionStreamCtor }).CompressionStream ?? null;
+}
+
+/** True when this platform can DEFLATE, so bulky derived text need not be stored raw. */
+export function isDeflateSupported(): boolean {
+  return compressionStreamCtor() != null;
+}
+
+/**
+ * Raw-deflate a blob through the platform compressor. Returns null on any
+ * failure so the caller falls back to storing — a bigger archive is always
+ * preferable to a broken one.
+ */
+async function deflateRaw(blob: Blob): Promise<Blob | null> {
+  const Ctor = compressionStreamCtor();
+  if (!Ctor) return null;
+  try {
+    const compressed = blob.stream().pipeThrough(new Ctor("deflate-raw") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>);
+    return await new Response(compressed as unknown as ReadableStream).blob();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -189,6 +233,8 @@ type PreparedEntry = {
   blob: Blob;
   crc: number;
   size: number;
+  storedSize: number;
+  method: number;
   offset: number;
   time: number;
   date: number;
@@ -197,11 +243,17 @@ type PreparedEntry = {
 /** Where an entry physically lives in the finished archive. */
 export type ZipEntryInfo = {
   path: string;
+  /** Logical size of the payload, i.e. the size after extraction. */
   size: number;
+  /** Bytes actually occupied in the archive. Equal to `size` when stored. */
+  compressedSize: number;
+  /** False when this entry was deflated, so carving at `dataOffset` yields compressed bytes. */
+  stored: boolean;
+  /** CRC-32 of the uncompressed payload, as the ZIP format defines it. */
   crc32: number;
   /** Offset of the local file header. */
   headerOffset: number;
-  /** Offset of the first payload byte — carve from here for `size` bytes. */
+  /** Offset of the first payload byte — carve from here for `compressedSize` bytes. */
   dataOffset: number;
 };
 
@@ -254,11 +306,17 @@ export async function buildZip(entries: ZipEntry[], options?: BuildZipOptions): 
     if (blob.size > MAX_ENTRY_BYTES) {
       throw new Error(`"${path}" is ${(blob.size / 1024 / 1024 / 1024).toFixed(2)} GB — above the 4 GB per-file ZIP limit`);
     }
+    // CRC is always of the uncompressed bytes, whether or not we deflate.
     const crc = await crc32OfBlob(blob);
+    const deflated = entry.compress === true && blob.size > 0 ? await deflateRaw(blob) : null;
+    // Only take the compressed form when it actually helps.
+    const useDeflate = deflated != null && deflated.size < blob.size;
+    const payload = useDeflate && deflated ? deflated : blob;
+    const method = useDeflate ? METHOD_DEFLATE : METHOD_STORE;
     const nameBytes = encoder.encode(path);
     const { time, date } = dosDateTime(entry.date ?? new Date());
     const headerLength = 30 + nameBytes.length;
-    if (offset + headerLength + blob.size > MAX_ARCHIVE_BYTES) {
+    if (offset + headerLength + payload.size > MAX_ARCHIVE_BYTES) {
       throw new Error(
         `The archive would exceed the 4 GB ZIP limit while adding "${path}". Export fewer clips at a time — a truncated archive would be worse than a refused one.`
       );
@@ -268,21 +326,29 @@ export async function buildZip(entries: ZipEntry[], options?: BuildZipOptions): 
     u32(header, LOCAL_SIG);
     u16(header, VERSION);
     u16(header, FLAG_UTF8);
-    u16(header, METHOD_STORE);
+    u16(header, method);
     u16(header, time);
     u16(header, date);
     u32(header, crc);
-    u32(header, blob.size);
+    u32(header, payload.size);
     u32(header, blob.size);
     u16(header, nameBytes.length);
     u16(header, 0);
     raw(header, nameBytes);
 
     parts.push(header.buffer);
-    if (blob.size > 0) parts.push(blob);
-    prepared.push({ nameBytes, blob, crc, size: blob.size, offset, time, date });
-    table.push({ path, size: blob.size, crc32: crc, headerOffset: offset, dataOffset: offset + headerLength });
-    offset += headerLength + blob.size;
+    if (payload.size > 0) parts.push(payload);
+    prepared.push({ nameBytes, blob, crc, size: blob.size, storedSize: payload.size, method, offset, time, date });
+    table.push({
+      path,
+      size: blob.size,
+      compressedSize: payload.size,
+      stored: !useDeflate,
+      crc32: crc,
+      headerOffset: offset,
+      dataOffset: offset + headerLength,
+    });
+    offset += headerLength + payload.size;
 
     done += 1;
     onProgress?.({ done, total, path, bytes: blob.size });
@@ -301,11 +367,11 @@ export async function buildZip(entries: ZipEntry[], options?: BuildZipOptions): 
     u16(central, VERSION);
     u16(central, VERSION);
     u16(central, FLAG_UTF8);
-    u16(central, METHOD_STORE);
+    u16(central, e.method);
     u16(central, e.time);
     u16(central, e.date);
     u32(central, e.crc);
-    u32(central, e.size);
+    u32(central, e.storedSize);
     u32(central, e.size);
     u16(central, e.nameBytes.length);
     u16(central, 0);

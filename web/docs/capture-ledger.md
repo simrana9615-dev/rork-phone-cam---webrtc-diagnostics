@@ -230,6 +230,38 @@ the origin it reports.
 The full inventory write-up (`inventoryReport()`) is attached to the ledger as a
 round-trip step note, so it is archived verbatim in the evidence pack.
 
+## Deep Probe: the same discipline, a different question
+
+`/deep-probe` (`lib/deep-probe/*`) runs outside the ledger — it opens and closes
+hundreds of feeds and a per-feed ledger entry for each would be noise rather than
+evidence. It keeps its own record instead, built on the same rules:
+
+- **Asked and granted are recorded separately, never merged.** Every row of
+  `camera-matrix.ts` carries the constraint sent and the settings read back
+  afterwards. A request that succeeds while quietly delivering a different size is
+  more revealing than one that fails, so the two are never collapsed into a single
+  "result".
+- **A rejection is a result.** `OverconstrainedError` maps where the hardware's
+  limit actually is, exactly as in the Advanced Tools constraint suite. It is never
+  presented as an app fault.
+- **Origin is declared at the capture site.** Sweep stills carry
+  `platform-photo` or `app-encoded-frame` as produced, and `raw-pack.ts` routes them
+  to `captures/` or `rendered-frames/` on that value alone — identical to the
+  evidence pack's rule, for identical reasons.
+- **Absence is typed.** In the permission sweep, "this browser has no such API" is
+  decided by feature probe *before* the request fires, so it can never be recorded
+  as a refusal. That mirrors the ledger's `not-exposed` diff verdict, which likewise
+  refuses to read a missing field as a mismatch.
+- **Coverage is a floor, not a ceiling.** The permission ledger states plainly that
+  the browser's permission surface differs by version and that this is what the app
+  knew to ask for — the same reason honesty rows exist per feed.
+
+The one place the two meet: Deep Probe's manual stage uses the same camera-app
+handoffs as the flows (`native-camera`, `capture-boolean`, `capacitor`), and those
+are the only shots in the run that can carry real camera EXIF. Comparing them with
+the sweep's metadata-free stills is the clearest demonstration of the trade
+described above.
+
 ## Where it surfaces
 
 - **Report section** ("Capture Feed Ledger") in the EyeDeeKit summary and the

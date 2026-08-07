@@ -9,6 +9,7 @@ import {
   Gauge,
   HeartPulse,
   MonitorSmartphone,
+  Radar,
   ScanFace,
   Smartphone,
   SlidersHorizontal,
@@ -300,6 +301,29 @@ export default function Dashboard() {
             </p>
           </div>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+        </Link>
+
+        <Link
+          to="/deep-probe"
+          className="flex w-full items-center gap-3 rounded-2xl border border-fuchsia-500/40 bg-gradient-to-br from-fuchsia-500/12 via-card to-card p-3.5 text-left transition-all hover:border-fuchsia-400/60 active:scale-[0.985]"
+        >
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300">
+            <Radar className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[13.5px] font-semibold leading-tight">Deep Probe</span>
+              <span className="rounded-md border border-fuchsia-500/40 bg-fuchsia-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-fuchsia-300">
+                Long run
+              </span>
+            </div>
+            <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+              Asks for every permission a website can ask you for, records what your device actually hands over, then photographs through every
+              camera at every resolution, ratio and mode it supports. Ends in one archive with the untouched files, a hex dump of every byte, every
+              carved metadata region and four checksums each. 15–30 minutes; you can stop at any point and keep what you have.
+            </p>
+          </div>
+          <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />
         </Link>
 
         <Link

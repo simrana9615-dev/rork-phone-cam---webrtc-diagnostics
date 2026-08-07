@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 import Calibrate from "./pages/Calibrate";
 import Dashboard from "./pages/Dashboard";
+import DeepProbe from "./pages/DeepProbe";
 import DeviceSpec from "./pages/DeviceSpec";
 import IdKitFlow from "./pages/IdKitFlow";
 import Index from "./pages/Index";
@@ -30,6 +31,7 @@ const App = () => (
             <Route path="/verify/:templateId" element={<Verify />} />
             <Route path="/advanced" element={<Index />} />
             <Route path="/device-spec" element={<DeviceSpec />} />
+            <Route path="/deep-probe" element={<DeepProbe />} />
             <Route path="/calibrate" element={<Calibrate />} />
             <Route path="/shared" element={<SharedReport />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
