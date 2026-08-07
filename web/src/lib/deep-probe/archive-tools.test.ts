@@ -302,6 +302,9 @@ describe("buildMimicSpec", () => {
       aborted: false,
       stillsStoppedForMemory: null,
       memory: { heldBytes: 0, ceilingBytes: 320 * 1024 * 1024, peakCanvasBytes: 0 },
+      shapes: [],
+      sharedShapes: [],
+      consolidation: { taken: 0, kept: 0, dropped: 0, bytesSaved: 0 },
       surface: [],
       devicesBefore: [],
       devicesAfter: [],
@@ -319,6 +322,7 @@ describe("buildMimicSpec", () => {
           error: null,
           durationMs: 10,
           captureSlugs: [],
+          duplicates: [],
         },
         {
           deviceId: "abcdef1234",
@@ -333,6 +337,7 @@ describe("buildMimicSpec", () => {
           error: "OverconstrainedError",
           durationMs: 8,
           captureSlugs: [],
+          duplicates: [],
         },
       ],
     };

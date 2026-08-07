@@ -44,6 +44,7 @@ function matrix(overrides: Partial<CameraMatrixReport> = {}): CameraMatrixReport
         error: null,
         durationMs: 410,
         captureSlugs: ["sweep-01"],
+        duplicates: [],
       },
       {
         deviceId: "cam-a",
@@ -58,6 +59,7 @@ function matrix(overrides: Partial<CameraMatrixReport> = {}): CameraMatrixReport
         error: "OverconstrainedError",
         durationMs: 120,
         captureSlugs: [],
+        duplicates: [],
       },
     ],
     stillPolicy: "one still per granted row",
@@ -65,6 +67,9 @@ function matrix(overrides: Partial<CameraMatrixReport> = {}): CameraMatrixReport
     aborted: false,
     stillsStoppedForMemory: null,
     memory: { heldBytes: 12_000_000, ceilingBytes: 320 * 1024 * 1024, peakCanvasBytes: 33_177_600 },
+    shapes: [],
+    sharedShapes: [],
+    consolidation: { taken: 0, kept: 0, dropped: 0, bytesSaved: 0 },
     surface: [],
     devicesBefore: [],
     devicesAfter: [],
@@ -92,6 +97,9 @@ function facts(overrides: Partial<CaptureFacts> = {}): CaptureFacts {
     width: 1920,
     height: 1080,
     hashes: { bytes: 2_400_000, md5: "a".repeat(32), sha1: "b".repeat(40), sha256: "c".repeat(64), crc32: "0xdeadbeef" },
+    shape: null,
+    pixels: null,
+    pixelsUnavailable: null,
     encoder: {
       isJpeg: true,
       quantTables: [
@@ -231,6 +239,7 @@ describe("buildSheets", () => {
           error: null,
           durationMs: 200,
           captureSlugs: [],
+          duplicates: [],
         },
       ],
     });

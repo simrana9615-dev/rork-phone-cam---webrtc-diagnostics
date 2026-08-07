@@ -20,6 +20,7 @@ import type { PackOrigin } from "../evidence-pack";
 import { type CameraDeviceInfo, classifyCameraLabel } from "../device-camera";
 import { CAMERA_DEADLINE_POLICY, CAMERA_OPEN_TIMEOUT_MS, isCameraTimeout, openMediaWithDeadline, withCameraDeadline, type LateArrival } from "./camera-timeout";
 import { drawVideoStill, heldBytesCeiling, readPixelSize, releaseScratchCanvas } from "./capture-memory";
+import { CONSOLIDATION_POLICY, createShapeLedger, shapeScope, type ShapeGroup } from "./capture-signature";
 import { readMemoryHints } from "./hex-budget";
 
 /**
@@ -80,6 +81,16 @@ export type MatrixRow = {
   durationMs: number;
   /** Slugs of any captures taken at this step. Empty is normal and stated. */
   captureSlugs: string[];
+  /**
+   * Stills that WERE taken at this step and then not kept, because their
+   * byte shape was already on file for this camera and this path.
+   *
+   * Recorded on the row rather than discarded, because the identity is the
+   * finding: it says this request and an earlier one came out of one pipeline.
+   * A row with entries here is a row where the camera answered — never one
+   * where it failed.
+   */
+  duplicates: { path: ProbeCapture["path"]; sameAsSlug: string; shapeId: string; reason: string }[];
 };
 
 /**
@@ -138,6 +149,12 @@ export type CameraMatrixReport = {
   stillsStoppedForMemory: string | null;
   /** Peak capture bytes held at once, and the ceiling it was measured against. */
   memory: { heldBytes: number; ceilingBytes: number; peakCanvasBytes: number };
+  /** One entry per distinct file shape kept, with every later request that repeated it. */
+  shapes: ShapeGroup[];
+  /** Shapes that turned up under more than one camera or path — a finding, not a duplicate. */
+  sharedShapes: { id: string; scopes: string[] }[];
+  /** How many stills were taken, how many survived, and what the collapse saved. */
+  consolidation: { taken: number; kept: number; dropped: number; bytesSaved: number };
   /** The verbatim JS-visible surface of each camera. */
   surface: CameraSurfaceRecord[];
   /** `enumerateDevices()` before the sweep opened anything, full IDs, untruncated. */
@@ -171,7 +188,7 @@ const ASPECTS: { ratio: number; name: string }[] = [
 const FRAME_RATES: number[] = [15, 24, 30, 60, 120];
 
 const STILL_POLICY =
-  "A still was taken at the native maximum, at every landscape resolution rung, and at every aspect ratio — down BOTH available paths at each of those steps (the browser's own photo pipeline, and a frame this app encoded from the video track). Portrait variants, frame-rate steps and control-mode steps deliberately produce no still: they change how the track behaves, not what a photo of it looks like, and taking hundreds of near-identical frames would pad the archive without adding evidence. Rows with an empty capture list were never expected to have one.";
+  "A still was ATTEMPTED at the native maximum, at every landscape resolution rung, and at every aspect ratio — down BOTH available paths at each of those steps (the browser's own photo pipeline, and a frame this app encoded from the video track). Portrait variants, frame-rate steps and control-mode steps deliberately attempt none: they change how the track behaves, not what a photo of it looks like. A still that WAS taken is only kept when its byte shape is new for that camera and that path; one repeating a shape already held is recorded on its row and dropped, since a second copy of a file already in the archive is weight rather than evidence. So an empty capture list on a row means one of two stated things — no still was attempted there, or the still that was taken had a shape already on file — and never that the camera failed.";
 
 type PhotoCaps = { imageWidth?: { max?: number }; imageHeight?: { max?: number } };
 type ImageCaptureLike = {
@@ -511,9 +528,36 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     );
   };
 
-  const recordCapture = (capture: ProbeCapture): void => {
+  // Every still is reduced to a shape before it is kept. Two requests answered
+  // by one pipeline produce one file, and the fact that they matched is written
+  // onto the row instead of being stored a second time.
+  const ledger = createShapeLedger();
+  let stillsTaken = 0;
+
+  /**
+   * Offers a still to the ledger. Kept stills consume a slug and are recorded;
+   * repeats are written onto the row and dropped without ever being counted as
+   * photographs taken.
+   */
+  const offer = async (build: (slug: string) => ProbeCapture, row: { captureSlugs: string[]; duplicates: MatrixRow["duplicates"] }, prefix: string): Promise<void> => {
+    // The slug is only peeked at: the counter moves when a still survives, so
+    // the numbering never carries a gap where a duplicate used to be.
+    const capture = build(`${String(counter + 1).padStart(3, "0")}-${prefix}`);
+    stillsTaken += 1;
+    const verdict = await ledger.consider({
+      slug: capture.slug,
+      blob: capture.blob,
+      scope: shapeScope(capture.deviceLabel, capture.path),
+      asked: capture.asked,
+    });
+    if (verdict.repeat != null) {
+      row.duplicates.push({ path: capture.path, sameAsSlug: verdict.repeat.sameAsSlug, shapeId: verdict.shape.id, reason: verdict.repeat.reason });
+      return;
+    }
+    counter += 1;
     captures.push(capture);
     heldBytes += capture.blob.size;
+    row.captureSlugs.push(capture.slug);
     options.onCapture(capture);
   };
 
@@ -541,6 +585,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         aborted,
         stillsStoppedForMemory: null,
         memory: { heldBytes: 0, ceilingBytes: heldBytesCeiling(readMemoryHints()), peakCanvasBytes: 0 },
+        shapes: [],
+        sharedShapes: [],
+        consolidation: { taken: 0, kept: 0, dropped: 0, bytesSaved: 0 },
         surface,
         devicesBefore,
         devicesAfter,
@@ -574,11 +621,6 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   const perDevice = planFor("x").length;
   const total = Math.max(1, inventory.length * (perDevice + 6));
   let done = 0;
-
-  const nextSlug = (prefix: string): string => {
-    counter += 1;
-    return `${String(counter).padStart(3, "0")}-${prefix}`;
-  };
 
   for (const device of inventory) {
     await options.waitWhilePaused?.();
@@ -617,6 +659,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
           error: errorName(err),
           durationMs: Math.round(performance.now() - stepStart),
           captureSlugs: [],
+          duplicates: [],
         });
         continue;
       }
@@ -631,7 +674,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         }
       }
 
-      const captureSlugs: string[] = [];
+      const stepRow = { captureSlugs: [] as string[], duplicates: [] as MatrixRow["duplicates"] };
       let videoDims: { width: number; height: number } | null = null;
       if (step.takeStills && track && stillsAllowed()) {
         const video = await attachVideo(stream);
@@ -639,52 +682,54 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
 
         const platform = await platformStill(track);
         if (platform) {
-          const slug = nextSlug("platform");
-          captureSlugs.push(slug);
-          const capture: ProbeCapture = {
-            slug,
-            label: `${name} — ${step.asked} — platform photo pipeline`,
-            blob: platform.blob,
-            origin: "platform-photo",
-            stage: "camera-sweep",
-            deviceLabel: name,
-            path: "image-capture",
-            width: platform.width,
-            height: platform.height,
-            fileName: null,
-            fileLastModified: null,
-            fileRelativePath: null,
-            asked: step.asked,
-            granted: settingsText(settings),
-            takenAt: new Date().toISOString(),
-          };
-          recordCapture(capture);
-        }
-
-        if (video) {
-          const drawn = await drawVideoStill(video, CANVAS_ENCODE_QUALITY);
-          if (drawn) peakCanvasBytes = Math.max(peakCanvasBytes, drawn.canvasBytes);
-          if (drawn) {
-            const slug = nextSlug("canvas");
-            captureSlugs.push(slug);
-            const capture: ProbeCapture = {
+          await offer(
+            (slug) => ({
               slug,
-              label: `${name} — ${step.asked} — frame encoded by this app`,
-              blob: drawn.blob,
-              origin: "app-encoded-frame",
+              label: `${name} — ${step.asked} — platform photo pipeline`,
+              blob: platform.blob,
+              origin: "platform-photo",
               stage: "camera-sweep",
               deviceLabel: name,
-              path: "canvas",
-              width: drawn.width,
-              height: drawn.height,
+              path: "image-capture",
+              width: platform.width,
+              height: platform.height,
               fileName: null,
               fileLastModified: null,
               fileRelativePath: null,
               asked: step.asked,
               granted: settingsText(settings),
               takenAt: new Date().toISOString(),
-            };
-            recordCapture(capture);
+            }),
+            stepRow,
+            "platform"
+          );
+        }
+
+        if (video) {
+          const drawn = await drawVideoStill(video, CANVAS_ENCODE_QUALITY);
+          if (drawn) peakCanvasBytes = Math.max(peakCanvasBytes, drawn.canvasBytes);
+          if (drawn) {
+            await offer(
+              (slug) => ({
+                slug,
+                label: `${name} — ${step.asked} — frame encoded by this app`,
+                blob: drawn.blob,
+                origin: "app-encoded-frame",
+                stage: "camera-sweep",
+                deviceLabel: name,
+                path: "canvas",
+                width: drawn.width,
+                height: drawn.height,
+                fileName: null,
+                fileLastModified: null,
+                fileRelativePath: null,
+                asked: step.asked,
+                granted: settingsText(settings),
+                takenAt: new Date().toISOString(),
+              }),
+              stepRow,
+              "canvas"
+            );
           }
           detachVideo(video);
         }
@@ -711,7 +756,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         grantedSettings: plainSettings(settings),
         error: null,
         durationMs: Math.round(performance.now() - stepStart),
-        captureSlugs,
+        captureSlugs: stepRow.captureSlugs,
+        duplicates: stepRow.duplicates,
       });
 
       // Read the verbatim JS surface once per camera, on the track that is
@@ -764,6 +810,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             error: "no track available to apply the constraint to",
             durationMs: 0,
             captureSlugs: [],
+            duplicates: [],
           });
           continue;
         }
@@ -783,6 +830,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             error: null,
             durationMs: Math.round(performance.now() - stepStart),
             captureSlugs: [],
+            duplicates: [],
           });
         } catch (err) {
           rows.push({
@@ -798,6 +846,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             error: errorName(err),
             durationMs: Math.round(performance.now() - stepStart),
             captureSlugs: [],
+            duplicates: [],
           });
         }
       }
@@ -812,6 +861,17 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   }
 
   if (aborted) notes.push("You stopped the sweep before it finished. Every row above really ran; the rows that never ran are simply absent, and the archive is marked partial.");
+  if (ledger.droppedCount() > 0) {
+    notes.push(
+      `${ledger.droppedCount()} of ${stillsTaken} still(s) repeated a byte shape already held for the same camera and the same path, and were not kept — saving ${(ledger.bytesSaved() / 1024 / 1024).toFixed(1)} MB. ` +
+        `Each one is named on its own row with the file it matched. Those requests all succeeded; nothing here is a camera failing, and nothing that was dropped is counted as a photograph taken.`
+    );
+  }
+  for (const shared of ledger.sharedShapes()) {
+    notes.push(
+      `Shape ${shared.id} appeared under more than one scope — ${shared.scopes.join(" and ")}. Each scope kept its own copy, deliberately: one encoder pipeline serving two different lenses or two different paths is a fact about this device, and collapsing it would have destroyed the evidence for it.`
+    );
+  }
   if (timeouts > 0) {
     notes.push(
       `${timeouts} request(s) passed the ${(CAMERA_OPEN_TIMEOUT_MS / 1000).toFixed(0)}-second camera deadline without answering and were abandoned so the sweep could continue. ` +
@@ -843,6 +903,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       aborted,
       stillsStoppedForMemory,
       memory: { heldBytes, ceilingBytes, peakCanvasBytes },
+      shapes: ledger.groups(),
+      sharedShapes: ledger.sharedShapes(),
+      consolidation: { taken: stillsTaken, kept: ledger.keptCount(), dropped: ledger.droppedCount(), bytesSaved: ledger.bytesSaved() },
       surface,
       devicesBefore,
       devicesAfter,
@@ -878,6 +941,11 @@ export function matrixText(report: CameraMatrixReport): string {
     "-".repeat(78),
     ...wrap(report.stillPolicy, 78),
     "",
+    ...CONSOLIDATION_POLICY,
+    "",
+    `  This run: ${report.consolidation.taken} still(s) taken, ${report.consolidation.kept} kept, ${report.consolidation.dropped} dropped as repeats` +
+      `${report.consolidation.bytesSaved > 0 ? `, ${(report.consolidation.bytesSaved / 1024 / 1024).toFixed(1)} MB not stored` : ""}.`,
+    "",
     `CAMERAS (${report.inventory.length})`,
     "-".repeat(78),
   ];
@@ -911,6 +979,37 @@ export function matrixText(report: CameraMatrixReport): string {
         row.ok ? `             got: ${row.granted}` : `             ${row.error}`
       );
       if (row.captureSlugs.length > 0) lines.push(`             stills: ${row.captureSlugs.join(", ")}`);
+      for (const duplicate of row.duplicates) {
+        lines.push(`             repeat: a ${duplicate.path} still was taken here and matched ${duplicate.sameAsSlug} exactly (shape ${duplicate.shapeId}), so it was not kept.`);
+      }
+    }
+  }
+
+  if (report.shapes.length > 0) {
+    lines.push(
+      "",
+      "=".repeat(78),
+      `DISTINCT FILE SHAPES (${report.shapes.length})`,
+      "=".repeat(78),
+      "",
+      "One entry per genuinely different file this device produced. Everything the sweep took collapsed",
+      "into these; the requests listed under each one all came out of the same pipeline byte-for-byte.",
+      ""
+    );
+    for (const shape of report.shapes) {
+      lines.push(
+        `  ${shape.id}  ${shape.container} ${shape.width}×${shape.height}`,
+        `      scope   ${shape.scope}`,
+        `      kept    ${shape.keptSlug} — first seen when asked for: ${shape.keptAsked}`
+      );
+      if (shape.repeats.length === 0) {
+        lines.push("      repeats none — this shape appeared exactly once.");
+      } else {
+        lines.push(`      repeats ${shape.repeats.length}, ${(shape.bytesSaved / 1024 / 1024).toFixed(1)} MB not stored:`);
+        for (const repeat of shape.repeats.slice(0, 12)) lines.push(`                · ${repeat.asked}`);
+        if (shape.repeats.length > 12) lines.push(`                · … and ${shape.repeats.length - 12} more`);
+      }
+      lines.push("");
     }
   }
 

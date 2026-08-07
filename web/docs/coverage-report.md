@@ -294,12 +294,17 @@ count, minutes, photo count, archive size — before anything runs.
    steps and `stillPolicy` states which, so an empty capture list reads as designed. The
    torch is always left off. Every request runs under a **ten-second deadline**, and a
    timed-out row says only that — it is never presented as a refusal or as a limit the
-   camera stated.
+   camera stated. A still is kept only when its **shape** is new for that camera and that
+   path; one repeating a shape already held is recorded on its row and dropped.
 5. **Manual shots.** Two library picks, then every named camera in a pinned viewfinder plus
    three zoom steps each (resolved against that camera's own reported range, not a hardcoded
    factor), then both facings through all three camera-app handoffs — the paths that yield
    real camera EXIF. A camera with no zoom control produces a clearly-recorded unzoomed shot
-   rather than a fake one. Skips are recorded as skips.
+   rather than a fake one. Skips are recorded as skips. The list shortens once the run has
+   PROVEN a shot redundant, but nothing taken by hand is ever thrown away.
+6. **Pixel measurements.** Per surviving capture, a bounded centre sample: the 8×8 block grid
+   phase, and the sensor pipeline's channel balance, tone histogram, clipping and noise floor.
+   The one kind of evidence in the run that is not a header field.
 
 **Export:** one raw dump ZIP (layout in `architecture.md` §6b) with the untouched
 captures stored uncompressed, a complete hex + ASCII dump of every byte, a real
@@ -448,6 +453,72 @@ levels and a thousand iterations of that clamp is four seconds on its own). And 
 work is gone: the encoder parse, the IFD walk and the tag dump share one read of the bytes instead
 of three, carved segments are lazy `Blob.slice` views the writer reads once each, and the
 byte-identity re-check streams rather than materialising the archive a second time.
+
+**A hundred photographs of one photograph.** The sweep used to keep every still it took. Four
+cameras through eight resolution rungs and six aspect ratios down two paths is well over a
+hundred files, and most of them were the same file twice — same container, same quantisation
+tables, same Huffman tables, same marker order, same metadata layout, same dimensions, differing
+only in what the lens happened to be pointed at. That difference is the one thing this app is
+not measuring, and paying for it in memory was what put the archive in reach of the browser's
+patience.
+
+So every still is now reduced to a **shape** first, and a shape already on file for that camera
+and that path is not stored a second time. The shape holds what describes the machine: container,
+dimensions, chroma subsampling, all 64 coefficients of every quantisation table, every Huffman
+code-length table, the marker order, the APP segment identifiers, the TIFF byte order, the
+directory order, the tag IDs each directory holds, the maker-note signature and the colour
+profile's identity. It deliberately excludes everything that describes the moment: timestamps,
+GPS, exposure, ISO, aperture, orientation, the file's length and the image data itself.
+
+The tag IDs are the fine distinction and the one worth stating: the IDs are layout and belong in
+the shape, the values behind them are the moment and must not be. A camera writing its
+directories in a fixed order is telling you about its firmware; the exposure time it wrote there
+is telling you about the light. Two photographs of two different scenes from one camera at one
+setting are *meant* to collapse into one shape — the collapse is the measurement, not a loss.
+
+Three things keep that honest. A dropped still is never counted as one that was taken. The
+numbering only advances on a file that survived, so there are no gaps where a duplicate used to
+be. And the identity goes onto the row it came from, because two different asks answered by one
+pipeline is worth more than a second copy of a file already held. Shapes are compared within one
+camera and one path at a time — the same tables coming out of two different lenses is a finding,
+not a duplicate, and is listed separately as one.
+
+**Not asking for what has already been answered.** The manual stage spends attention rather than
+time, so it shortens as evidence arrives. Once two *different* camera-app engines return the same
+shape for one facing, the third has been answered — this device routes them all to one camera
+app — and is not asked for. Two shots from the same engine agreeing proves only that the engine
+is consistent with itself, and is explicitly not enough. A camera that applied no zoom when asked
+has no range to walk, so its remaining zoom shots go too.
+
+The asymmetry is deliberate: the sweep drops files it already took, but the manual stage stops
+asking instead. A photograph someone stood still to produce is never discarded. Every skip is
+listed on screen with the observation that caused it, so a shorter list is never a quieter one.
+
+**What the pixels say.** Everything else here reads headers — which is what the writer *chose* to
+record. Consolidation made the other kind affordable: with a dozen genuinely different files
+instead of two hundred near-identical ones, each one earns a decode. Two measurements come out of
+a bounded centre sample. The **8×8 block grid**: on the boundary it is just this file's own
+compression and is reported as the non-finding it is; *off* the boundary it means the picture was
+compressed, then cropped or shifted, then compressed again — which a frame straight from a camera
+cannot be. And the **sensor pipeline**: channel balance, tone histogram, clipping at both ends,
+noise floor, distinct luma count.
+
+Four restraints, because a pixel statistic is the easiest thing here to over-read. Scene-dependent
+numbers are labelled scene-dependent and compared only between photographs of the same scene. A
+frame this app encoded from a video track *will* show recompression, because that is literally
+what it is, and it says so itself rather than letting a reader discover it. The sample origin is
+forced onto an 8-pixel boundary so the sampling cannot create the misalignment it is looking for.
+And an axis showing no periodicity is given **no phase** — taking the winner of eight
+near-identical numbers would manufacture an offset out of noise, and an offset is the one serious
+claim this pass makes. Still no verdict, no score, no probability.
+
+**What holds, and what moves.** A spec listing one photograph's tables describes one photograph.
+Each trait is now classified by what it moves *with* — nothing, the production path, one lens, or
+the frame size — which is the part a single file cannot tell you and the part anyone reproducing
+this device most needs. The conservatism is the point: a trait counts as holding everywhere only
+once it has held across more than one scope, so one value seen ten times down a single path on a
+single camera reads as unestablished rather than as a law, and the coverage the classification
+rests on is printed above it.
 
 **A camera that never answers.** `getUserMedia` has no timeout of its own, so a camera that is
 busy, mid-rotation or confused by the two hundredth constraint change in a row does not fail —

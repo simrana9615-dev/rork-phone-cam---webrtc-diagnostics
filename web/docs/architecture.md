@@ -119,12 +119,14 @@ belonging to other apps).
    load warning explicitly labelled as load, not temperature. The byte counter is the
    *smaller* of this stage's two memory costs — see §6b.2 — so the sweep enforces its own
    ceiling rather than trusting what is on screen. Every camera request runs under the
-   ten-second deadline of §6b.6.
+   ten-second deadline of §6b.6, and every still it takes is kept only if its shape is new
+   (§6b.8).
 4. **Manual shots** — two library picks first, then every named camera in the pinned viewfinder
    plus three zoom steps each, then both facings through all three camera-app handoffs. The
    picks lead because they need no camera, no permission and no good light, and they are the
    only evidence in the run for what an ordinary upload form receives from the photo library
-   (§6b.5). They are filed as `picker-file` and never as camera output.
+   (§6b.5). They are filed as `picker-file` and never as camera output. The list shortens as
+   evidence arrives — see §6b.9 — but nothing taken by hand is ever discarded.
 5. **Exports** — the four tick boxes of `lib/deep-probe/export-choice.ts`, the archive **off**
    by default (§6b.3), arriving pre-filled from the dashboard card and the setup screen. Kept
    here as the last checkpoint rather than the first sighting, because with the archive
@@ -132,9 +134,10 @@ belonging to other apps).
    could no longer be acted on. Every stage that did not run is listed on this screen with its
    reason before the choice is confirmed.
 6. **Sheets** — `lib/deep-probe/capture-facts.ts` then `lib/deep-probe/sheets.ts`. One walk
-   over each capture, then every sheet written from the result. Nothing large is held except
-   the two camera-app originals of §6b.7, which are named before the pass starts and offered
-   as plain downloads afterwards.
+   over each capture — checksums, parses, structure and now a bounded pixel sample (§6b.10) —
+   then every sheet written from the result. Nothing large is held except the two camera-app
+   originals of §6b.7, which are named before the pass starts and offered as plain downloads
+   afterwards.
 7. **Archive** *(only if ticked)* — `lib/deep-probe/raw-pack.ts`, then every capture is carved
    back out of the finished blob and compared byte-for-byte, with the result shown on screen.
    The stepper omits this stage entirely when it was not asked for.
@@ -220,6 +223,10 @@ renders the read-only session summary.
 | `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
 | `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
 | `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
+| `deep-probe/capture-signature.ts` | Reduces a file to its device-describing shape, and the ledger that keeps the first of each and records the repeats (§6b.8) |
+| `deep-probe/adaptive-manual.ts` | Decides when a camera-app handoff or a zoom step has been answered already, so the run stops asking (§6b.9) |
+| `deep-probe/pixel-probe.ts` | The bounded pixel sample: 8×8 block grid phase and the sensor pipeline numbers (§6b.10) |
+| `deep-probe/constancy.ts` | Classifies each trait by what it moves with — path, camera, size, or nothing (§6b.11) |
 | `deep-probe/camera-timeout.ts` | The ten-second deadline on every camera request, the sixty-second one on a prompt, and the adoption that stops a stream arriving after its deadline instead of leaving a camera lit behind the run (§6b.6) |
 | `deep-probe/originals.ts` | Chooses the back and front camera-app files, names the downloads and states why a missing one is missing. Only a real camera-app file qualifies (§6b.7) |
 | `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time, plus the two library picks. A pick still cannot promise a fresh photo, so it is never offered as one — it is asked for explicitly as a library file and filed as `picker-file`. The pair differs only in `accept`, which is the measurement (§6b.5) |
@@ -383,6 +390,102 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.8 Shape, not scene — `lib/deep-probe/capture-signature.ts`
+
+A sweep of four cameras through eight resolution rungs and six aspect ratios down two paths is
+well over a hundred files, and most of them were the same file twice. Same container, same
+quantisation tables, same Huffman tables, same marker order, same metadata layout, same
+dimensions — differing only in what the lens happened to be pointed at, which is the one thing
+this app is not measuring.
+
+So every still is reduced to a **shape** before it is kept, and a still whose shape is already
+on file for that camera and that path is not stored. What the shape contains is the whole
+argument, so the module states it in as many words:
+
+- **In** — container, pixel dimensions, chroma subsampling, all 64 coefficients of every
+  quantisation table, every Huffman code-length table, the marker sequence in file order, the
+  APP segment identifiers, TIFF byte order, the directory sequence, the **tag IDs** each
+  directory holds, the maker-note signature, and the colour profile's identity.
+- **Out** — timestamps, GPS, exposure, ISO, aperture, orientation, the file's byte length and
+  the compressed image data itself.
+
+The tag IDs are the subtle case and the one that took the most care: the IDs are *layout* and
+belong in the shape, while the values behind them are the *moment* and must not be. A camera
+that writes its directories in a fixed order is telling you about its firmware; the exposure
+time it wrote there is telling you about the light. Two photographs of two different scenes
+from one camera at one setting are **meant** to collapse to a single shape — that collapse is
+the measurement, not a loss.
+
+The ID is sixteen hex characters from a doubled FNV-1a, chosen for being trivially
+reimplementable rather than for strength: it is a comparison handle, and every component that
+fed it is kept alongside so a match can be argued with instead of taken on trust. Reading it
+costs a bounded 512 KB header slice, not a decode.
+
+Scoping is per camera and per path, deliberately. The same tables coming out of two different
+lenses is a real finding, so each scope keeps its own first copy and shapes appearing under
+several scopes are reported separately as exactly that. Three further rules keep the collapse
+honest: a dropped still is never counted as one that was taken, the slug counter only advances
+on a kept file so the numbering carries no gaps, and the identity is written onto the row — a
+repeat is evidence that two asks share one pipeline, which is worth more than a second copy of
+a file already held.
+
+### 6b.9 Not asking twice — `lib/deep-probe/adaptive-manual.ts`
+
+The manual stage is the only part of a run that spends the user's attention rather than the
+device's time. Two rules shorten it, and both fire only on something the run has actually
+observed.
+
+The three camera-app handoffs are worth trying because on some devices they genuinely return
+different files. Once **two different engines** return the same shape for one facing, the third
+has been answered — this device routes them all to one camera app — so the rest of that
+facing's handoffs are dropped. Two shots from the *same* engine agreeing proves only that the
+engine is consistent with itself, and is explicitly not enough. Likewise, three of the four
+viewfinder shots per camera exist to walk a zoom range; a camera that applied no zoom when
+asked has no range to walk.
+
+The important asymmetry: the sweep drops files it already took, but the manual stage stops
+**asking** instead. A file someone stood still to produce is never discarded — same saving,
+without the discourtesy — and every skip is listed on screen with the observation that caused
+it, so a shorter list is never a quieter one.
+
+### 6b.10 What the pixels say — `lib/deep-probe/pixel-probe.ts`
+
+Everything else in a run reads headers, which is what the writer *chose* to record. The decoded
+picture is the other kind of evidence, and consolidation is what made it affordable: once the
+capture list is a dozen genuinely different files rather than two hundred near-identical ones,
+a bounded 512×512 centre sample per capture costs little.
+
+Two measurements. The **8×8 block grid**: a grid on the boundary is just this file's own
+compression and is reported as the non-finding it is, while a grid *off* the boundary means the
+picture was compressed, then cropped or shifted, then compressed again — which a frame straight
+from a camera cannot be. And the **sensor pipeline**: channel balance, tone histogram, clipping
+at both ends, noise floor, distinct luma count.
+
+Four rules, because a pixel statistic is the easiest thing in forensics to over-read. Scene‑
+dependent numbers are labelled scene-dependent and are comparable only between photographs of
+the same scene. A frame this app encoded from a video track *will* show recompression, because
+that is literally what it is, and the report says so itself rather than leaving a reader to
+discover it. The sample origin is forced onto an 8-pixel boundary so the sampling cannot create
+the misalignment it is looking for. And an axis with no measurable periodicity has **no phase** —
+taking the winner of eight near-identical numbers would manufacture an offset out of noise, and
+an offset is this pass's one serious claim. Nothing here produces a verdict, a score or a
+probability.
+
+### 6b.11 What holds, and what moves — `lib/deep-probe/constancy.ts`
+
+A spec listing one photograph's tables is a description of one photograph. What someone
+reproducing this device needs is the level up: which traits are true of it whatever you ask,
+which change with the production path, which belong to one lens, and which follow the frame
+size. Hold the wrong one constant and the result is wrong in a way no single-file comparison
+would catch.
+
+Each trait is classified against scopes tested in order of how fundamental they are — path,
+then camera, then size — so a trait fitting several is filed under the one that explains it. The
+conservatism is the point: a trait is only **universal** when it held across more than one
+scope, so one value seen ten times down a single path on a single camera reads as
+`unestablished` rather than as a law. A trait no capture could observe is dropped rather than
+reported empty, and the coverage the classification rests on is printed above it.
 
 ### 6b.6 The camera deadline — `lib/deep-probe/camera-timeout.ts`
 

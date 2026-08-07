@@ -18,8 +18,9 @@
 
 import { formatBytes, type LogEntry } from "../camera-diagnostics";
 import type { CaptureFacts } from "./capture-facts";
-import { ORIGIN_TEXT } from "./capture-facts";
+import { constancyObservations, ORIGIN_TEXT } from "./capture-facts";
 import type { CameraMatrixReport } from "./camera-matrix";
+import { buildConstancy } from "./constancy";
 import { briefChecklist, buildCorrelationBrief, type CorrelationInput } from "./correlation-brief";
 import { buildMimicSpec } from "./mimic-spec";
 import type { PassiveGroup } from "./passive";
@@ -471,6 +472,12 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
           { label: "Bytes", value: `${f.bytes.toLocaleString("en-US")} (${formatBytes(f.bytes)})` },
           { label: "MIME", value: f.mime || "not declared" },
           { label: "Container", value: f.structure.container },
+          {
+            label: "File shape",
+            value: f.shape
+              ? `${f.shape.id} — the device-describing parts of this file, folded into one comparable handle. Two captures sharing it are the same file in every respect except the moment.`
+              : "not readable",
+          },
           { label: "Structure", value: `${f.structure.segments.length} carvable region(s), ${f.structure.nodes.length} node(s)` },
           { label: "Encoder tables", value: quantSummary(f) },
           { label: "Huffman tables", value: f.encoder ? String(f.encoder.huffmanTables.length) : "—" },
@@ -487,6 +494,21 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
           { label: "File name as delivered", value: f.fileName ?? "no File object on this path" },
           { label: "File lastModified", value: f.fileLastModified != null ? String(f.fileLastModified) : "—" },
           { label: "Taken at", value: f.takenAt },
+          {
+            label: "8x8 block grid",
+            value: f.pixels
+              ? f.pixels.grid.reading
+              : (f.pixelsUnavailable ?? "not measured, and no reason was recorded — which is itself a fault."),
+            tone: f.pixels && f.pixels.grid.present && !f.pixels.grid.aligned && f.origin !== "app-encoded-frame" ? "warn" : undefined,
+          },
+          {
+            label: "Sensor pipeline",
+            value: f.pixels
+              ? `channel means R ${f.pixels.tone.meanR} G ${f.pixels.tone.meanG} B ${f.pixels.tone.meanB} · balance R/G ${f.pixels.tone.ratioRG}, B/G ${f.pixels.tone.ratioBG} · ` +
+                `${(f.pixels.tone.clippedLow * 100).toFixed(3)}% pure black, ${(f.pixels.tone.clippedHigh * 100).toFixed(3)}% pure white · noise floor ${f.pixels.tone.noise} · ` +
+                `${f.pixels.tone.distinctLuma} of 256 luma values present. These are scene-dependent: compare them between photographs of the same scene, never across different ones.`
+              : "not measured",
+          },
           { label: "MD5", value: f.hashes.md5 },
           { label: "SHA-1", value: f.hashes.sha1 },
           { label: "SHA-256", value: f.hashes.sha256 },
@@ -499,8 +521,48 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
   sections.push({
     id: "photos",
     title: "Every photo, in full",
-    blurb: "Per photo: which path produced it, its true dimensions, its encoder fingerprint, its compression tables, its metadata directories, its colour profile, its internal structure and four checksums.",
+    blurb:
+      "Per photo: which path produced it, its true dimensions, its encoder fingerprint, its compression tables, its metadata directories, its colour profile, its internal structure, what its pixels measure and four checksums.",
     blocks: photoBlocks,
+  });
+
+  const constancy = buildConstancy(constancyObservations(facts));
+  const constancyBlocks: SheetBlock[] = [
+    {
+      kind: "prose",
+      text:
+        "Each trait is classified by what it moves WITH, which is the part no single file can tell you. " +
+        "Hold the wrong one constant and the result is wrong in a way a one-file comparison would never catch. " +
+        "Nothing here is extrapolated to a request this run never made.",
+    },
+    {
+      kind: "rows",
+      rows: [
+        { label: "Photos classified", value: String(constancy.coverage.captures) },
+        { label: "Production paths covered", value: constancy.coverage.paths.join(", ") || "none" },
+        { label: "Cameras covered", value: constancy.coverage.cameras.join(", ") || "none" },
+        { label: "Frame sizes covered", value: constancy.coverage.sizes.join(", ") || "none" },
+      ],
+    },
+  ];
+  for (const note of constancy.notes) constancyBlocks.push({ kind: "prose", text: `! ${note}` });
+  if (constancy.traits.length > 0) {
+    constancyBlocks.push({
+      kind: "table",
+      head: ["Trait", "Moves with", "Values seen", "What to do with it"],
+      rows: constancy.traits.map((trait) => [
+        trait.name,
+        trait.classification,
+        trait.values.length === 1 ? trait.values[0].value : `${trait.values.length} distinct: ${trait.values.map((v) => v.value).slice(0, 3).join(" | ")}`,
+        trait.guidance,
+      ]),
+    });
+  }
+  sections.push({
+    id: "constancy",
+    title: "What holds, and what moves",
+    blurb: "Which traits held across every camera and path, which follow the path, which belong to one lens, and which follow the frame size.",
+    blocks: constancyBlocks,
   });
 
   sections.push({

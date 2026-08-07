@@ -28,11 +28,14 @@ import ExifReader from "exifreader";
 import { safeZipPath } from "../zip-writer";
 import { breatheEvery } from "./breathe";
 import type { ProbeCapture } from "./camera-matrix";
+import { shapeFromBytes, type ShapeSignature } from "./capture-signature";
+import type { ConstancyObservation } from "./constancy";
 import type { BriefCapture } from "./correlation-brief";
 import { readExifIfds, type ExifIfdReport } from "./exif-ifd";
 import { hashBlob, type FileHashes } from "./hashes";
 import { readJpegEncoderBytes, type JpegEncoderReport } from "./jpeg-encoder";
 import { STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
+import { probePixels, type PixelReport } from "./pixel-probe";
 import { walkStructure, type StructureReport } from "./raw-bytes";
 
 const MIME_EXT: Record<string, string> = {
@@ -197,6 +200,12 @@ export type CaptureFacts = {
   tags: TagDump;
   /** MD5 of the exact colour-profile bytes, when a profile is embedded. */
   iccMd5: string | null;
+  /** The forensic shape — the parts of the file that describe the device rather than the moment. */
+  shape: ShapeSignature | null;
+  /** Measurements taken from the decoded picture, when it could be decoded. */
+  pixels: PixelReport | null;
+  /** Why there are no pixel measurements. Null when there are. */
+  pixelsUnavailable: string | null;
   /** Facts about this capture in the shape the mimic spec consumes. */
   spec: MimicCaptureFact;
   /** The same in the shape the correlation brief consumes. */
@@ -262,6 +271,8 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
   const breather = breatheEvery();
   let done = 0;
   let bytesRead = 0;
+  /** Stops a browser-wide absence of a decoder being reported once per capture. */
+  let pixelEnvironmentNoted = false;
   let heldBytes = queue.reduce((sum, capture) => sum + capture.blob.size, 0);
 
   while (queue.length > 0) {
@@ -281,13 +292,17 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
     options.onStep?.(`Parsing ${capture.slug}`);
     let encoder: JpegEncoderReport | null = null;
     let ifd: ExifIfdReport | null = null;
+    let shape: ShapeSignature | null = null;
     let tags: TagDump = { text: `TAG DUMP — ${capture.label}\n\nThe bytes could not be read.`, count: 0, unknown: 0, metadataCount: 0, keys: [], stableTags: {} };
     try {
-      // One read of the bytes feeds all three parsers. Reading three times was
-      // three full copies of the file alive at once for no benefit.
+      // One read of the bytes feeds all four parsers. Reading four times was
+      // four full copies of the file alive at once for no benefit.
       const bytes = new Uint8Array(await capture.blob.arrayBuffer());
       encoder = readJpegEncoderBytes(bytes);
       ifd = readExifIfds(bytes);
+      // The whole file is in hand here, so the shape is read from all of it
+      // rather than from the bounded header slice the sweep had to settle for.
+      shape = shapeFromBytes(bytes, false);
       tags = tagDumpFromBytes(bytes, capture.label);
     } catch (err) {
       captureWarnings.push(
@@ -305,6 +320,26 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
         iccMd5 = (await hashBlob(capture.blob.slice(icc.offset, icc.offset + icc.length))).md5;
       } catch {
         iccMd5 = null;
+      }
+    }
+    await breather.tick();
+
+    // The decoded picture is the one kind of evidence that is not a header
+    // field, so it earns a decode — but only now that consolidation has cut the
+    // list down to files that genuinely differ from each other. Doing this to a
+    // hundred near-identical frames would have been the memory problem again.
+    options.onStep?.(`Measuring the pixels of ${capture.slug}`);
+    const pixelPass = await probePixels(capture.blob);
+    if (pixelPass.reason != null) {
+      // An environmental absence is one fact about the browser, said once. Only
+      // a failure that belongs to THIS picture is charged to this capture.
+      if (pixelPass.environmental) {
+        if (!pixelEnvironmentNoted) {
+          pixelEnvironmentNoted = true;
+          warnings.push(pixelPass.reason);
+        }
+      } else {
+        captureWarnings.push(`${capture.slug}: ${pixelPass.reason}`);
       }
     }
     await breather.tick();
@@ -344,6 +379,9 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
       structure,
       tags,
       iccMd5,
+      shape,
+      pixels: pixelPass.report,
+      pixelsUnavailable: pixelPass.reason,
       spec: {
         slug: capture.slug,
         origin: capture.origin,
@@ -397,4 +435,63 @@ export async function readCaptureFacts(captures: ProbeCapture[], options: FactsO
     bytesRead,
     yields: breather.yields(),
   };
+}
+
+/**
+ * Turns the facts into the observations the constancy pass classifies.
+ *
+ * A trait is only listed for a capture that could actually show it. A JPEG
+ * table on a HEIC file is not "absent", it is inapplicable, and feeding it in as
+ * an empty string would invent a difference between two files that differ only
+ * in what they are. Anything unreadable is left out of the map entirely, which
+ * is what the classifier treats as "not observable here".
+ */
+export function constancyObservations(facts: CaptureFacts[]): ConstancyObservation[] {
+  return facts.map((fact) => {
+    const traits: Record<string, string> = {
+      "declared type": fact.mime || "(none declared)",
+      container: fact.structure.container,
+      "file shape": fact.shape?.id ?? "unreadable",
+    };
+    if (fact.encoder?.isJpeg) {
+      traits["JFIF header"] = fact.encoder.hasJfif ? `present, v${fact.encoder.jfifVersion ?? "unreadable"}` : "absent";
+      traits["restart interval"] = fact.encoder.restartInterval != null ? String(fact.encoder.restartInterval) : "none set";
+      if (fact.encoder.frame) {
+        traits["frame mode"] = fact.encoder.frame.mode;
+        traits["chroma subsampling"] = fact.encoder.frame.subsampling;
+      }
+      if (fact.encoder.quantTables.length > 0) {
+        traits["quantisation table sums"] = fact.encoder.quantTables.map((table) => `${table.id}:${table.sum}`).join(" ");
+      }
+      if (fact.encoder.huffmanTables.length > 0) {
+        traits["Huffman tables"] = fact.encoder.huffmanTables.every((table) => table.annexKMatch != null)
+          ? "all standard Annex K"
+          : fact.encoder.huffmanTables.some((table) => table.annexKMatch != null)
+            ? "mixed standard and optimised"
+            : "all optimised for the image";
+      }
+      traits["embedded thumbnail"] = fact.encoder.thumbnail ? `${fact.encoder.thumbnail.width ?? "?"}×${fact.encoder.thumbnail.height ?? "?"}` : "none";
+      if (fact.encoder.icc) traits["colour profile"] = fact.encoder.icc.description ?? `(unnamed, creator ${fact.encoder.icc.creator})`;
+      else traits["colour profile"] = "none embedded";
+    }
+    if (fact.ifd && fact.ifd.byteOrder !== "unknown") {
+      traits["TIFF byte order"] = fact.ifd.byteOrder;
+      traits["maker note"] = fact.ifd.makerNote ? `"${fact.ifd.makerNote.signature}"` : "absent";
+    }
+    if (fact.pixels) {
+      traits["8x8 block grid"] = !fact.pixels.grid.present
+        ? "none measurable"
+        : fact.pixels.grid.aligned
+          ? "aligned — this file's own compression"
+          : `offset at phase (${fact.pixels.grid.phaseX}, ${fact.pixels.grid.phaseY}) — compressed before this one`;
+    }
+    return {
+      slug: fact.slug,
+      deviceLabel: fact.deviceLabel,
+      path: fact.path,
+      width: fact.width,
+      height: fact.height,
+      traits,
+    };
+  });
 }

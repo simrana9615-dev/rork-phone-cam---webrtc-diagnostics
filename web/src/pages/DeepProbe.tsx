@@ -33,8 +33,10 @@ import { Button } from "@/components/ui/button";
 import { downloadBlob, formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
+import { handoffDecision, zoomSkipReason, type AdaptiveSkip, type HandoffSighting, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
 import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
+import { readShape } from "@/lib/deep-probe/capture-signature";
 import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
 import { useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
@@ -214,6 +216,8 @@ export default function DeepProbe() {
   const [manualIndex, setManualIndex] = useState<number>(0);
   const [manualBusy, setManualBusy] = useState<boolean>(false);
   const [manualNotes, setManualNotes] = useState<string[]>([]);
+  /** Shots the run proved redundant and stopped asking for. */
+  const [adaptiveSkips, setAdaptiveSkips] = useState<AdaptiveSkip[]>([]);
 
   const [buildMessage, setBuildMessage] = useState<string>("");
   const [buildPct, setBuildPct] = useState<number>(0);
@@ -244,6 +248,13 @@ export default function DeepProbe() {
    * and the production path are only known for certain at the moment of capture.
    */
   const originalCandidatesRef = useRef<OriginalCandidate[]>([]);
+  /**
+   * Camera-app files seen so far, reduced to their shapes. Two different
+   * engines returning one shape is what proves the remaining handoffs for that
+   * facing would collect a third copy of a file already in hand.
+   */
+  const handoffSightingsRef = useRef<HandoffSighting[]>([]);
+  const adaptiveSkipsRef = useRef<AdaptiveSkip[]>([]);
   const passiveRef = useRef<PassiveGroup[]>([]);
   const statesBeforeRef = useRef<{ name: string; state: string | null }[]>([]);
   const statesAfterRef = useRef<{ name: string; state: string | null }[]>([]);
@@ -693,6 +704,23 @@ export default function DeepProbe() {
   const takeManual = useCallback(async (): Promise<void> => {
     const step = manualSteps[manualIndex];
     if (!step) return;
+
+    /**
+     * Drops shots the run has just PROVED redundant. Only ever touches steps
+     * ahead of the current one, so a shot already taken can never be rewritten
+     * as one that was skipped.
+     */
+    const dropAhead = (predicate: (candidate: ManualStep) => boolean, reason: string): void => {
+      const doomed = manualSteps.filter((candidate, i) => i > manualIndex && predicate(candidate));
+      if (doomed.length === 0) return;
+      const doomedIds = new Set(doomed.map((candidate) => candidate.id));
+      adaptiveSkipsRef.current.push(...doomed.map((candidate) => ({ stepId: candidate.id, title: candidate.title, reason })));
+      setAdaptiveSkips([...adaptiveSkipsRef.current]);
+      setManualSteps((prev) => prev.filter((candidate) => !doomedIds.has(candidate.id)));
+      setManualNotes((prev) => [...prev, `${doomed.length} shot(s) not asked for — ${doomed.map((candidate) => candidate.title).join(", ")}. ${reason}`]);
+      addLog("info", `Dropped ${doomed.length} remaining shot(s). ${reason}`);
+    };
+
     setManualBusy(true);
     try {
       if (step.kind === "viewfinder") {
@@ -719,6 +747,12 @@ export default function DeepProbe() {
         setByteCount((b) => b + shot.blob.size);
         addLog("success", `${step.title}: ${shot.width}×${shot.height}, ${formatBytes(shot.blob.size)} via ${shot.path === "image-capture" ? "the platform photo pipeline" : "a canvas encode by this app"}.`);
         if (shot.zoomNote) addLog("debug", shot.zoomNote);
+        // A zoom step that applied no zoom is the camera saying it has no range.
+        // The remaining two would each be an identical unzoomed frame carrying
+        // an identical note, which is one fact recorded twice more.
+        if (step.zoom != null && shot.zoomApplied == null) {
+          dropAhead((candidate) => candidate.kind === "viewfinder" && candidate.deviceId === step.deviceId && candidate.zoom != null, zoomSkipReason(step.deviceLabel));
+        }
       } else if (step.spec) {
         const spec = step.spec;
         const result = await runManualShot(spec);
@@ -747,6 +781,22 @@ export default function DeepProbe() {
         // for certain. A library pick never qualifies, however rich its metadata.
         if (!isLibrary && spec.facing != null) {
           originalCandidatesRef.current.push({ slug: capture.slug, facing: spec.facing, path: capture.path, origin: capture.origin });
+        }
+        // A file taken by hand is never thrown away — it cost someone a minute
+        // of standing still. What its shape can do is stop the run ASKING for
+        // the next one, which is the same saving without the discourtesy.
+        if (!isLibrary && spec.facing != null) {
+          const facing: ManualFacing = spec.facing;
+          const shape = await readShape(result.file);
+          handoffSightingsRef.current.push({ engine: String(spec.engine), facing, shapeId: shape.id, slug: capture.slug });
+          const remaining = manualSteps
+            .filter((candidate, i) => i > manualIndex && candidate.kind === "camera-app" && candidate.spec?.facing === facing)
+            .map((candidate) => String(candidate.spec?.engine ?? ""));
+          const decision = handoffDecision(handoffSightingsRef.current, facing, remaining);
+          if (decision.reason != null) {
+            const skipping = new Set(decision.skipEngines);
+            dropAhead((candidate) => candidate.kind === "camera-app" && candidate.spec?.facing === facing && skipping.has(String(candidate.spec?.engine ?? "")), decision.reason);
+          }
         }
         setPhotoCount(capturesRef.current.length);
         setByteCount((b) => b + result.file.size);
@@ -1268,6 +1318,21 @@ export default function DeepProbe() {
                     Skip
                   </Button>
                 </div>
+              </div>
+            </div>
+          ) : null}
+          {adaptiveSkips.length > 0 ? (
+            <div className="diag-card overflow-hidden">
+              <div className="border-b border-border/60 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                {adaptiveSkips.length} shot{adaptiveSkips.length === 1 ? "" : "s"} you were not asked for
+              </div>
+              <div className="divide-y divide-border/50">
+                {adaptiveSkips.map((skip) => (
+                  <div key={skip.stepId} className="px-3 py-2">
+                    <div className="text-[11.5px] font-semibold">{skip.title}</div>
+                    <p className="mt-0.5 text-[10.5px] leading-relaxed text-muted-foreground">{skip.reason}</p>
+                  </div>
+                ))}
               </div>
             </div>
           ) : null}
