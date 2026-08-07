@@ -331,6 +331,13 @@ export type SweepOptions = {
   onCapture: (capture: ProbeCapture) => void;
   /** Polled between steps; returning true ends the sweep cleanly at the next boundary. */
   shouldAbort: () => boolean;
+  /**
+   * Awaited at every step boundary, so a pause always lands between steps and
+   * never mid-step. Half-applying a constraint and then holding the track open
+   * would leave a row whose granted settings describe a paused camera rather
+   * than the setting under test.
+   */
+  waitWhilePaused?: () => Promise<void>;
 };
 
 /**
@@ -384,6 +391,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   };
 
   for (const device of inventory) {
+    await options.waitWhilePaused?.();
     if (options.shouldAbort()) {
       aborted = true;
       break;
@@ -392,6 +400,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     let capabilities: MediaTrackCapabilities | null = null;
 
     for (const step of planFor(device.deviceId)) {
+      await options.waitWhilePaused?.();
       if (options.shouldAbort()) {
         aborted = true;
         break;
@@ -517,6 +526,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       }
       const track = stream?.getVideoTracks()[0] ?? null;
       for (const control of controls) {
+        await options.waitWhilePaused?.();
         if (options.shouldAbort()) {
           aborted = true;
           break;

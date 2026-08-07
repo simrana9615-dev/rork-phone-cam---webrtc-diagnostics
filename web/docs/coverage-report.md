@@ -280,6 +280,16 @@ digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, s
 log and byte-identity data. Stopping early keeps everything gathered; the archive is
 named `…-PARTIAL.zip` and lists every omitted stage with its reason.
 
+**Interruption:** Pause and Stop are available throughout. A pause always lands *between*
+steps — the recording or constraint in flight completes first, because a half-recorded
+sensor window or a half-applied constraint would describe a paused device rather than the
+setting under test. Stop is immediate: the recorders poll for it, so a 25-second location
+watch ends on request rather than running out its window, and any window cut short says so
+in its own note instead of scaling its rate up to the window that was planned.
+Backgrounding the page — unavoidable during the camera-app handoff — is timed and logged,
+so the gaps in the archive's timeline are explained rather than left looking like missing
+evidence.
+
 ---
 
 ## 5. Verdict fusion recap

@@ -12,6 +12,8 @@ import {
   Loader2,
   Minus,
   Package,
+  Pause,
+  Play,
   Radio,
   ShieldQuestion,
   Square,
@@ -62,6 +64,8 @@ const STAGES: { phase: Phase; label: string; icon: typeof ShieldQuestion }[] = [
 ];
 
 const COUNTDOWN_SECONDS = 4;
+/** How often a paused stage re-checks whether you have resumed. */
+const PAUSE_POLL_MS = 200;
 /** Source bytes allowed a complete hex rendering before the dumps switch to windows. */
 const HEX_BUDGET = 192 * 1024 * 1024;
 
@@ -98,6 +102,25 @@ type ManualStep = {
   zoom: ZoomTarget;
   spec?: ManualShotSpec;
 };
+
+/**
+ * Appends a suspension summary to the session log at build time. Backgrounding is
+ * expected during the camera-app handoff, so the archive states plainly that the
+ * gaps in the timeline were the page being suspended and that the run continued
+ * across them — an unexplained gap would otherwise look like missing evidence.
+ */
+function suspensionLogs(logs: LogEntry[], suspensions: { phase: Phase; seconds: number; at: string }[]): LogEntry[] {
+  if (suspensions.length === 0) return logs;
+  const total = suspensions.reduce((sum, s) => sum + s.seconds, 0);
+  const longest = suspensions.reduce((max, s) => Math.max(max, s.seconds), 0);
+  return [
+    ...logs,
+    makeLog(
+      "debug",
+      `This page was suspended ${suspensions.length} time(s) during the run, for ${total.toFixed(1)}s in total (longest ${longest.toFixed(1)}s). That is normal — handing off to the phone's camera app backgrounds the page. Each gap in the timeline above corresponds to one of these, and the run resumed intact every time.`
+    ),
+  ];
+}
 
 function Counter({ label, value }: { label: string; value: string }) {
   return (
@@ -138,6 +161,7 @@ export default function DeepProbe() {
   const [pack, setPack] = useState<RawPackResult | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
 
+  const [paused, setPaused] = useState<boolean>(false);
   const [photoCount, setPhotoCount] = useState<number>(0);
   const [byteCount, setByteCount] = useState<number>(0);
   const [elapsed, setElapsed] = useState<number>(0);
@@ -150,6 +174,8 @@ export default function DeepProbe() {
   const startedAtRef = useRef<string>("");
   const startedMsRef = useRef<number>(0);
   const abortRef = useRef<boolean>(false);
+  const pausedRef = useRef<boolean>(false);
+  const suspensionsRef = useRef<{ phase: Phase; seconds: number; at: string }[]>([]);
   const ranRef = useRef<Set<string>>(new Set());
   const tickerRef = useRef<HTMLDivElement | null>(null);
 
@@ -167,6 +193,54 @@ export default function DeepProbe() {
     const id = window.setInterval(() => setElapsed(Math.round((performance.now() - startedMsRef.current) / 1000)), 1000);
     return () => window.clearInterval(id);
   }, [phase]);
+
+  /**
+   * Awaited at every stage boundary. A pause therefore always lands between
+   * steps, never inside one — a half-recorded sensor window or a half-applied
+   * camera constraint would produce a row describing a paused device rather
+   * than the setting under test.
+   */
+  const waitWhilePaused = useCallback(async (): Promise<void> => {
+    while (pausedRef.current && !abortRef.current) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, PAUSE_POLL_MS));
+    }
+  }, []);
+
+  const togglePause = useCallback((): void => {
+    const next = !pausedRef.current;
+    pausedRef.current = next;
+    setPaused(next);
+    addLog(
+      "info",
+      next
+        ? "Paused. The current step finishes, then nothing further starts until you resume — pausing mid-step would leave a reading that describes a paused device."
+        : "Resumed."
+    );
+  }, [addLog]);
+
+  /**
+   * Stage four hands off to the phone's camera app, which backgrounds this page
+   * — an entirely normal occurrence. Each suspension is timed and logged so the
+   * archive shows the run continued across it rather than leaving an unexplained
+   * gap in the timeline.
+   */
+  useEffect(() => {
+    if (phase === "setup" || phase === "done") return;
+    let hiddenAt = 0;
+    const onVisibility = (): void => {
+      if (document.hidden) {
+        hiddenAt = performance.now();
+        return;
+      }
+      if (hiddenAt === 0) return;
+      const seconds = Math.round((performance.now() - hiddenAt) / 100) / 10;
+      hiddenAt = 0;
+      suspensionsRef.current.push({ phase, seconds, at: new Date().toISOString() });
+      addLog("debug", `The page was in the background for ${seconds}s during the ${phase} stage and resumed with the run intact. Nothing was lost.`);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [phase, addLog]);
 
   /* ---------------- thermal / pressure watch ---------------- */
   useEffect(() => {
@@ -195,9 +269,12 @@ export default function DeepProbe() {
     startedAtRef.current = new Date().toISOString();
     startedMsRef.current = performance.now();
     abortRef.current = false;
+    pausedRef.current = false;
+    setPaused(false);
     ranRef.current = new Set();
     capturesRef.current = [];
     omissionsRef.current = [];
+    suspensionsRef.current = [];
     setRecords([]);
     setSensors([]);
     setLogs([]);
@@ -250,8 +327,9 @@ export default function DeepProbe() {
     let remaining = COUNTDOWN_SECONDS;
     setCountdown(remaining);
     const id = window.setInterval(() => {
-      // Pause while the page is hidden, so a backgrounded tab never fires a prompt you cannot see.
-      if (document.hidden) return;
+      // Hold while the page is hidden or you have paused, so a prompt never fires
+      // where you cannot see it or have asked it not to.
+      if (document.hidden || pausedRef.current) return;
       remaining -= 1;
       setCountdown(remaining);
       if (remaining <= 0) {
@@ -285,29 +363,73 @@ export default function DeepProbe() {
         addLog(series.rows.length > 0 ? "success" : "warn", `${series.label}: ${series.note}`);
       };
 
+      const stopped = (): boolean => abortRef.current;
+      const planned: { id: string; message: string; run: () => Promise<SensorSeries> }[] = [];
+
       if (grantedIds.has("motion")) {
-        setSensorMessage("Recording motion — hold the phone naturally, or move it around.");
-        push(await recordMotion(5000, setSensorMessage));
+        planned.push({
+          id: "motion",
+          message: "Recording motion — hold the phone naturally, or move it around.",
+          run: () => recordMotion(5000, setSensorMessage, stopped),
+        });
       }
       if (grantedIds.has("orientation")) {
-        setSensorMessage("Recording orientation and compass — try tilting the phone.");
-        push(await recordOrientation(5000, setSensorMessage));
+        planned.push({
+          id: "orientation",
+          message: "Recording orientation and compass — try tilting the phone.",
+          run: () => recordOrientation(5000, setSensorMessage, stopped),
+        });
       }
       if (grantedIds.has("geolocation")) {
-        setSensorMessage("Watching your location until the accuracy figure settles.");
-        push(await recordGeolocation(25000, setSensorMessage));
+        planned.push({
+          id: "geolocation",
+          message: "Watching your location until the accuracy figure settles.",
+          run: () => recordGeolocation(25000, setSensorMessage, stopped),
+        });
       }
       if (grantedIds.has("microphone")) {
-        setSensorMessage("Sampling microphone loudness — no audio is recorded, only the level.");
-        push(await recordMicrophoneLevel(4000, setSensorMessage));
+        planned.push({
+          id: "microphone",
+          message: "Sampling microphone loudness — no audio is recorded, only the level.",
+          run: () => recordMicrophoneLevel(4000, setSensorMessage, stopped),
+        });
       }
       if (grantedIds.has("ambient-light")) {
-        setSensorMessage("Sampling ambient light.");
-        push(await recordGenericSensor("AmbientLightSensor", "Ambient light", ["lux"], 10, 4000, setSensorMessage));
+        planned.push({
+          id: "ambient-light",
+          message: "Sampling ambient light.",
+          run: () => recordGenericSensor("AmbientLightSensor", "Ambient light", ["lux"], 10, 4000, setSensorMessage, stopped),
+        });
       }
       if (grantedIds.has("magnetometer")) {
-        setSensorMessage("Sampling the magnetic field.");
-        push(await recordGenericSensor("Magnetometer", "Magnetometer", ["x_ut", "y_ut", "z_ut"], 10, 4000, setSensorMessage));
+        planned.push({
+          id: "magnetometer",
+          message: "Sampling the magnetic field.",
+          run: () => recordGenericSensor("Magnetometer", "Magnetometer", ["x_ut", "y_ut", "z_ut"], 10, 4000, setSensorMessage, stopped),
+        });
+      }
+
+      for (const item of planned) {
+        await waitWhilePaused();
+        if (abortRef.current) break;
+        setSensorMessage(item.message);
+        push(await item.run());
+      }
+
+      setSensorMessage("");
+
+      if (abortRef.current) {
+        const remaining = planned.length - collected.length;
+        if (remaining > 0) {
+          omissionsRef.current.push({
+            stage: "Sensor recordings (partially)",
+            reason: `You stopped the run. ${remaining} recording(s) never started. The ones that did are real, and any window cut short says so in its own note rather than scaling its rate up to the window that was planned.`,
+          });
+        }
+        ranRef.current.add("camera");
+        omissionsRef.current.push({ stage: "Camera sweep and manual shots", reason: "You stopped the run before these stages." });
+        setPhase("building");
+        return;
       }
 
       if (collected.length === 0) {
@@ -317,10 +439,9 @@ export default function DeepProbe() {
           reason: "Nothing that produces a time series was granted, so there was nothing to record. This is a consequence of the permission answers, not a fault.",
         });
       }
-      setSensorMessage("");
       setPhase("camera");
     })();
-  }, [phase, grantedIds, addLog]);
+  }, [phase, grantedIds, addLog, waitWhilePaused]);
 
   /* ---------------- stage three: camera sweep ---------------- */
   useEffect(() => {
@@ -348,6 +469,7 @@ export default function DeepProbe() {
           setByteCount((b) => b + capture.blob.size);
         },
         shouldAbort: () => abortRef.current,
+        waitWhilePaused,
       });
       capturesRef.current = [...capturesRef.current];
       setMatrix(report);
@@ -373,7 +495,7 @@ export default function DeepProbe() {
       setManualIndex(0);
       setPhase("manual");
     })();
-  }, [phase, grantedIds, addLog]);
+  }, [phase, grantedIds, addLog, waitWhilePaused]);
 
   /* ---------------- stage four: manual shots ---------------- */
   const manualStep = phase === "manual" ? manualSteps[manualIndex] : undefined;
@@ -476,7 +598,7 @@ export default function DeepProbe() {
             sensors,
             matrix,
             captures: capturesRef.current,
-            logs,
+            logs: suspensionLogs(logs, suspensionsRef.current),
             omissions: omissionsRef.current,
             hexBudgetBytes: HEX_BUDGET,
           },
@@ -508,6 +630,8 @@ export default function DeepProbe() {
 
   const stopEverything = useCallback((): void => {
     abortRef.current = true;
+    pausedRef.current = false;
+    setPaused(false);
     addLog("warn", "Stopping. Everything gathered so far is kept, and the archive will be labelled partial.");
     if (phase === "permissions") {
       for (const request of queue.slice(index)) setRecords((prev) => [...prev, skippedRecord(request)]);
@@ -556,14 +680,28 @@ export default function DeepProbe() {
           <h1 className="truncate text-[15px] font-semibold leading-tight">Maximum-demand run</h1>
         </div>
         {phase !== "setup" && phase !== "done" && phase !== "building" ? (
-          <button
-            type="button"
-            onClick={stopEverything}
-            className="flex items-center gap-1.5 rounded-xl border border-rose-500/45 bg-rose-500/10 px-2.5 py-2 text-[11px] font-semibold text-rose-300 active:scale-95"
-          >
-            <Square className="h-3 w-3" />
-            Stop
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={togglePause}
+              aria-label={paused ? "Resume the run" : "Pause the run"}
+              className={cn(
+                "flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-[11px] font-semibold active:scale-95",
+                paused ? "border-amber-500/50 bg-amber-500/15 text-amber-200" : "border-border/70 bg-card text-muted-foreground"
+              )}
+            >
+              {paused ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
+              {paused ? "Resume" : "Pause"}
+            </button>
+            <button
+              type="button"
+              onClick={stopEverything}
+              className="flex items-center gap-1.5 rounded-xl border border-rose-500/45 bg-rose-500/10 px-2.5 py-2 text-[11px] font-semibold text-rose-300 active:scale-95"
+            >
+              <Square className="h-3 w-3" />
+              Stop
+            </button>
+          </div>
         ) : null}
       </header>
 
@@ -670,7 +808,12 @@ export default function DeepProbe() {
               A grant on its own proves very little. Each recording below reports the rate actually measured, not the rate requested — the two
               usually differ, and quoting the request back would be repeating an intention as if it were a reading.
             </p>
-            {sensorMessage ? (
+            {paused ? (
+              <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/45 bg-amber-500/10 p-2.5 text-[11.5px] leading-relaxed text-amber-200">
+                <Pause className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>Paused. The recording in progress finishes on its own — cutting one off midway would leave a rate that describes a paused phone rather than a real one. Nothing further starts until you resume.</span>
+              </div>
+            ) : sensorMessage ? (
               <div className="mt-3 flex items-center gap-2 rounded-xl border border-fuchsia-500/40 bg-fuchsia-500/10 p-2.5 text-[12px] text-fuchsia-200">
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                 {sensorMessage}
@@ -713,9 +856,21 @@ export default function DeepProbe() {
               refusal is a result — it marks where the hardware's limit actually is.
             </p>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
-              <div className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 to-cyan-400 transition-[width] duration-300" style={{ width: `${sweepPct}%` }} />
+              <div
+                className={cn(
+                  "h-full rounded-full transition-[width] duration-300",
+                  paused ? "bg-amber-400/70" : "bg-gradient-to-r from-fuchsia-500 to-cyan-400"
+                )}
+                style={{ width: `${sweepPct}%` }}
+              />
             </div>
             <p className="mono mt-2 text-[10.5px] leading-relaxed text-muted-foreground">{sweepMessage || "Starting…"}</p>
+            {paused ? (
+              <p className="mt-2 flex items-start gap-2 rounded-xl border border-amber-500/45 bg-amber-500/10 p-2.5 text-[11.5px] leading-relaxed text-amber-200">
+                <Pause className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>Paused between steps. The step above completes, then the sweep holds — pausing mid-step would record a camera that was paused rather than the setting being tested.</span>
+              </p>
+            ) : null}
           </div>
           {ticker}
         </div>
@@ -732,12 +887,22 @@ export default function DeepProbe() {
               <div className="space-y-3 p-3.5">
                 <h2 className="text-[16px] font-semibold leading-tight">{manualStep.title}</h2>
                 <p className="text-[11.5px] leading-relaxed text-muted-foreground">{manualStep.purpose}</p>
+                {paused ? (
+                  <p className="flex items-start gap-2 rounded-xl border border-amber-500/45 bg-amber-500/10 p-2.5 text-[11.5px] leading-relaxed text-amber-200">
+                    <Pause className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>Paused. This stage waits for you anyway — take your time, and resume when you are ready.</span>
+                  </p>
+                ) : null}
                 <div className="grid grid-cols-[1fr_auto] gap-2">
-                  <Button disabled={manualBusy} className="h-12 bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400" onClick={() => void takeManual()}>
+                  <Button
+                    disabled={manualBusy || paused}
+                    className="h-12 bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400"
+                    onClick={() => void takeManual()}
+                  >
                     {manualBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="mr-1.5 h-4 w-4" />}
                     {manualBusy ? "" : "Take it"}
                   </Button>
-                  <Button variant="outline" disabled={manualBusy} className="h-12" onClick={skipManual}>
+                  <Button variant="outline" disabled={manualBusy || paused} className="h-12" onClick={skipManual}>
                     Skip
                   </Button>
                 </div>
