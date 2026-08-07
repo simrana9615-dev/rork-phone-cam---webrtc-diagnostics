@@ -8,61 +8,55 @@
  * because nobody needs to carve a hex dump out at a byte offset and refusing to
  * compress it would triple an already large archive for no gain.
  *
+ * This file no longer reads the captures. The facts pass does that once, up
+ * front, and the sheets are written from the result — so a run that never asks
+ * for an archive never enters this file at all, and a run that does still only
+ * walks the bytes once for facts and once for hex. What remains here is the
+ * genuinely archive-shaped work: hex renderings, segment carving, assembly and
+ * the byte-identity re-check.
+ *
  * The two things this file will never do:
  *   • call a file a camera original when this app encoded it, and
  *   • imply completeness it did not achieve. Every truncation, every skipped
  *     stage and every unparsed container is named in the archive itself.
  */
 
-import ExifReader from "exifreader";
-
-import { downloadBlob, formatBytes, type LogEntry } from "../camera-diagnostics";
+import { downloadBlob, type LogEntry } from "../camera-diagnostics";
 import { buildZip, crcHex, isDeflateSupported, safeZipPath, verifyBytes, type ZipEntry, type ZipEntryInfo } from "../zip-writer";
-import { briefChecklist, buildCorrelationBrief, type BriefCapture } from "./correlation-brief";
-import { readExifIfds, ifdText, type ExifIfdReport } from "./exif-ifd";
-import { hashBlob, type FileHashes } from "./hashes";
-import { hexPolicyText, hexTextBytesFor, memoryPressure, perCaptureHexBudget, readMemoryHints, HEX_MIN_PER_CAPTURE, HEX_PRESSURE_LIMIT } from "./hex-budget";
-import { encoderText, readJpegEncoderBytes, type JpegEncoderReport } from "./jpeg-encoder";
-import { buildMimicSpec, STABLE_TAG_KEYS, type MimicCaptureFact } from "./mimic-spec";
-import { hexDumpBlob, structureText, walkStructure } from "./raw-bytes";
-import { matrixText, type CameraMatrixReport, type ProbeCapture } from "./camera-matrix";
+import { breatheEvery } from "./breathe";
 import { capturePolicyText } from "./capture-memory";
-import { passiveText, type PassiveGroup } from "./passive";
-import { seriesCsv, type SensorSeries } from "./sensors";
-import { OUTCOME_LABEL, TIER_INFO, type PermissionRecord, type PermissionTier } from "./permissions";
+import { folderFor, ORIGIN_TEXT, type CaptureFacts } from "./capture-facts";
+import { matrixText, type ProbeCapture } from "./camera-matrix";
+import { encoderText } from "./jpeg-encoder";
+import { ifdText } from "./exif-ifd";
+import { hashBlob } from "./hashes";
+import { hexPolicyText, hexTextBytesFor, memoryPressure, perCaptureHexBudget, readMemoryHints, HEX_MIN_PER_CAPTURE, HEX_PRESSURE_LIMIT } from "./hex-budget";
+import { passiveText } from "./passive";
+import { seriesCsv } from "./sensors";
+import { checksumsText, permissionLedgerText, sensorsText, stamp, VERIFY_HOW_TO, type RunFacts, type SheetSet, type StageOmission } from "./sheets";
+import { hexDumpBlob, structureText } from "./raw-bytes";
+import { TIER_INFO } from "./permissions";
 
-/** A stage that did not run, and the honest reason. */
-export type StageOmission = { stage: string; reason: string };
+export type { StageOmission } from "./sheets";
 
-export type RawPackInput = {
-  startedAt: string;
-  finishedAt: string;
-  tier: PermissionTier;
-  permissions: PermissionRecord[];
-  passive: PassiveGroup[];
-  permissionStatesBefore: { name: string; state: string | null }[];
-  permissionStatesAfter: { name: string; state: string | null }[];
-  sensors: SensorSeries[];
-  matrix: CameraMatrixReport | null;
+export type RawPackInput = RunFacts & {
+  /** The capture list, still holding its bytes. Released runs cannot be archived. */
   captures: ProbeCapture[];
-  logs: LogEntry[];
-  /** Stages that never ran — named, with the reason, so the archive is never quietly partial. */
-  omissions: StageOmission[];
   /**
    * Total source bytes allowed a hex rendering across the whole run. Shared out
    * equally per capture rather than spent in arrival order — see `hex-budget.ts`
    * for why, and for the memory arithmetic that sets the figure.
    */
   hexBudgetBytes: number;
-  /**
-   * `enumerateDevices()` taken before any permission was requested. Kept apart
-   * from the sweep's own snapshots because "before permission" and "before the
-   * sweep" are different moments and only one of them shows the pre-grant state.
-   */
-  devicesBeforePermission: { kind: string; deviceId: string; groupId: string; label: string }[];
 };
 
 export type RawPackProgress = (message: string, done: number, total: number) => void;
+
+export type RawPackOptions = {
+  onProgress: RawPackProgress;
+  /** Called before each unit of work, so the crash trail records where it died. */
+  onStep?: (step: string) => void;
+};
 
 export type RawPackResult = {
   blob: Blob;
@@ -71,271 +65,21 @@ export type RawPackResult = {
   bytes: number;
   warnings: string[];
   verification: { path: string; ok: boolean; detail: string }[];
-  /**
-   * The device spec, also written into the archive as `device-spec.md`. Returned
-   * separately so it can be saved on its own without unpacking the archive.
-   */
-  specMarkdown: string;
-  specFileName: string;
 };
 
-const MIME_EXT: Record<string, string> = {
-  "image/jpeg": "jpg",
-  "image/jpg": "jpg",
-  "image/png": "png",
-  "image/webp": "webp",
-  "image/heic": "heic",
-  "image/heif": "heif",
-  "image/avif": "avif",
-  "video/mp4": "mp4",
-  "video/quicktime": "mov",
-  "video/webm": "webm",
-};
-
-function extensionFor(blob: Blob, fileName: string | null): string {
-  const fromName = fileName?.match(/\.([a-z0-9]{2,5})$/i)?.[1];
-  if (fromName) return fromName.toLowerCase();
-  const base = blob.type.split(";")[0].trim().toLowerCase();
-  return MIME_EXT[base] ?? "bin";
-}
-
-function stamp(date: Date): string {
-  const p = (n: number): string => String(n).padStart(2, "0");
-  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`;
-}
-
-function esc(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-/** Captures whose bytes this app did not author go in `captures/`; the ones it did go in `rendered-frames/`. */
-function folderFor(capture: ProbeCapture): "captures" | "rendered-frames" {
-  return capture.origin === "app-encoded-frame" ? "rendered-frames" : "captures";
-}
-
-const ORIGIN_TEXT: Record<string, string> = {
-  "camera-file": "A file the operating system's camera app produced and handed to the browser. These are the camera's own bytes, with whatever metadata it chose to write.",
-  "supplied-file": "A file selected from storage. Copied in byte-for-byte; this app cannot know what happened to it before it arrived.",
-  "platform-photo":
-    "A still the browser's own photo pipeline produced from a live camera track. The bytes are the platform's; browsers write little or no camera metadata on this path, so sparse tags here are normal and mean nothing.",
-  "recorder-stream": "The byte stream the browser's media recorder produced from a live track.",
-  "app-encoded-frame":
-    "A frame THIS APP drew from the video track onto a canvas and encoded as JPEG. It is not a camera file: the pixels came from the browser, the JPEG around them was written here. That is why it sits outside the captures folder.",
-};
-
-/** Everything recorded about one archived capture. */
-type CaptureRecord = {
-  capture: ProbeCapture;
-  path: string;
-  hashes: FileHashes;
-  tagCount: number;
-  unknownTagCount: number;
-  hexTruncated: boolean;
-  segmentCount: number;
-  container: string;
-};
-
-function tagValue(tag: unknown): string {
-  if (tag == null) return "";
-  const holder = tag as { description?: unknown; value?: unknown };
-  const raw = holder.description ?? holder.value ?? tag;
-  let text: string;
-  if (Array.isArray(raw)) text = raw.length > 48 ? `[${raw.length} values] ${JSON.stringify(raw.slice(0, 24))}…` : JSON.stringify(raw);
-  else if (typeof raw === "object") {
-    try {
-      text = JSON.stringify(raw);
-    } catch {
-      text = String(raw);
-    }
-  } else text = String(raw);
-  return text.length > 600 ? `${text.slice(0, 600)}… (${text.length} chars total)` : text;
-}
-
-/**
- * Full tag listing, including the entries no dictionary names. `includeUnknown`
- * is the point of this function: the undocumented tags are exactly the ones a
- * normal viewer hides, and they are frequently the most device-specific.
- */
-async function tagDump(blob: Blob, label: string): Promise<{ text: string; count: number; unknown: number; keys: string[]; stableTags: Record<string, string> }> {
-  const lines: string[] = [`TAG DUMP — ${label}`, "=".repeat(78), ""];
-  const keys: string[] = [];
-  const stableTags: Record<string, string> = {};
-  let buffer: ArrayBuffer;
-  try {
-    buffer = await blob.arrayBuffer();
-  } catch (err) {
-    return { text: `${lines.join("\n")}\nThe bytes could not be read: ${err instanceof Error ? err.message : String(err)}`, count: 0, unknown: 0, keys, stableTags };
-  }
-
-  let count = 0;
-  let unknown = 0;
-  try {
-    const tags = ExifReader.load(buffer, { expanded: true, includeUnknown: true }) as unknown as Record<string, Record<string, unknown>>;
-    lines.push(
-      "Read directly from the archived bytes, with unknown and undocumented entries INCLUDED. Ordinary",
-      "metadata viewers drop those, which is a shame: an unnamed tag is still a fact about the device that",
-      "wrote the file, and on phone cameras there are usually plenty of them.",
-      ""
+/** Raised when an archive is asked for after the capture bytes were released. */
+export class CapturesReleasedError extends Error {
+  constructor() {
+    super(
+      "The archive cannot be built because the photo bytes were released. That happens when the run was started without the archive ticked, which is the setting that keeps memory low. Run Deep Probe again with the archive ticked to get one."
     );
-    for (const group of Object.keys(tags).sort()) {
-      const groupTags = tags[group];
-      if (!groupTags || typeof groupTags !== "object") continue;
-      const keys = Object.keys(groupTags);
-      if (keys.length === 0) continue;
-      lines.push("", `── ${group} (${keys.length}) ──`);
-      for (const key of keys.sort()) {
-        if (key === "Thumbnail") {
-          lines.push(`  ${key} = [embedded thumbnail — carved out as its own file, see the segments folder]`);
-          count += 1;
-          continue;
-        }
-        const isUnknown = /^undefined-|^unknown/i.test(key) || /^\d+$/.test(key);
-        if (isUnknown) unknown += 1;
-        const value = tagValue(groupTags[key]);
-        lines.push(`  ${isUnknown ? "[undocumented] " : ""}${key} = ${value}`);
-        if (!isUnknown) keys.push(key);
-        if (STABLE_TAG_KEYS.includes(key) && value.length > 0 && stableTags[key] == null) stableTags[key] = value;
-        count += 1;
-      }
-    }
-    if (count === 0) {
-      lines.push(
-        "No tags at all.",
-        "",
-        "For a frame this app encoded from a video track that is the expected and only possible result — a",
-        "canvas encode cannot carry camera metadata. Absence here is not evidence of anything."
-      );
-    }
-  } catch (err) {
-    lines.push(`The metadata parser could not read this file: ${err instanceof Error ? err.message : String(err)}`);
+    this.name = "CapturesReleasedError";
   }
-  return { text: lines.join("\n"), count, unknown, keys, stableTags };
 }
 
-function permissionLedgerText(input: RawPackInput): string {
-  const lines: string[] = [
-    "PERMISSION LEDGER",
-    "=".repeat(78),
-    `Scope: ${TIER_INFO[input.tier].label} — ${TIER_INFO[input.tier].blurb}`,
-    `Run started ${input.startedAt}, finished ${input.finishedAt}`,
-    "",
-    "WHAT THE OUTCOMES MEAN",
-    "-".repeat(78),
-    "  Allowed             you agreed, and the API returned something. What it returned is quoted below.",
-    "  Denied              you refused, or the browser reused an earlier refusal without asking again.",
-    "  Dismissed           the prompt was closed without an answer, or nothing was chosen from a picker.",
-    "  Not in this browser the API does not exist here. NOTHING WAS ASKED. This is never a refusal, and it",
-    "                      is listed separately for exactly that reason.",
-    "  Skipped             you moved past it before it fired.",
-    "  Errored             the API exists and failed for some other reason, quoted verbatim.",
-    "",
-    "A NOTE ON COVERAGE",
-    "-".repeat(78),
-    "This ledger covers every request this app knows how to make at the chosen scope. It is not, and cannot",
-    "honestly claim to be, every request that exists: the permission surface differs between browsers and",
-    "grows with each release. What you have here is a floor, not a ceiling.",
-    "",
-    "Nothing below was retried. A refusal was taken as final.",
-    "",
-  ];
-
-  const counts = new Map<string, number>();
-  for (const record of input.permissions) counts.set(record.outcome, (counts.get(record.outcome) ?? 0) + 1);
-  lines.push("SUMMARY", "-".repeat(78));
-  for (const [outcome, label] of Object.entries(OUTCOME_LABEL)) {
-    lines.push(`  ${label.padEnd(20)} ${counts.get(outcome) ?? 0}`);
-  }
-
-  for (const tier of ["standard", "extended", "everything"] as PermissionTier[]) {
-    const group = input.permissions.filter((p) => p.tier === tier);
-    if (group.length === 0) continue;
-    lines.push("", "=".repeat(78), `${TIER_INFO[tier].label.toUpperCase()} TIER (${group.length} requests)`, "=".repeat(78));
-    if (TIER_INFO[tier].caution) lines.push(`! ${TIER_INFO[tier].caution}`, "");
-    for (const record of group) {
-      lines.push(
-        "",
-        `${OUTCOME_LABEL[record.outcome].toUpperCase()} — ${record.label}`,
-        `  api            ${record.api}`,
-        `  asked at       ${record.askedAt}`,
-        `  you answered   ${record.responseMs} ms later`,
-        `  reaches        ${record.reaches}`,
-        `  grant lasts    ${record.duration}`,
-        `  what happened  ${record.detail}`,
-        `  browser state  before: ${record.stateBefore ?? "(not queryable)"} → after: ${record.stateAfter ?? "(not queryable)"}`
-      );
-      if (record.data) lines.push(`  returned       ${JSON.stringify(record.data)}`);
-    }
-  }
-  return lines.join("\n");
-}
-
-function sensorsText(series: SensorSeries[]): string {
-  const lines: string[] = [
-    "SENSOR RECORDINGS",
-    "=".repeat(78),
-    "",
-    "A grant proves very little on its own; what matters is the data that follows it. Each recording below",
-    "reports the MEASURED sample rate, not the requested one, because browsers throttle these events and",
-    "quoting the request back would be repeating an intention as though it were a reading.",
-    "",
-  ];
-  if (series.length === 0) {
-    lines.push("No sensor recordings ran. Either nothing was granted, or the stage was skipped — the omissions list says which.");
-    return lines.join("\n");
-  }
-  for (const s of series) {
-    lines.push(
-      "",
-      `── ${s.label} ──`,
-      `   file        sensors/${s.id}.csv`,
-      `   samples     ${s.rows.length}`,
-      `   duration    ${s.durationMs} ms`,
-      `   requested   ${s.requestedHz != null ? `${s.requestedHz} Hz` : "not applicable — this API has no rate control"}`,
-      `   measured    ${s.measuredHz != null ? `${s.measuredHz} Hz` : "too few samples to state a rate"}`,
-      `   ${s.note}`
-    );
-  }
-  return lines.join("\n");
-}
-
-const VERIFY_HOW_TO = [
-  "HOW TO CHECK ALL OF THIS WITHOUT THIS APP",
-  "-".repeat(78),
-  "",
-  "1. Extract and checksum. Files under captures/ and rendered-frames/ are STORED, not compressed, so",
-  "   extraction is a pure copy:",
-  "     unzip -p <this>.zip 'captures/<file>' > out.bin",
-  "     md5sum out.bin ; sha1sum out.bin ; sha256sum out.bin ; crc32 out.bin",
-  "   All four must match the values in checksums/checksums.txt.",
-  "",
-  "2. Bulk-verify with the provided digest files, which are in the exact format the standard tools read:",
-  "     unzip -o <this>.zip -d unpacked && cd unpacked",
-  "     md5sum -c checksums/checksums.md5",
-  "     sha256sum -c checksums/checksums.sha256",
-  "",
-  "3. Carve at the raw offset. This is the strongest check because it bypasses ZIP tooling entirely.",
-  "   Stored entries sit contiguously in the archive at the offset listed in verification/byte-identity.txt:",
-  "     dd if=<this>.zip bs=1 skip=<data offset> count=<bytes> of=carved.bin",
-  "     cmp carved.bin out.bin        # identical",
-  "   If carving at the stated offset yields an image that opens, the bytes were never transformed on the",
-  "   way in. There is nowhere for a re-encode to hide.",
-  "",
-  "4. Re-dump the hex yourself and diff it against the copy in raw/:",
-  "     xxd out.bin > mine.hex && diff mine.hex <(tail -n +8 raw/<slug>.hex.txt)",
-  "",
-  "Honesty note: this file cannot verify itself, and neither can any other file inside the archive it",
-  "describes. It gives you the numbers to check against. The app additionally re-carves every capture out",
-  "of the finished archive immediately after building it and reports the result on screen.",
-  "",
-  "Compression note: text files in this archive MAY be deflated to keep the size sane. Captures never are.",
-  "verification/byte-identity.txt states which is which for every entry, and the CRC-32 in the ZIP header",
-  "is always the checksum of the uncompressed bytes, so `unzip -t` validates everything either way.",
-  "",
-].join("\n");
-
-function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number): string {
+function readMe(input: RawPackInput, facts: CaptureFacts[], fileCount: number): string {
   const partial = input.omissions.length > 0 || input.matrix?.aborted === true;
-  const rendered = records.filter((r) => folderFor(r.capture) === "rendered-frames").length;
+  const rendered = facts.filter((f) => f.archivePath.startsWith("rendered-frames/")).length;
   return [
     "DEEP PROBE — RAW DUMP",
     "=".repeat(78),
@@ -355,7 +99,9 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
     "",
     "WHAT IS IN HERE",
     "-".repeat(78),
-    "overview.html            Start here. The readable summary of the whole run.",
+    "stat-sheet.html          Start here. Every detectable factor of this run, end to end.",
+    "stat-sheet.txt           The same sheet as plain text, for grepping and diffing.",
+    "forensic-items.txt       The item list on its own, first in the sheet and standalone here.",
     "permissions/             Every request: when it fired, what came back, how long you took to answer,",
     "                         and what that permission would have reached.",
     "environment/             Everything readable WITHOUT any prompt at all. Arguably the more revealing half.",
@@ -372,6 +118,8 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
       : []),
     "correlation-brief.md     Item-by-item answers to the forensic request: capture paths, encoder tables,",
     "                         raw directory entries, colour profile, JS surface and motion precision.",
+    "device-spec.md           Only what is distinctive about this device, with the generic facts left out",
+    "                         on purpose.",
     "raw/                     Per capture: the complete hex + ASCII dump, the structural map of the container,",
     "                         the full tag listing including undocumented entries, the JPEG encoder signature",
     "                         (quantisation and Huffman tables), and a raw EXIF directory walk reporting every",
@@ -383,6 +131,8 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
     "                         a window omits, and how to dump the missing range yourself.",
     "camera/memory-policy.txt The two memory costs a byte counter cannot see \u2014 canvas backing store and image",
     "                         decoding \u2014 with this run's real figures and whether stills stopped early.",
+    "log/build-trail.txt      Every step of this build with its duration and heap use, so a build that dies",
+    "                         next time can be compared against one that did not.",
     "raw/segments/            Metadata regions carved out whole — EXIF block, maker note, colour profile,",
     "                         embedded thumbnails — each at its exact position in the original.",
     "checksums/               MD5, SHA-1, SHA-256 and CRC-32 for every capture, plus digest files in the",
@@ -411,153 +161,40 @@ function readMe(input: RawPackInput, records: CaptureRecord[], fileCount: number
   ].join("\n");
 }
 
-function checksumsText(records: CaptureRecord[]): string {
-  const lines: string[] = [
-    "CHECKSUMS",
+/**
+ * Appends a suspension summary to the session log. Backgrounding is expected
+ * during the camera-app handoff, so the archive states plainly that the gaps in
+ * the timeline were the page being suspended and that the run continued across
+ * them — an unexplained gap would otherwise look like missing evidence.
+ */
+function sessionLogText(logs: LogEntry[]): string {
+  return [
+    "DEEP PROBE SESSION LOG",
     "=".repeat(78),
+    `${logs.length} entries, in order, exactly as recorded on the device.`,
     "",
-    "Four independent checksums per capture, so whichever tool you already trust can confirm the contents.",
-    "",
-    "MD5 is included because md5sum is the most universally available checker there is. It is a broken hash",
-    "for signature purposes and is offered here only as an integrity and transcription check — never as a",
-    "security claim. SHA-256 is the one to rely on.",
-    "",
-  ];
-  for (const r of records) {
-    lines.push(
-      r.path,
-      `  bytes    ${r.hashes.bytes.toLocaleString("en-US")}`,
-      `  md5      ${r.hashes.md5}`,
-      `  sha1     ${r.hashes.sha1}`,
-      `  sha256   ${r.hashes.sha256}`,
-      `  crc32    ${r.hashes.crc32}`,
-      ""
-    );
-  }
-  return lines.join("\n");
+    ...logs.map((l) => `${l.ts}  [${l.level.toUpperCase().padEnd(7)}] ${l.message}`),
+  ].join("\n");
 }
 
-function overviewHtml(input: RawPackInput, records: CaptureRecord[], fileCount: number, totalBytes: number): string {
-  const counts = new Map<string, number>();
-  for (const p of input.permissions) counts.set(p.outcome, (counts.get(p.outcome) ?? 0) + 1);
-  const partial = input.omissions.length > 0 || input.matrix?.aborted === true;
-  const matrixRows = input.matrix?.rows ?? [];
-  const grantedRows = matrixRows.filter((r) => r.ok).length;
+/** Builds the raw dump archive from facts already read and sheets already written. */
+export async function buildRawPack(input: RawPackInput, facts: CaptureFacts[], sheets: SheetSet, options: RawPackOptions): Promise<RawPackResult> {
+  if (facts.length > 0 && input.captures.length === 0) throw new CapturesReleasedError();
 
-  const css = `
-:root{color-scheme:light}
-*{box-sizing:border-box}
-body{margin:0;padding:28px 20px 72px;background:#0e1116;color:#e8edf3;font:15px/1.6 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:940px;margin:0 auto}
-h1{margin:0 0 6px;font-size:27px;letter-spacing:-0.02em}
-h2{margin:36px 0 12px;font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#7d8da0;border-bottom:1px solid #232b36;padding-bottom:8px}
-p{margin:8px 0}
-.sub{color:#8b9aab;font-size:13px;margin:0 0 4px}
-.banner{margin:18px 0;padding:14px 16px;border-radius:12px;border:1px solid #6b4d09;background:#2a2109;color:#f3d38a;font-size:14px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:14px 0}
-.stat{background:#151a21;border:1px solid #232b36;border-radius:12px;padding:12px 14px}
-.stat b{display:block;font-size:24px;letter-spacing:-0.02em}
-.stat span{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:#7d8da0}
-table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
-th,td{text-align:left;padding:8px 9px;border-bottom:1px solid #1e252f;vertical-align:top}
-th{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:#7d8da0}
-.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
-.granted{background:#0d3323;color:#5ee0a0}
-.denied{background:#3a1518;color:#ff9a9a}
-.unavailable{background:#1b2430;color:#8fb0d4}
-.skipped{background:#2a2109;color:#f3d38a}
-.dismissed{background:#2a2109;color:#f3d38a}
-.error{background:#3a1518;color:#ff9a9a}
-code{background:#1a212a;padding:2px 6px;border-radius:5px;font:12px ui-monospace,Menlo,monospace}
-.muted{color:#8b9aab;font-size:13px}
-@media print{body{background:#fff;color:#111}}
-`;
-
-  const parts: string[] = [
-    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    "<title>Deep Probe — Raw Dump</title>",
-    `<style>${css}</style></head><body><div class="wrap">`,
-    "<h1>Deep Probe — raw dump</h1>",
-    `<p class="sub">${esc(input.startedAt)} → ${esc(input.finishedAt)} · scope ${esc(TIER_INFO[input.tier].label)}</p>`,
-    partial
-      ? '<div class="banner"><b>Partial run.</b> One or more stages did not complete. Everything present really happened; the missing parts are named in READ-ME.txt rather than quietly left out.</div>'
-      : "",
-    '<div class="grid">',
-    `<div class="stat"><b>${input.permissions.length}</b><span>requests made</span></div>`,
-    `<div class="stat"><b>${counts.get("granted") ?? 0}</b><span>allowed</span></div>`,
-    `<div class="stat"><b>${counts.get("denied") ?? 0}</b><span>denied</span></div>`,
-    `<div class="stat"><b>${counts.get("unavailable") ?? 0}</b><span>not in this browser</span></div>`,
-    `<div class="stat"><b>${records.length}</b><span>photos</span></div>`,
-    `<div class="stat"><b>${matrixRows.length}</b><span>camera requests</span></div>`,
-    `<div class="stat"><b>${fileCount}</b><span>files in archive</span></div>`,
-    `<div class="stat"><b>${formatBytes(totalBytes)}</b><span>archive size</span></div>`,
-    "</div>",
-
-    "<h2>What was asked for</h2>",
-    '<p class="muted">Denied and “not in this browser” are different things and are never merged. An unavailable API was never asked about at all.</p>',
-    "<table><thead><tr><th>Request</th><th>Outcome</th><th>What it reaches</th><th>You answered in</th></tr></thead><tbody>",
-    ...input.permissions.map(
-      (p) =>
-        `<tr><td><b>${esc(p.label)}</b><br><code>${esc(p.api)}</code></td><td><span class="tag ${p.outcome}">${esc(OUTCOME_LABEL[p.outcome])}</span></td><td class="muted">${esc(p.reaches)}</td><td class="muted">${p.outcome === "unavailable" ? "—" : `${p.responseMs} ms`}</td></tr>`
-    ),
-    "</tbody></table>",
-
-    "<h2>What was taken without asking</h2>",
-    '<p class="muted">No prompt, no indicator, no way to decline. The full listing is in <code>environment/passive-dump.txt</code>.</p>',
-    "<table><tbody>",
-    ...input.passive.flatMap((g) => [
-      `<tr><th colspan="2">${esc(g.title)}</th></tr>`,
-      ...g.rows.slice(0, 6).map((r) => `<tr><td class="muted">${esc(r.label)}</td><td><code>${esc(r.value.slice(0, 120))}</code></td></tr>`),
-    ]),
-    "</tbody></table>",
-  ];
-
-  if (input.matrix) {
-    parts.push(
-      "<h2>Camera sweep</h2>",
-      `<p>${grantedRows} of ${matrixRows.length} requests were granted across ${input.matrix.inventory.length} camera(s). A rejection is a result, not a fault — it marks where the hardware's limit actually is.</p>`,
-      '<p class="muted">Full asked-versus-granted table: <code>camera/matrix.txt</code></p>'
-    );
-  }
-
-  if (input.sensors.length > 0) {
-    parts.push(
-      "<h2>Sensor recordings</h2>",
-      "<table><thead><tr><th>Sensor</th><th>Samples</th><th>Measured rate</th><th>Notes</th></tr></thead><tbody>",
-      ...input.sensors.map(
-        (s) =>
-          `<tr><td>${esc(s.label)}</td><td>${s.rows.length}</td><td>${s.measuredHz != null ? `${s.measuredHz} Hz` : "—"}</td><td class="muted">${esc(s.note)}</td></tr>`
-      ),
-      "</tbody></table>"
-    );
-  }
-
-  parts.push(
-    "<h2>Photos</h2>",
-    "<table><thead><tr><th>File</th><th>Where the bytes came from</th><th>Tags found</th><th>SHA-256</th></tr></thead><tbody>",
-    ...records.map(
-      (r) =>
-        `<tr><td><code>${esc(r.path)}</code><br><span class="muted">${esc(r.capture.label)}</span></td><td class="muted">${esc(ORIGIN_TEXT[r.capture.origin] ?? r.capture.origin)}</td><td>${r.tagCount}${r.unknownTagCount > 0 ? ` <span class="muted">(${r.unknownTagCount} undocumented)</span>` : ""}</td><td><code>${esc(r.hashes.sha256.slice(0, 24))}…</code></td></tr>`
-    ),
-    "</tbody></table>",
-    "<h2>Checking this yourself</h2>",
-    `<pre style="background:#151a21;border:1px solid #232b36;border-radius:12px;padding:14px;overflow:auto;font:12px/1.6 ui-monospace,Menlo,monospace">${esc(VERIFY_HOW_TO)}</pre>`,
-    "</div></body></html>"
-  );
-  return parts.join("");
-}
-
-/** Builds the raw dump archive. */
-export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgress): Promise<RawPackResult> {
+  const onProgress = options.onProgress;
+  const step = (message: string): void => options.onStep?.(message);
   const entries: ZipEntry[] = [];
   const warnings: string[] = [];
-  const records: CaptureRecord[] = [];
   const capturePaths = new Map<string, ProbeCapture>();
-  const specCaptures: MimicCaptureFact[] = [];
-  const briefCaptures: BriefCapture[] = [];
+  const byteTrail: string[] = [];
+  const breather = breatheEvery();
+  const buildStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const trailAt = (label: string): void => {
+    const at = typeof performance !== "undefined" ? performance.now() : Date.now();
+    byteTrail.push(`${((at - buildStarted) / 1000).toFixed(2).padStart(8)}s  ${label}`);
+  };
 
-  const total = input.captures.length * 4 + 12;
+  const total = input.captures.length * 2 + 14;
   let done = 0;
   const tick = (message: string): void => {
     done += 1;
@@ -575,53 +212,41 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
   let hexWindowed = 0;
   let pressureThrottled = false;
 
+  const factBySlug = new Map(facts.map((f) => [f.slug, f]));
+
   for (const capture of input.captures) {
-    const folder = folderFor(capture);
-    const ext = extensionFor(capture.blob, capture.fileName);
-    const path = `${folder}/${safeZipPath(`${capture.slug}.${ext}`)}`;
+    const fact = factBySlug.get(capture.slug);
+    if (!fact) {
+      warnings.push(`${capture.slug} was captured but never read by the facts pass, so it is stored without its derived files. The bytes themselves are complete.`);
+    }
+    const path = fact?.archivePath ?? `${folderFor(capture)}/${safeZipPath(`${capture.slug}.bin`)}`;
     capturePaths.set(path, capture);
 
     // The capture itself: stored, never compressed, never re-encoded.
     entries.push({ path, data: capture.blob });
-    tick(`Packing ${capture.slug}`);
 
-    const hashes = await hashBlob(capture.blob);
-    tick(`Checksumming ${capture.slug}`);
+    if (fact) {
+      if (fact.encoder) entries.push({ path: `raw/${capture.slug}.encoder.txt`, data: encoderText(fact.encoder, capture.label), compress: true });
+      if (fact.ifd) entries.push({ path: `raw/${capture.slug}.ifd.txt`, data: ifdText(fact.ifd, capture.label), compress: true });
+      entries.push({ path: `raw/${capture.slug}.structure.txt`, data: structureText(fact.structure, capture.label), compress: true });
+      entries.push({ path: `raw/${capture.slug}.tags.txt`, data: fact.tags.text, compress: true });
 
-    // One read of the bytes feeds both deep parsers.
-    let encoder: JpegEncoderReport | null = null;
-    let ifd: ExifIfdReport | null = null;
-    try {
-      const bytes = new Uint8Array(await capture.blob.arrayBuffer());
-      encoder = readJpegEncoderBytes(bytes);
-      ifd = readExifIfds(bytes);
-    } catch (err) {
-      warnings.push(`${capture.slug}: the encoder and directory parses could not read the bytes (${err instanceof Error ? err.message : String(err)}). Reported rather than skipped silently.`);
-    }
-    if (encoder) entries.push({ path: `raw/${capture.slug}.encoder.txt`, data: encoderText(encoder, capture.label), compress: true });
-    if (ifd) entries.push({ path: `raw/${capture.slug}.ifd.txt`, data: ifdText(ifd, capture.label), compress: true });
-
-    const structure = await walkStructure(capture.blob);
-    entries.push({ path: `raw/${capture.slug}.structure.txt`, data: structureText(structure, capture.label), compress: true });
-    let iccMd5: string | null = null;
-    for (const segment of structure.segments) {
-      if (segment.offset < 0 || segment.length <= 0 || segment.offset + segment.length > capture.blob.size) {
-        warnings.push(`Segment "${segment.name}" of ${capture.slug} reported an out-of-range position and was not carved. The hex dump still covers those bytes.`);
-        continue;
-      }
-      const carved = capture.blob.slice(segment.offset, segment.offset + segment.length);
-      entries.push({ path: `raw/segments/${capture.slug}/${safeZipPath(segment.name)}.bin`, data: carved });
-      // The exact colour-profile bytes get their own checksum, since the request
-      // is specifically for the profile's MD5 rather than the whole file's.
-      if (segment.name === "icc-profile") {
-        try {
-          iccMd5 = (await hashBlob(carved)).md5;
-        } catch {
-          iccMd5 = null;
+      step(`Carving segments from ${capture.slug}`);
+      for (const segment of fact.structure.segments) {
+        if (segment.offset < 0 || segment.length <= 0 || segment.offset + segment.length > capture.blob.size) {
+          warnings.push(`Segment "${segment.name}" of ${capture.slug} reported an out-of-range position and was not carved. The hex dump still covers those bytes.`);
+          continue;
         }
+        // Blob.slice is a lazy view: this costs no memory until something reads it,
+        // and the ZIP writer reads each one exactly once, in order.
+        entries.push({ path: `raw/segments/${capture.slug}/${safeZipPath(segment.name)}.bin`, data: capture.blob.slice(segment.offset, segment.offset + segment.length) });
       }
+      trailAt(`segments carved: ${capture.slug}`);
+      tick(`Carving segments from ${capture.slug}`);
+      await breather.tick();
+    } else {
+      tick(`Packing ${capture.slug}`);
     }
-    tick(`Carving segments from ${capture.slug}`);
 
     // Where the browser reports heap use, back off before it kills the tab.
     // Losing the whole archive to render bytes nobody reads would be a poor
@@ -639,6 +264,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
       });
     }
     const allowance = throttled ? HEX_MIN_PER_CAPTURE : perCaptureHex;
+    step(`Rendering hex for ${capture.slug} (${(allowance / 1024).toFixed(0)} KiB window)`);
     const hex = await hexDumpBlob(capture.blob, capture.label, allowance);
     hexSpent += hex.bytesRendered;
     entries.push({ path: `raw/${capture.slug}.hex.txt`, data: hex.blob, compress: true });
@@ -646,58 +272,9 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
       hexWindowed += 1;
       warnings.push(`${capture.slug}: the hex dump is windowed, not complete — ${hex.note}`);
     }
-
-    const tags = await tagDump(capture.blob, capture.label);
-    entries.push({ path: `raw/${capture.slug}.tags.txt`, data: tags.text, compress: true });
+    trailAt(`hex rendered: ${capture.slug}`);
     tick(`Dumping bytes of ${capture.slug}`);
-
-    records.push({
-      capture,
-      path,
-      hashes,
-      tagCount: tags.count,
-      unknownTagCount: tags.unknown,
-      hexTruncated: hex.truncated,
-      segmentCount: structure.segments.length,
-      container: structure.container,
-    });
-
-    specCaptures.push({
-      slug: capture.slug,
-      origin: capture.origin,
-      path: capture.path,
-      deviceLabel: capture.deviceLabel,
-      width: capture.width,
-      height: capture.height,
-      bytes: capture.blob.size,
-      mime: capture.blob.type,
-      container: structure.container,
-      markers: structure.nodes.filter((node) => node.depth === 0).map((node) => node.id).slice(0, 48),
-      segments: structure.segments.map((segment) => segment.name),
-      tagCount: tags.count,
-      unknownTagCount: tags.unknown,
-      tagKeys: tags.keys,
-      stableTags: tags.stableTags,
-    });
-
-    briefCaptures.push({
-      slug: capture.slug,
-      archivePath: path,
-      label: capture.label,
-      path: capture.path,
-      origin: capture.origin,
-      deviceLabel: capture.deviceLabel,
-      fileName: capture.fileName,
-      fileLastModified: capture.fileLastModified,
-      fileRelativePath: capture.fileRelativePath,
-      bytes: capture.blob.size,
-      mime: capture.blob.type,
-      width: capture.width,
-      height: capture.height,
-      encoder,
-      ifd,
-      iccMd5,
-    });
+    await breather.tick();
   }
 
   // Reports
@@ -721,6 +298,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     });
   }
 
+  step("Writing the permission ledger");
   entries.push({ path: "permissions/ledger.txt", data: permissionLedgerText(input), compress: true });
   entries.push({
     path: "permissions/ledger.json",
@@ -728,7 +306,9 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     compress: true,
   });
   tick("Writing the permission ledger");
+  await breather.tick();
 
+  step("Writing the passive dump");
   entries.push({ path: "environment/passive-dump.txt", data: passiveText(input.passive, input.permissionStatesAfter), compress: true });
   entries.push({
     path: "environment/passive-dump.json",
@@ -746,13 +326,17 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     compress: true,
   });
   tick("Writing the passive dump");
+  await breather.tick();
 
+  step("Writing the sensor recordings");
   entries.push({ path: "sensors/README.txt", data: sensorsText(input.sensors), compress: true });
   for (const series of input.sensors) {
     entries.push({ path: `sensors/${safeZipPath(series.id)}.csv`, data: seriesCsv(series), compress: true });
   }
   tick("Writing the sensor recordings");
+  await breather.tick();
 
+  step("Writing the camera matrix");
   if (input.matrix) {
     entries.push({ path: "camera/matrix.txt", data: matrixText(input.matrix), compress: true });
     entries.push({ path: "camera/matrix.json", data: JSON.stringify({ kind: "deep-probe-camera-matrix", version: 1, ...input.matrix }, null, 2), compress: true });
@@ -790,6 +374,7 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     });
   }
   tick("Writing the camera matrix");
+  await breather.tick();
 
   entries.push({
     path: "camera/devices.json",
@@ -833,77 +418,76 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     compress: true,
   });
   tick("Writing the device and file surface");
+  await breather.tick();
 
-  entries.push({ path: "checksums/checksums.txt", data: checksumsText(records), compress: true });
-  entries.push({ path: "checksums/checksums.md5", data: records.map((r) => `${r.hashes.md5}  ${r.path}`).join("\n") });
-  entries.push({ path: "checksums/checksums.sha1", data: records.map((r) => `${r.hashes.sha1}  ${r.path}`).join("\n") });
-  entries.push({ path: "checksums/checksums.sha256", data: records.map((r) => `${r.hashes.sha256}  ${r.path}`).join("\n") });
+  step("Writing the checksum files");
+  entries.push({ path: "checksums/checksums.txt", data: checksumsText(facts), compress: true });
+  entries.push({ path: "checksums/checksums.md5", data: facts.map((f) => `${f.hashes.md5}  ${f.archivePath}`).join("\n") });
+  entries.push({ path: "checksums/checksums.sha1", data: facts.map((f) => `${f.hashes.sha1}  ${f.archivePath}`).join("\n") });
+  entries.push({ path: "checksums/checksums.sha256", data: facts.map((f) => `${f.hashes.sha256}  ${f.archivePath}`).join("\n") });
   tick("Writing the checksum files");
+  await breather.tick();
 
+  entries.push({ path: "log/session-log.txt", data: sessionLogText(input.logs), compress: true });
+  tick("Writing the session log");
+
+  // The sheets were written before this file ever ran. They are copied in, not
+  // rebuilt, so what the archive contains is byte-identical to what was handed
+  // over on screen.
+  step("Copying in the sheets");
+  entries.push({ path: "stat-sheet.html", data: sheets.statSheetHtml, compress: true });
+  entries.push({ path: "stat-sheet.txt", data: sheets.statSheetText, compress: true });
+  entries.push({ path: "forensic-items.txt", data: sheets.forensicChecklist, compress: true });
+  entries.push({ path: "correlation-brief.md", data: sheets.correlationBrief, compress: true });
+  entries.push({ path: "device-spec.md", data: sheets.specMarkdown, compress: true });
+  tick("Copying in the sheets");
+  await breather.tick();
+
+  const fileCount = entries.length + 6;
+  entries.unshift({ path: "READ-ME.txt", data: readMe(input, facts, fileCount) });
+  trailAt("entry list complete, assembly begins");
   entries.push({
-    path: "log/session-log.txt",
+    path: "log/build-trail.txt",
     data: [
-      "DEEP PROBE SESSION LOG",
+      "ARCHIVE BUILD TRAIL",
       "=".repeat(78),
-      `${input.logs.length} entries, in order, exactly as recorded on the device.`,
       "",
-      ...input.logs.map((l) => `${l.ts}  [${l.level.toUpperCase().padEnd(7)}] ${l.message}`),
+      "Wall-clock time at each stage of building this archive, measured from the moment the build began.",
+      "A build that dies next time can be compared against this one to see exactly where it got further,",
+      "or did not. The same trail is written to browser storage as it happens, so a build that kills the",
+      "tab still leaves this behind.",
+      "",
+      ...byteTrail,
+      "",
     ].join("\n"),
     compress: true,
   });
-  tick("Writing the session log");
-
-  // Both renderings come from one registry, so the checklist at the top of the
-  // spec cannot drift from the document it summarises.
-  const correlationInput = {
-    generatedAt: input.finishedAt,
-    passive: input.passive,
-    sensors: input.sensors,
-    matrix: input.matrix,
-    captures: briefCaptures,
-    devicesBeforePermission: input.devicesBeforePermission,
-    permissionStatesBefore: input.permissionStatesBefore,
-    permissionStatesAfter: input.permissionStatesAfter,
-    omissions: input.omissions,
-  };
-  entries.push({ path: "correlation-brief.md", data: buildCorrelationBrief(correlationInput), compress: true });
-  tick("Writing the correlation brief");
-
-  const specMarkdown = buildMimicSpec({
-    generatedAt: input.finishedAt,
-    tier: input.tier,
-    passive: input.passive,
-    permissionStates: input.permissionStatesAfter,
-    permissions: input.permissions,
-    sensors: input.sensors,
-    matrix: input.matrix,
-    captures: specCaptures,
-    omissions: input.omissions,
-    briefChecklist: briefChecklist(correlationInput),
-  });
-  entries.push({ path: "device-spec.md", data: specMarkdown, compress: true });
-  tick("Writing the device spec");
-
-  const fileCount = entries.length + 5;
-  entries.unshift({ path: "READ-ME.txt", data: readMe(input, records, fileCount) });
-  entries.push({ path: "overview.html", data: overviewHtml(input, records, fileCount, 0), compress: true });
-  tick("Writing the overview");
+  tick("Writing the build trail");
 
   // Build, then write the verification report citing every offset laid out above.
+  step(`Assembling ${entries.length} entries`);
   const built = await buildZip(entries, {
-    onProgress: (p) => onProgress(`Archiving ${p.path}`, done, total),
+    onProgress: (p) => {
+      onProgress(`Archiving ${p.path}`, done, total);
+      step(`Archiving ${p.path}`);
+    },
     finalize: (table) => [
       { path: "verification/byte-identity.txt", data: verificationText(table, capturePaths), compress: true },
       { path: "MANIFEST.txt", data: manifestText(table) },
     ],
   });
+  trailAt("archive assembled");
   tick("Assembling the archive");
+  await breather.tick();
 
-  // Carve every capture back out of the finished archive and compare. The claim is checked, not asserted.
+  // Carve every capture back out of the finished archive and compare. The claim
+  // is checked, not asserted. Blob.slice is a view rather than a copy, and
+  // verifyBytes streams, so this never materialises the archive twice.
   const verification: { path: string; ok: boolean; detail: string }[] = [];
   for (const entry of built.entries) {
     const capture = capturePaths.get(entry.path);
     if (!capture) continue;
+    step(`Re-carving ${entry.path} to verify it`);
     const carved = built.blob.slice(entry.dataOffset, entry.dataOffset + entry.compressedSize);
     const check = await verifyBytes(carved, capture.blob);
     verification.push({
@@ -914,7 +498,9 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
         : `MISMATCH at byte ${check.firstDifferenceAt ?? "unknown"}. Do not trust this entry.`,
     });
     if (!check.identical) warnings.push(`Byte-identity check FAILED for ${entry.path}. This is reported rather than hidden.`);
+    await breather.tick();
   }
+  trailAt("byte-identity re-check complete");
   tick("Re-carving every capture to verify it");
 
   if (!isDeflateSupported()) {
@@ -923,19 +509,9 @@ export async function buildRawPack(input: RawPackInput, onProgress: RawPackProgr
     );
   }
 
-  const suffix = stamp(new Date());
   const partial = input.omissions.length > 0 || input.matrix?.aborted;
-  const fileName = `deep-probe-${suffix}${partial ? "-PARTIAL" : ""}.zip`;
-  return {
-    blob: built.blob,
-    fileName,
-    files: built.entries.length,
-    bytes: built.blob.size,
-    warnings,
-    verification,
-    specMarkdown,
-    specFileName: `device-spec-${suffix}${partial ? "-PARTIAL" : ""}.md`,
-  };
+  const fileName = `deep-probe-${stamp(new Date())}${partial ? "-PARTIAL" : ""}.zip`;
+  return { blob: built.blob, fileName, files: built.entries.length, bytes: built.blob.size, warnings, verification };
 }
 
 function verificationText(table: ZipEntryInfo[], capturePaths: Map<string, ProbeCapture>): string {
@@ -1001,7 +577,5 @@ export function downloadRawPack(result: RawPackResult): void {
   downloadBlob(result.blob, result.fileName);
 }
 
-/** Saves the device spec on its own, for the common case of wanting only that. */
-export function downloadDeviceSpec(result: RawPackResult): void {
-  downloadBlob(new Blob([result.specMarkdown], { type: "text/markdown;charset=utf-8" }), result.specFileName);
-}
+/** MD5 of an arbitrary blob, re-exported so callers need not know where hashing lives. */
+export { hashBlob };

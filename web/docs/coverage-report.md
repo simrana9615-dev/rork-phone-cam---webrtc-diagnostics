@@ -415,6 +415,38 @@ reports the error name, message and component stack, states that an unfinished r
 memory only and did not survive, and recognises an out-of-memory signature well enough to
 suggest a narrower scope or an earlier stop.
 
+**A tab that is killed cannot report anything — so it reports beforehand.** An error boundary
+only helps when JavaScript is still running. Repeated reports had the browser dying outright at
+the moment the archive step began, every time, which runs no handler, fires no event and leaves
+no console line. `crash-trail.ts` therefore writes each step to `localStorage` *before* it runs,
+and the next visit reads back whatever the last run left. The measurement that actually decides
+the question is a heartbeat on a 250 ms timer, because running out of memory and being killed for
+not responding are indistinguishable from the outside and need opposite fixes: a blocked main
+thread cannot service a timer, so a last tick landing as a step begins means that step froze the
+thread, while ticks continuing for seconds into the step and then stopping dead mean the thread
+was healthy right to the end. Heap figures corroborate where they exist — WebKit exposes neither
+`deviceMemory` nor `jsHeapSizeLimit`, which is precisely why the heartbeat and not the heap is the
+primary signal. Where the evidence does not decide, the report says `undetermined` and says why,
+rather than picking the more satisfying answer.
+
+**The sheets are no longer hostages to the archive.** The stat sheet, the correlation brief and
+the device spec were built *inside* the ZIP builder and returned only if it survived, so a crash
+at the last step of a twenty-minute run destroyed the cheap products along with the expensive one.
+They are now produced by a separate pass — `capture-facts.ts` walks each capture once,
+`sheets.ts` writes everything from the result — and handed over before the archive is attempted.
+The archive is a tick box, off by default, and leaving it unticked releases each photo's bytes the
+moment its facts are read. That is why the choice is presented *before* the read: a choice offered
+afterwards could no longer be acted on, and pretending otherwise would be the polite lie here.
+The consequence — no archive can be built from that run — is printed on the box, not in a footnote.
+
+**Both plausible fixes were applied, because only one needed to be right.** Every long pass now
+yields to the browser on a time cadence (`breathe.ts`; `scheduler.yield()` where it exists, a
+`MessageChannel` macrotask otherwise, since a nested `setTimeout(0)` is clamped to 4 ms after five
+levels and a thousand iterations of that clamp is four seconds on its own). And the duplicated
+work is gone: the encoder parse, the IFD walk and the tag dump share one read of the bytes instead
+of three, carved segments are lazy `Blob.slice` views the writer reads once each, and the
+byte-identity re-check streams rather than materialising the archive a second time.
+
 **Interruption:** Pause and Stop are available throughout. A pause always lands *between*
 steps — the recording or constraint in flight completes first, because a half-recorded
 sensor window or a half-applied constraint would describe a paused device rather than the

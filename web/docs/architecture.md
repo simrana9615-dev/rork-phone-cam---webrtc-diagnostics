@@ -121,11 +121,21 @@ belonging to other apps).
    ceiling rather than trusting what is on screen.
 4. **Manual shots** — every named camera in the pinned viewfinder plus three zoom steps each,
    then both facings through all three camera-app handoffs.
-5. **Archive** — `lib/deep-probe/raw-pack.ts`, then every capture is carved back out of the
-   finished blob and compared byte-for-byte, with the result shown on screen.
+5. **Exports** — four tick boxes, the archive **off** by default (§6b.3). Shown here rather
+   than at the end because with the archive unticked the photo bytes are released as they are
+   read, and a choice offered afterwards could no longer be acted on.
+6. **Sheets** — `lib/deep-probe/capture-facts.ts` then `lib/deep-probe/sheets.ts`. One walk
+   over each capture, then every sheet written from the result. Nothing large is held.
+7. **Archive** *(only if ticked)* — `lib/deep-probe/raw-pack.ts`, then every capture is carved
+   back out of the finished blob and compared byte-for-byte, with the result shown on screen.
+   The stepper omits this stage entirely when it was not asked for.
+
+On arrival the page reads whatever the last run left in `localStorage` and, if that run never
+closed its trail, shows a `CrashBanner` naming the step it died in, what it was holding and
+which of the two deaths it was — with the whole trail copyable as text. Reported exactly once.
 
 Stopping at any point keeps everything gathered; the remaining stages are pushed onto the
-omission list with a reason and the archive is named `…-PARTIAL.zip`.
+omission list with a reason and every sheet is labelled `PARTIAL`.
 
 ### `SharedReport.tsx`
 Decodes the share-link fragment (deflate-raw + base64url), enforces the 72 h TTL, and
@@ -147,6 +157,8 @@ renders the read-only session summary.
 | `LastPhotoExif.tsx` | Diagnostic-hub EXIF inspector for the newest captured photo: device / timestamp / GPS headline tiles with explicit not-in-file states, capture-parameter chips, and the complete raw tag dump (parsed locally); exports the reusable `ExifInspector` panel, also embedded in every session-gallery item, with a one-tap JSON download of the raw tags + the photo's observed capture timeline + screening verdict (heat-map image payloads excluded with an explicit note) |
 | `ReportView.tsx` | Forensic report renderer: verdict chip, category bars, finding rows (observed/expected/impact), heat-map visuals, technical appendix; exports `FindingRow` |
 | `CameraErrorHelp.tsx` | getUserMedia error classifier with actionable fixes |
+| `deep-probe/CrashBanner.tsx` | What the last run was doing when it died: the step, the step number and time into the run, how long the page kept answering its timer afterwards, the heap either side, the capture bytes held, the verdict and how it was reached. One tap copies the whole trail. Shown only for a run that never closed its trail, and only once |
+| `deep-probe/SheetViewer.tsx` | The stat sheet on screen — section list, then the section — rendered from the same block registry as the downloadable sheet and the HTML page, so the three cannot disagree. No download, no archive, no unzipping |
 | `deep-probe/ProbeViewfinder.tsx` | Deep Probe's manual-shot viewfinder, pinned to one `deviceId` and holding one end of that camera's own reported zoom range (`min`/`mid`/`max` resolved against the range rather than a hardcoded factor). HUD states the granted size, which still path will run and that no camera EXIF exists on this path, all *before* the shutter. A camera with no zoom control produces a clearly-recorded unzoomed shot instead of a fake one. Mounted imperatively via `probeManualShot()`, rejecting with `CaptureCancelledError` on skip |
 | `PhoneGate.tsx` | Phones-only gate (see §2) |
 | `ui/*` | shadcn/ui primitives |
@@ -189,7 +201,11 @@ renders the read-only session summary.
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
 | `deep-probe/hex-budget.ts` | How much of a run may be rendered as hex and why. Holds the 4.94-characters-per-byte constant measured against `hexLines` itself, the device-derived total allowance, the equal per-capture share with its floor and ceiling, the heap-pressure threshold, and the policy statement written into the archive. Pure and fully unit-tested, because getting this number wrong does not degrade the archive — it destroys the run |
-| `deep-probe/raw-pack.ts` | The raw dump archive: captures stored verbatim (`captures/` vs `rendered-frames/` by declared origin), per-capture hex dump + structure map + full tag listing **including undocumented entries** (`includeUnknown`), carved segments, four checksums plus `md5sum`/`sha256sum`-format digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session log, byte-identity data and an HTML overview. Post-build it re-carves every capture from the finished blob and compares. Names the file `…-PARTIAL.zip` and lists every omission when a stage did not run |
+| `deep-probe/breathe.ts` | The yield that keeps a long pass alive. `scheduler.yield()` where it exists, a `MessageChannel` macrotask otherwise (a nested `setTimeout(0)` is clamped to 4 ms after five levels — over a thousand iterations that alone is four seconds), `setTimeout` as the floor. `breatheEvery` yields on a time cadence rather than per item, so the cost of breathing does not scale with the number of bytes walked |
+| `deep-probe/crash-trail.ts` | Breadcrumbs that outlive the tab. Every step is written to `localStorage` before it runs, so a kill leaves the step name behind; a heartbeat on a 250 ms timer separates the two deaths, because a blocked main thread cannot service a timer while a page that runs out of memory answers one right up to the end. Returns a `CrashReport` naming the step, the silence gap, the heap either side and a verdict — and refuses to guess when the browser reports no heap at all. Hot path writes one ~200-byte key; the full trail is flushed on a throttle with the opening steps always forced through |
+| `deep-probe/capture-facts.ts` | The facts pass: **one** walk over each capture producing its four checksums, encoder report, IFD walk, structure map and full tag dump, in both the shapes the spec and the brief consume. Breathes between captures. When no archive was asked for it drains the caller's array as it goes, so each blob becomes collectable at the moment its facts are read rather than at the end of the loop. Does not count `exifreader`'s synthetic `file.FileType` group as metadata — counting it meant a canvas frame with genuinely no metadata never registered as one |
+| `deep-probe/sheets.ts` | Every sheet a run can produce without an archive: the full stat sheet (plain text **and** a readable HTML page), the forensic item list, the correlation brief and the device spec. One section registry, three renderings — plain text, HTML and the on-screen viewer are all rendered from the same blocks, so what is read cannot drift from what is saved. Also the home of `StageOmission`, `RunFacts` and the text builders the archive shares |
+| `deep-probe/raw-pack.ts` | The raw dump archive, now built **from** the facts pass and the sheets rather than owning them: captures stored verbatim (`captures/` vs `rendered-frames/` by declared origin), per-capture hex dump + structure map + full tag listing, carved segments as lazy `Blob.slice` views, four checksums plus `md5sum`/`sha256sum`-format digest files, the permission ledger, passive dump, sensor CSVs, camera matrix, session log, byte-identity data, the sheets copied in byte-identically and a build trail. Breathes between every stage. Post-build it re-carves every capture from the finished blob and compares. Refuses with `CapturesReleasedError` rather than writing empty files when the bytes were released. Names the file `…-PARTIAL.zip` and lists every omission when a stage did not run |
 | `deep-probe/jpeg-encoder.ts` | The encoder signature: all 64 DQT coefficients per table (printed in both natural and file zig-zag order), DHT code-length counts compared against all four ITU T.81 Annex K tables to separate *standard* from *optimised*, frame mode (baseline vs progressive), chroma subsampling derived from the per-component sampling factors, SOS scan count, DRI restart interval, APP segments in file order with lengths and signatures, the embedded thumbnail parsed as the complete second JPEG it is (its own dimensions and table sums), a full ICC header parse (desc name, class, spaces, creator, intent, the profile's own embedded ID), and any bytes after EOI. The libjpeg quality estimate is **withheld** where the tables are not a scaled Annex K table — Apple's encoder is that case, and the refusal is itself the finding |
 | `deep-probe/exif-ifd.ts` | A raw TIFF/IFD walk reporting every entry **as stored**: tag ID, TIFF type, component count, byte length, inline-vs-offset, and the undecoded value — rationals as `num/den` rather than decimals, ASCII with its length and NUL-termination stated, UNDEFINED as hex. Also the structure a tag list cannot express: byte order, magic, directory order, IFD1 presence, MakerNote length and signature, `ColorSpace 65535` and `InteroperabilityIndex` as first-class fields, and the GPS block with every Ref resolved. Undocumented tags are reported with a null name, never dropped |
 | `deep-probe/correlation-brief.ts` | Answers a specific forensic request item by item from a **single registry**, rendered two ways — the full `correlation-brief.md` and the compact answer key at the top of `device-spec.md` — so the summary cannot drift from the document it summarises. Four statuses, not two: `captured`, `partial`, `not-run` (a gap in this observation) and `not-obtainable` (a limit of what a web page can read). Merging the last two would be the most useful lie such a document could tell, so they are never merged |
@@ -264,7 +280,9 @@ question: not *is this capture authentic* but *what did this device actually han
 | Path | Contents |
 |---|---|
 | `READ-ME.txt` | What each folder is, what the archive does and does not prove, and — when a stage did not run — exactly which one and why |
-| `overview.html` | Readable summary: outcome counts, the full request table, a passive-dump extract, sweep totals, sensor rates, the photo table with SHA-256, and the re-verification instructions |
+| `stat-sheet.html` / `.txt` | The full stat and spec sheet, copied in byte-identically from what was handed over on screen: the forensic item list, run summary, every request, everything taken without asking, sensor rates, the asked-versus-granted camera table with the silent substitutions called out, every photo in full, every omission and the re-verification instructions |
+| `forensic-items.txt` | The forensic item list on its own — first in the sheet and standalone here, as asked |
+| `log/build-trail.txt` | Wall-clock time at each stage of building this archive, so a build that dies next time can be compared against one that did not |
 | `permissions/ledger.txt` / `.json` | Every request: API name, the moment it fired, your response time, what it reaches, how long the grant lasts, what came back, and the browser's own permission state before and after |
 | `environment/passive-dump.txt` / `.json` | Everything readable with **no prompt at all**, plus `permissions.query` for every name any browser answers to |
 | `sensors/*.csv` | One commented CSV per granted sensor, each stating the measured rate beside the requested one |
@@ -339,6 +357,43 @@ data, incompressible noise with nothing structural in it. Every region a forensi
 the thumbnail, SOF, the first SOS and any bytes after EOI — sits in the head or the tail and is
 always rendered. The complete file is present and byte-identical in `captures/` either way, so
 a window costs a convenience rather than evidence.
+
+### 6b.3 The archive is opt-in, and the crash has to testify
+
+Repeated reports had the browser dying "every single time" the archive step began. Two things
+followed from that, and only one of them is a fix.
+
+**The sheets stopped being hostages.** The stat sheet, the correlation brief and the device spec
+were all built *inside* `raw-pack.ts` and returned only if the ZIP survived — so the cheapest,
+most useful products of a twenty-minute run died with the most expensive and most fragile one.
+The pass is now split three ways: `capture-facts.ts` walks each capture once, `sheets.ts` writes
+everything from the result, and `raw-pack.ts` consumes both. A crash at archive time now costs the
+dump and nothing else. The archive itself is a tick box, **off by default**, and unticking it
+releases each photo's bytes the instant its facts are read — which is why the choice is offered
+*before* the read rather than after, and why the consequence (no archive from this run) is stated
+on the box rather than buried.
+
+**The crash was made to testify.** A tab killed by the OS runs no handler and logs nothing, so
+`crash-trail.ts` writes each step to `localStorage` *before* it runs. The decisive measurement is
+a heartbeat on a 250 ms timer: a blocked main thread cannot service a timer, so if the last tick
+lands as a step begins, that step froze the thread and the page was killed for not responding; if
+ticks carried on for seconds into the step and then stopped dead, the thread was healthy and
+something else ended the tab — which on a phone means memory. Heap figures corroborate where the
+browser reports them, and WebKit reports neither, which is exactly why the heartbeat rather than
+the heap is the primary signal. Where the evidence does not decide, the report says
+`undetermined` rather than picking one.
+
+Both candidate fixes were applied, because both were cheap and only one needed to be right:
+
+- **Breathing.** `breathe.ts` returns control to the browser on a time cadence through every long
+  pass — the facts walk, the hex renderings, the segment carving, the assembly and the
+  re-verification. `scheduler.yield()` where it exists, a `MessageChannel` macrotask otherwise,
+  because a nested `setTimeout(0)` is clamped to 4 ms after five levels and over a thousand
+  iterations that clamp alone is four seconds.
+- **Fewer walks, no duplicated buffers.** The encoder parse, the IFD walk and the tag dump used to
+  read the bytes separately; they now share one read. Segments are carried as lazy `Blob.slice`
+  views the ZIP writer reads once each, and the re-carve verification streams rather than
+  materialising the archive twice.
 
 ### 6b.2 Sweep memory — the costs a byte counter cannot see
 

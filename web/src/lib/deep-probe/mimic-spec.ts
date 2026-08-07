@@ -34,7 +34,7 @@ import type { PackOrigin } from "../evidence-pack";
 import type { CameraMatrixReport, MatrixRow } from "./camera-matrix";
 import type { PassiveGroup } from "./passive";
 import type { PermissionRecord, PermissionTier } from "./permissions";
-import type { StageOmission } from "./raw-pack";
+import type { StageOmission } from "./sheets";
 import type { SensorSeries } from "./sensors";
 
 /**

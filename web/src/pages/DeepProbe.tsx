@@ -11,8 +11,10 @@ import {
   Hand,
   Loader2,
   Minus,
+  FileCode,
   FileText,
   FolderOpen,
+  ListChecks,
   Package,
   Pause,
   Play,
@@ -23,12 +25,16 @@ import {
   X,
 } from "lucide-react";
 
+import { CrashBanner } from "@/components/deep-probe/CrashBanner";
 import { probeManualShot, type ZoomTarget } from "@/components/deep-probe/ProbeViewfinder";
+import { SheetViewer } from "@/components/deep-probe/SheetViewer";
 import { Button } from "@/components/ui/button";
-import { formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
+import { downloadBlob, formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
+import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
+import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
 import { buildManualShotList, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
 import { collectPassive, type PassiveGroup } from "@/lib/deep-probe/passive";
@@ -45,7 +51,8 @@ import {
   type PermissionTier,
   type ProbeRequest,
 } from "@/lib/deep-probe/permissions";
-import { buildRawPack, downloadDeviceSpec, downloadRawPack, type RawPackResult, type StageOmission } from "@/lib/deep-probe/raw-pack";
+import { buildRawPack, downloadRawPack, type RawPackResult } from "@/lib/deep-probe/raw-pack";
+import { buildSheets, type RunFacts, type SheetSet, type StageOmission } from "@/lib/deep-probe/sheets";
 import {
   recordGenericSensor,
   recordGeolocation,
@@ -56,15 +63,22 @@ import {
 } from "@/lib/deep-probe/sensors";
 import { cn } from "@/lib/utils";
 
-type Phase = "setup" | "permissions" | "sensors" | "camera" | "manual" | "building" | "done";
+type Phase = "setup" | "permissions" | "sensors" | "camera" | "manual" | "exports" | "reading" | "building" | "done";
 
 const STAGES: { phase: Phase; label: string; icon: typeof ShieldQuestion }[] = [
   { phase: "permissions", label: "Permissions", icon: ShieldQuestion },
   { phase: "sensors", label: "Sensors", icon: Radio },
   { phase: "camera", label: "Camera sweep", icon: Camera },
   { phase: "manual", label: "Your shots", icon: Hand },
+  { phase: "reading", label: "Sheets", icon: ListChecks },
   { phase: "building", label: "Archive", icon: Package },
 ];
+
+/** Phases where the run is working through the bytes rather than waiting on you. */
+const WORKING: Phase[] = ["exports", "reading", "building"];
+
+/** What a finished run can hand over. Only the archive is off by default. */
+type ExportChoice = { sheet: boolean; spec: boolean; viewer: boolean; archive: boolean };
 
 const COUNTDOWN_SECONDS = 4;
 /** How often a paused stage re-checks whether you have resumed. */
@@ -166,7 +180,16 @@ export default function DeepProbe() {
   const [buildMessage, setBuildMessage] = useState<string>("");
   const [buildPct, setBuildPct] = useState<number>(0);
   const [pack, setPack] = useState<RawPackResult | null>(null);
+  const [sheets, setSheets] = useState<SheetSet | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
+  const [archiveFatal, setArchiveFatal] = useState<string | null>(null);
+  /**
+   * The archive is off by default. It is the one product of a run that has been
+   * killing the tab, and everything else is cheap — so the expensive thing is
+   * opted into rather than out of, until it has earned the trust back.
+   */
+  const [choice, setChoice] = useState<ExportChoice>({ sheet: true, spec: true, viewer: true, archive: false });
+  const [crash, setCrash] = useState<CrashReport | null>(null);
 
   const [paused, setPaused] = useState<boolean>(false);
   const [photoCount, setPhotoCount] = useState<number>(0);
@@ -190,6 +213,10 @@ export default function DeepProbe() {
   const pausedRef = useRef<boolean>(false);
   const suspensionsRef = useRef<{ phase: Phase; seconds: number; at: string }[]>([]);
   const ranRef = useRef<Set<string>>(new Set());
+  const factsRef = useRef<CaptureFacts[]>([]);
+  const sheetsRef = useRef<SheetSet | null>(null);
+  const finishedAtRef = useRef<string>("");
+  const choiceRef = useRef<ExportChoice>(choice);
   const tickerRef = useRef<HTMLDivElement | null>(null);
 
   const addLog = useCallback((level: LogLevel, message: string): void => {
@@ -199,6 +226,47 @@ export default function DeepProbe() {
   useEffect(() => {
     tickerRef.current?.scrollTo({ top: tickerRef.current.scrollHeight, behavior: "smooth" });
   }, [logs]);
+
+  useEffect(() => {
+    choiceRef.current = choice;
+  }, [choice]);
+
+  /**
+   * Reads whatever the last run left behind, once, on arrival.
+   *
+   * A tab killed by the operating system runs no handler and writes no console
+   * line, so the only way to learn anything about the death is to read the notes
+   * the run left on disk before it happened. `pagehide` marks an ordinary
+   * departure, which is how a deliberate reload is told apart from a kill.
+   */
+  useEffect(() => {
+    setCrash(takeCrashReport());
+    const onHide = (): void => markLeft();
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      stopHeartbeat();
+    };
+  }, []);
+
+  /** Everything the run gathered, in the shape both the sheets and the archive read. */
+  const runFacts = useCallback(
+    (): RunFacts => ({
+      startedAt: startedAtRef.current,
+      finishedAt: finishedAtRef.current || new Date().toISOString(),
+      tier,
+      permissions: records,
+      passive: passiveRef.current,
+      permissionStatesBefore: statesBeforeRef.current,
+      permissionStatesAfter: statesAfterRef.current.length > 0 ? statesAfterRef.current : statesBeforeRef.current,
+      sensors,
+      matrix,
+      logs: suspensionLogs(logs, suspensionsRef.current),
+      omissions: omissionsRef.current,
+      devicesBeforePermission: devicesBeforeRef.current,
+    }),
+    [tier, records, sensors, matrix, logs]
+  );
 
   /* ---------------- elapsed clock ---------------- */
   useEffect(() => {
@@ -611,36 +679,110 @@ export default function DeepProbe() {
   useEffect(() => {
     if (phase !== "manual" || manualSteps.length === 0 || manualIndex < manualSteps.length) return;
     addLog("success", "Manual shots finished.");
-    setPhase("building");
+    finishedAtRef.current = new Date().toISOString();
+    setPhase("exports");
   }, [phase, manualIndex, manualSteps.length, addLog]);
 
-  /* ---------------- stage five: the archive ---------------- */
+  /* ---------------- stage five: the facts, then the sheets ---------------- */
+  useEffect(() => {
+    if (phase !== "reading" || ranRef.current.has("reading")) return;
+    ranRef.current.add("reading");
+    const wants = choiceRef.current;
+    void (async () => {
+      const captureCount = capturesRef.current.length;
+      const captureBytes = capturesRef.current.reduce((sum, capture) => sum + capture.blob.size, 0);
+      startTrail({
+        scope: TIER_INFO[tier].label,
+        captures: captureCount,
+        captureMegabytes: Math.round(captureBytes / 1024 / 1024),
+        archiveRequested: wants.archive,
+        hexBudgetMegabytes: Math.round(HEX_BUDGET / 1024 / 1024),
+        userAgent: navigator.userAgent.slice(0, 120),
+      });
+      setHeldBytes(captureBytes);
+      try {
+        addLog(
+          "info",
+          wants.archive
+            ? `Reading the facts of ${captureCount} capture(s). The bytes are kept because you asked for the archive.`
+            : `Reading the facts of ${captureCount} capture(s). Each photo's bytes are released the moment its facts are read, so nothing large is held while the sheets are written.`
+        );
+        mark(`Reading the facts of ${captureCount} capture(s), ${Math.round(captureBytes / 1024 / 1024)} MB`);
+        const result = await readCaptureFacts(capturesRef.current, {
+          release: !wants.archive,
+          onProgress: (message, done, total) => {
+            setBuildMessage(message);
+            setBuildPct(Math.min(96, Math.round((done / Math.max(total, 1)) * 100)));
+          },
+          onStep: mark,
+          onHeldBytes: (bytes) => {
+            setHeldBytes(bytes);
+            setByteCount(bytes);
+          },
+        });
+        factsRef.current = result.facts;
+        for (const warning of result.warnings) addLog("warn", warning);
+        addLog(
+          "success",
+          `Read ${result.facts.length} capture(s), ${formatBytes(result.bytesRead)} walked. Control went back to the browser ${result.yields} time(s) during the pass, which is what keeps the page answering instead of being killed for going quiet.`
+        );
+        if (result.released) {
+          addLog("info", "The photo bytes have been released. No archive can be built from this run — that is the trade you chose, and it is why the memory figure above is now zero.");
+        }
+
+        mark("Writing the sheets");
+        setBuildMessage("Writing the sheets");
+        const built = buildSheets(runFacts(), result.facts);
+        sheetsRef.current = built;
+        setSheets(built);
+        setBuildPct(100);
+        setBuildMessage("");
+        addLog(
+          "success",
+          `Sheets ready: the full stat sheet, the forensic item list, the correlation brief and the device spec. None of them needed an archive, and you have them now rather than after one.`
+        );
+
+        if (wants.archive) {
+          setPhase("building");
+          return;
+        }
+        finishTrail("complete");
+        setPhase("done");
+      } catch (err) {
+        const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        setFatal(message);
+        addLog("error", `The facts could not be read: ${message}`);
+        finishTrail("failed", message);
+        setPhase("done");
+      }
+    })();
+  }, [phase, tier, runFacts, addLog]);
+
+  /* ---------------- stage six: the archive, only if asked for ---------------- */
   useEffect(() => {
     if (phase !== "building" || ranRef.current.has("building")) return;
     ranRef.current.add("building");
+    const sheetSet = sheetsRef.current;
     void (async () => {
+      if (!sheetSet) {
+        setArchiveFatal("The sheets were not written, so there is nothing for the archive to copy in. This is a bug, and the run is reported as it is rather than patched over.");
+        finishTrail("failed", "sheets missing at archive time");
+        setPhase("done");
+        return;
+      }
       try {
         addLog("info", `Assembling the archive from ${capturesRef.current.length} capture(s).`);
+        mark(`Starting the archive from ${capturesRef.current.length} capture(s)`);
         const result = await buildRawPack(
+          { ...runFacts(), captures: capturesRef.current, hexBudgetBytes: HEX_BUDGET },
+          factsRef.current,
+          sheetSet,
           {
-            startedAt: startedAtRef.current,
-            finishedAt: new Date().toISOString(),
-            tier,
-            permissions: records,
-            passive: passiveRef.current,
-            permissionStatesBefore: statesBeforeRef.current,
-            permissionStatesAfter: statesAfterRef.current.length > 0 ? statesAfterRef.current : statesBeforeRef.current,
-            sensors,
-            matrix,
-            captures: capturesRef.current,
-            logs: suspensionLogs(logs, suspensionsRef.current),
-            omissions: omissionsRef.current,
-            hexBudgetBytes: HEX_BUDGET,
-            devicesBeforePermission: devicesBeforeRef.current,
-          },
-          (message, done, total) => {
-            setBuildMessage(message);
-            setBuildPct(Math.min(99, Math.round((done / Math.max(total, 1)) * 100)));
+            onProgress: (message, done, total) => {
+              setBuildMessage(message);
+              setBuildPct(Math.min(99, Math.round((done / Math.max(total, 1)) * 100)));
+            },
+            onStep: mark,
           }
         );
         setBuildPct(100);
@@ -654,33 +796,41 @@ export default function DeepProbe() {
             : `Archive built, but ${failed} capture(s) failed the byte-identity re-check. That failure is reported, not hidden.`
         );
         for (const warning of result.warnings) addLog("warn", warning);
+        finishTrail("complete");
         setPhase("done");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        setFatal(message);
-        addLog("error", `The archive could not be built: ${message}`);
+        setArchiveFatal(message);
+        addLog("error", `The archive could not be built: ${message} — the sheets above are unaffected and already yours.`);
+        finishTrail("failed", message);
         setPhase("done");
       }
     })();
-  }, [phase, tier, records, sensors, matrix, logs, addLog]);
+  }, [phase, runFacts, addLog]);
 
   const stopEverything = useCallback((): void => {
     abortRef.current = true;
     pausedRef.current = false;
     setPaused(false);
-    addLog("warn", "Stopping. Everything gathered so far is kept, and the archive will be labelled partial.");
+    addLog("warn", "Stopping. Everything gathered so far is kept, and every sheet will be labelled partial.");
+    finishedAtRef.current = new Date().toISOString();
     if (phase === "permissions") {
       for (const request of queue.slice(index)) setRecords((prev) => [...prev, skippedRecord(request)]);
       omissionsRef.current.push({ stage: "Remaining permission requests", reason: "You stopped the run. The requests that had not yet fired are listed as skipped." });
       ranRef.current.add("sensors");
       ranRef.current.add("camera");
       omissionsRef.current.push({ stage: "Sensor recordings, camera sweep and manual shots", reason: "You stopped the run before these stages." });
-      setPhase("building");
+      setPhase("exports");
     } else if (phase === "manual") {
       omissionsRef.current.push({ stage: "Remaining manual shots", reason: "You stopped the run. The shots not yet taken were never attempted." });
-      setPhase("building");
+      setPhase("exports");
     }
   }, [phase, queue, index, addLog]);
+
+  /** Saves one derived text file. Nothing here needs the archive to exist. */
+  const saveText = useCallback((text: string, fileName: string, mime: string): void => {
+    downloadBlob(new Blob([text], { type: `${mime};charset=utf-8` }), fileName);
+  }, []);
 
   const counters = (
     <div className="grid grid-cols-4 gap-1.5">
@@ -690,6 +840,12 @@ export default function DeepProbe() {
       <Counter label="Elapsed" value={`${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`} />
     </div>
   );
+
+  /**
+   * The archive step only appears in the stepper when it was asked for. Showing
+   * a stage that will never run would misreport the shape of the run.
+   */
+  const stages = useMemo(() => STAGES.filter((stage) => stage.phase !== "building" || choice.archive), [choice.archive]);
 
   const ticker = (
     <div className="diag-card overflow-hidden">
@@ -715,7 +871,7 @@ export default function DeepProbe() {
           <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fuchsia-400">Deep Probe</p>
           <h1 className="truncate text-[15px] font-semibold leading-tight">Maximum-demand run</h1>
         </div>
-        {phase !== "setup" && phase !== "done" && phase !== "building" ? (
+        {phase !== "setup" && phase !== "done" && !WORKING.includes(phase) ? (
           <div className="flex items-center gap-1.5">
             <button
               type="button"
@@ -743,9 +899,9 @@ export default function DeepProbe() {
 
       {phase !== "setup" ? (
         <div className="mb-3 flex items-center gap-1">
-          {STAGES.map((stage) => {
-            const order = STAGES.findIndex((s) => s.phase === phase);
-            const mine = STAGES.findIndex((s) => s.phase === stage.phase);
+          {stages.map((stage) => {
+            const order = stages.findIndex((s) => s.phase === (phase === "exports" ? "reading" : phase));
+            const mine = stages.findIndex((s) => s.phase === stage.phase);
             const state = phase === "done" || mine < order ? "done" : mine === order ? "active" : "todo";
             const Icon = stage.icon;
             return (
@@ -765,6 +921,12 @@ export default function DeepProbe() {
               </div>
             );
           })}
+        </div>
+      ) : null}
+
+      {crash ? (
+        <div className="mb-3">
+          <CrashBanner report={crash} onDismiss={() => setCrash(null)} />
         </div>
       ) : null}
 
@@ -956,19 +1118,48 @@ export default function DeepProbe() {
         </div>
       ) : null}
 
-      {phase === "building" ? (
+      {phase === "exports" ? (
+        <div className="space-y-3">
+          {counters}
+          <ExportChoicePanel
+            choice={choice}
+            setChoice={setChoice}
+            photoCount={photoCount}
+            byteCount={byteCount}
+            onGo={() => {
+              addLog(
+                "info",
+                choice.archive
+                  ? "Archive ticked. The photo bytes are kept, so this run will use the memory the archive needs."
+                  : "Archive not ticked. The photo bytes will be released as they are read, and no archive can be made from this run afterwards."
+              );
+              setBuildPct(0);
+              setPhase("reading");
+            }}
+          />
+          {ticker}
+        </div>
+      ) : null}
+
+      {phase === "reading" || phase === "building" ? (
         <div className="space-y-3">
           {counters}
           <div className="diag-card p-3.5">
-            <h2 className="section-title">Building the archive</h2>
+            <h2 className="section-title">{phase === "reading" ? "Reading the photos and writing the sheets" : "Building the archive"}</h2>
             <p className="section-sub mt-1">
-              Every capture is copied in untouched and stored uncompressed, then carved back out of the finished archive and compared byte-for-byte —
-              the claim is checked, not asserted.
+              {phase === "reading"
+                ? "One walk over each photo produces its checksums, its encoder signature, its metadata directories and its structure. Control goes back to the browser as it goes, so this page keeps answering instead of being killed for going quiet."
+                : "Every capture is copied in untouched and stored uncompressed, then carved back out of the finished archive and compared byte-for-byte — the claim is checked, not asserted."}
             </p>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
               <div className="h-full rounded-full bg-gradient-to-r from-fuchsia-500 to-cyan-400 transition-[width] duration-300" style={{ width: `${buildPct}%` }} />
             </div>
             <p className="mono mt-2 text-[10.5px] text-muted-foreground">{buildMessage || "…"}</p>
+            {phase === "building" ? (
+              <p className="mt-2 rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-2.5 text-[10.5px] leading-relaxed text-emerald-200">
+                Every sheet is already written and waiting below. If this step fails, you keep all of it.
+              </p>
+            ) : null}
           </div>
           {ticker}
         </div>
@@ -982,8 +1173,79 @@ export default function DeepProbe() {
               <div className="flex items-start gap-2 text-rose-300">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <div>
-                  <h2 className="text-[14px] font-semibold">The archive could not be built</h2>
+                  <h2 className="text-[14px] font-semibold">The photos could not be read</h2>
                   <p className="mt-1 text-[11.5px] leading-relaxed text-rose-200/90">{fatal}</p>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {sheets ? (
+            <div className="diag-card p-3.5">
+              <h2 className="section-title">Your sheets are ready</h2>
+              <p className="section-sub mt-1">
+                {photoCount} photo(s) read · {records.filter((r) => r.outcome !== "skipped").length} request(s) answered
+                {sheets.partial ? " · labelled PARTIAL, with every missing stage named inside" : " · every stage ran"}
+              </p>
+              {choice.sheet ? (
+                <>
+                  <Button
+                    className="mt-3 h-12 w-full bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400"
+                    onClick={() => saveText(sheets.statSheetHtml, sheets.fileNames.statHtml, "text/html")}
+                  >
+                    <Download className="mr-1.5 h-4 w-4" />
+                    Full stat and spec sheet (.html)
+                  </Button>
+                  <Button variant="outline" className="mt-2 h-11 w-full" onClick={() => saveText(sheets.statSheetText, sheets.fileNames.statText, "text/plain")}>
+                    <FileText className="mr-1.5 h-4 w-4" />
+                    The same sheet as plain text (.txt)
+                  </Button>
+                  <Button variant="outline" className="mt-2 h-11 w-full" onClick={() => saveText(sheets.forensicChecklist, sheets.fileNames.checklist, "text/plain")}>
+                    <ListChecks className="mr-1.5 h-4 w-4" />
+                    The forensic item list on its own (.txt)
+                  </Button>
+                  <Button variant="outline" className="mt-2 h-11 w-full" onClick={() => saveText(sheets.correlationBrief, sheets.fileNames.brief, "text/markdown")}>
+                    <FileText className="mr-1.5 h-4 w-4" />
+                    Correlation brief (.md)
+                  </Button>
+                </>
+              ) : null}
+              {choice.spec ? (
+                <>
+                  <Button
+                    variant={choice.sheet ? "outline" : "default"}
+                    className={cn("mt-2 h-11 w-full", choice.sheet ? "" : "h-12 bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400")}
+                    onClick={() => saveText(sheets.specMarkdown, sheets.fileNames.spec, "text/markdown")}
+                  >
+                    <FileCode className="mr-1.5 h-4 w-4" />
+                    AI mimic spec (.md)
+                  </Button>
+                  <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                    A few pages holding only what is distinctive about this device. The facts that are identical on every phone alive are left out on
+                    purpose, and the file says so — they would be noise in a document whose whole job is to characterise this one.
+                  </p>
+                </>
+              ) : null}
+              {!choice.sheet && !choice.spec ? (
+                <p className="mt-3 rounded-xl border border-border/60 bg-background/40 p-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                  You ticked neither downloadable sheet, so nothing is offered for saving. Everything is still readable below.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {sheets && choice.viewer ? <SheetViewer sections={sheets.sections} /> : null}
+
+          {archiveFatal ? (
+            <div className="diag-card border-rose-500/45 p-3.5">
+              <div className="flex items-start gap-2 text-rose-300">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <div>
+                  <h2 className="text-[14px] font-semibold">The archive could not be built</h2>
+                  <p className="mt-1 text-[11.5px] leading-relaxed text-rose-200/90">{archiveFatal}</p>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                    The sheets above are unaffected. They were written before the archive was attempted, which is exactly why they survived it.
+                  </p>
                 </div>
               </div>
             </div>
@@ -992,27 +1254,14 @@ export default function DeepProbe() {
           {pack ? (
             <>
               <div className="diag-card p-3.5">
-                <h2 className="section-title">Run complete</h2>
+                <h2 className="section-title">The raw archive</h2>
                 <p className="section-sub mt-1">
                   {pack.files} files · {formatBytes(pack.bytes)}
-                  {omissionsRef.current.length > 0 || matrix?.aborted ? " · labelled PARTIAL, with every missing stage named inside" : " · every stage ran"}
                 </p>
-                <Button
-                  className="mt-3 h-12 w-full bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400"
-                  onClick={() => downloadRawPack(pack)}
-                >
+                <Button className="mt-3 h-12 w-full bg-fuchsia-500 text-fuchsia-950 hover:bg-fuchsia-400" onClick={() => downloadRawPack(pack)}>
                   <Download className="mr-1.5 h-4 w-4" />
                   Download the raw dump
                 </Button>
-                <Button variant="outline" className="mt-2 h-11 w-full" onClick={() => downloadDeviceSpec(pack)}>
-                  <FileText className="mr-1.5 h-4 w-4" />
-                  Device spec only (.md)
-                </Button>
-                <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
-                  The spec is a few pages instead of {formatBytes(pack.bytes)}: only the readings that differ between devices, each tagged as fixed
-                  hardware, tied to the OS version, a setting you chose, or something that changes every run. It is also inside the archive as
-                  device-spec.md.
-                </p>
                 <Link
                   to="/archive"
                   className="mt-2 flex h-11 w-full items-center justify-center gap-1.5 rounded-xl border border-border/70 bg-card text-[12px] font-semibold active:scale-95"
@@ -1049,6 +1298,15 @@ export default function DeepProbe() {
                 </div>
               ) : null}
             </>
+          ) : null}
+
+          {!choice.archive && sheets ? (
+            <div className="diag-card p-3">
+              <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+                You did not ask for the archive, so the photo bytes were released as they were read and none is held now. That is why this run used a
+                fraction of the memory. To get a byte-for-byte dump you would need to run again with the archive ticked.
+              </p>
+            </div>
           ) : null}
 
           <ResultList records={records} />
@@ -1132,6 +1390,155 @@ function ResultList({ records }: { records: PermissionRecord[] }) {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** One tick box, with the consequence of the choice stated on the box itself. */
+function TickBox({
+  on,
+  onToggle,
+  title,
+  detail,
+  icon: Icon,
+  tone,
+}: {
+  on: boolean;
+  onToggle: () => void;
+  title: string;
+  detail: string;
+  icon: typeof FileText;
+  tone?: "heavy";
+}) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={on}
+      onClick={onToggle}
+      className={cn(
+        "flex w-full items-start gap-2.5 rounded-xl border p-3 text-left transition-colors active:scale-[0.99]",
+        on
+          ? tone === "heavy"
+            ? "border-amber-500/55 bg-amber-500/12"
+            : "border-fuchsia-500/55 bg-fuchsia-500/12"
+          : "border-border/70 bg-background/40"
+      )}
+    >
+      <span
+        className={cn(
+          "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border",
+          on ? (tone === "heavy" ? "border-amber-400/70 bg-amber-500/25 text-amber-200" : "border-fuchsia-400/70 bg-fuchsia-500/25 text-fuchsia-200") : "border-border text-transparent"
+        )}
+      >
+        <Check className="h-3 w-3" />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-1.5">
+          <Icon className={cn("h-3.5 w-3.5 shrink-0", on ? (tone === "heavy" ? "text-amber-300" : "text-fuchsia-300") : "text-muted-foreground")} />
+          <span className={cn("text-[12.5px] font-semibold", on ? "text-foreground" : "text-muted-foreground")}>{title}</span>
+        </span>
+        <span className="mt-1 block text-[10.5px] leading-relaxed text-muted-foreground">{detail}</span>
+      </span>
+    </button>
+  );
+}
+
+/**
+ * The export choice, made before the photos are read rather than after.
+ *
+ * It has to be here and not at the end: with the archive unticked the photo
+ * bytes are released as each one is read, and that is the entire reason the
+ * sheet-only path costs a fraction of the memory. A choice offered afterwards
+ * would be a choice that could no longer be acted on.
+ */
+function ExportChoicePanel({
+  choice,
+  setChoice,
+  photoCount,
+  byteCount,
+  onGo,
+}: {
+  choice: ExportChoice;
+  setChoice: (next: ExportChoice) => void;
+  photoCount: number;
+  byteCount: number;
+  onGo: () => void;
+}) {
+  const nothing = !choice.sheet && !choice.spec && !choice.viewer && !choice.archive;
+  return (
+    <div className="space-y-3">
+      <div className="diag-card p-3.5">
+        <h2 className="section-title">The asking and the shooting are done</h2>
+        <p className="section-sub mt-1">
+          {photoCount} photo(s), {formatBytes(byteCount)} held. Choose what this run should hand over before it reads them — the choice changes how much
+          memory the next step needs, so it cannot honestly be offered afterwards.
+        </p>
+      </div>
+
+      <div className="diag-card space-y-2 p-3">
+        <TickBox
+          on={choice.sheet}
+          onToggle={() => setChoice({ ...choice, sheet: !choice.sheet })}
+          title="Full stat and spec sheet"
+          detail="Every detectable factor of this run, end to end, as a readable page and as plain text. The forensic item list sits at the top and also comes as its own file, alongside the correlation brief."
+          icon={FileText}
+        />
+        <TickBox
+          on={choice.spec}
+          onToggle={() => setChoice({ ...choice, spec: !choice.spec })}
+          title="AI mimic spec"
+          detail="One concise markdown file holding only what is distinctive about this device. Facts that are identical on every phone alive are left out on purpose, and the file says so."
+          icon={FileCode}
+        />
+        <TickBox
+          on={choice.viewer}
+          onToggle={() => setChoice({ ...choice, viewer: !choice.viewer })}
+          title="Look through it here"
+          detail="The same content on screen, section by section. No download, no archive, no unzipping."
+          icon={ListChecks}
+        />
+        <TickBox
+          on={choice.archive}
+          onToggle={() => setChoice({ ...choice, archive: !choice.archive })}
+          title="Raw archive (the heavy one)"
+          detail="The complete byte-for-byte dump: every photo untouched, hex dumps, carved metadata regions and four checksums each. This is the step that has been killing the browser, so it is off unless you ask for it."
+          icon={Package}
+          tone="heavy"
+        />
+      </div>
+
+      <div
+        className={cn(
+          "diag-card p-3 text-[10.5px] leading-relaxed",
+          choice.archive ? "border-amber-500/40 text-amber-200/90" : "border-emerald-500/35 text-emerald-200/90"
+        )}
+      >
+        {choice.archive ? (
+          <>
+            <span className="font-semibold">The photo bytes will be kept.</span> All {formatBytes(byteCount)} of them stay in memory while the archive is
+            assembled, which is what this browser has been dying on. The sheets are still written first and handed to you before the archive is
+            attempted, so a crash now costs you the dump and nothing else.
+          </>
+        ) : (
+          <>
+            <span className="font-semibold">Each photo's bytes will be released the moment its facts are read.</span> That is what keeps this path
+            cheap. It also means no archive can be made from this run afterwards — you would have to run again with the archive ticked.
+          </>
+        )}
+      </div>
+
+      {nothing ? (
+        <div className="diag-card border-border/70 p-3 text-[10.5px] leading-relaxed text-muted-foreground">
+          Nothing is ticked. The photos will still be read and the sheets still written — they are how the run reports itself — but none of them will be
+          offered for saving or shown on screen.
+        </div>
+      ) : null}
+
+      <Button className="h-14 w-full bg-fuchsia-500 text-[14px] font-semibold text-fuchsia-950 hover:bg-fuchsia-400" onClick={onGo}>
+        {choice.archive ? "Read the photos, then build the archive" : "Read the photos and write the sheets"}
+        <ChevronRight className="ml-1 h-4 w-4" />
+      </Button>
     </div>
   );
 }

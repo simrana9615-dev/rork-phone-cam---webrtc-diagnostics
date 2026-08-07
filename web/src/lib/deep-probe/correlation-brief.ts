@@ -24,7 +24,7 @@ import type { CameraMatrixReport } from "./camera-matrix";
 import type { ExifIfdReport } from "./exif-ifd";
 import type { JpegEncoderReport } from "./jpeg-encoder";
 import type { PassiveGroup } from "./passive";
-import type { StageOmission } from "./raw-pack";
+import type { StageOmission } from "./sheets";
 import type { SensorSeries } from "./sensors";
 
 export type BriefStatus = "captured" | "partial" | "not-run" | "not-obtainable";
