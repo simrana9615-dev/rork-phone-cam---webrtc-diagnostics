@@ -4,6 +4,7 @@ import type { CaptureFacts } from "./capture-facts";
 import { buildSheets, type RunFacts } from "./sheets";
 import type { CameraMatrixReport } from "./camera-matrix";
 import type { PermissionRecord } from "./permissions";
+import { analyseSeries } from "./sensor-stats";
 
 function permission(overrides: Partial<PermissionRecord> = {}): PermissionRecord {
   return {
@@ -187,9 +188,18 @@ function run(overrides: Partial<RunFacts> = {}): RunFacts {
         requestedHz: 60,
         measuredHz: 41,
         note: "Throttled by the browser.",
+        stats: analyseSeries(
+          ["t_ms", "ax", "ay", "az"],
+          [
+            ["0", "0.011", "9.802", "0.004"],
+            ["24", "0.013", "9.799", "0.006"],
+          ],
+          5000
+        ),
       },
     ],
     matrix: matrix(),
+    widthProbe: null,
     logs: [],
     omissions: [],
     devicesBeforePermission: [],

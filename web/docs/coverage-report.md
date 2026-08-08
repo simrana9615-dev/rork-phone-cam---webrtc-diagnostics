@@ -284,7 +284,11 @@ count, minutes, photo count, archive size — before anything runs.
    accuracy figure settles, microphone loudness (level only — no audio is retained), and
    the generic sensors. Each series reports the **measured** rate beside the requested
    one, because browsers throttle these events and quoting the request back would be
-   repeating an intention as a reading.
+   repeating an intention as a reading. The rows themselves are then measured for what
+   they say about the hardware: the **quantisation step** between distinct readings, how
+   many events merely **repeated** the one before (and so the true update rate beside the
+   delivery rate), how **evenly** they arrived, and the **gravity constant** this firmware
+   subtracts.
 4. **Camera matrix.** Per camera: native max, the full resolution ladder in landscape
    **and** portrait, six aspect ratios, five frame rates, then every advertised focus /
    exposure / white-balance / resize mode, zoom extremes and torch applied to a live
@@ -298,13 +302,27 @@ count, minutes, photo count, archive size — before anything runs.
    path; one repeating a shape already held is recorded on its row and dropped.
 5. **Manual shots.** Two library picks, then every named camera in a pinned viewfinder plus
    three zoom steps each (resolved against that camera's own reported range, not a hardcoded
-   factor), then both facings through all three camera-app handoffs — the paths that yield
-   real camera EXIF. A camera with no zoom control produces a clearly-recorded unzoomed shot
-   rather than a fake one. Skips are recorded as skips. The list shortens once the run has
-   PROVEN a shot redundant, but nothing taken by hand is ever thrown away.
-6. **Pixel measurements.** Per surviving capture, a bounded centre sample: the 8×8 block grid
-   phase, and the sensor pipeline's channel balance, tone histogram, clipping and noise floor.
-   The one kind of evidence in the run that is not a header field.
+   factor), then **one** camera-app shot per side — the path that yields real camera EXIF.
+   Each of those two carries all three routes into the camera app as spares, tried in turn
+   until that side has its file, so the stage costs two trips rather than six and still gets
+   its file where the first route fails. A camera with no zoom control produces a
+   clearly-recorded unzoomed shot rather than a fake one. Skips are recorded as skips. The
+   list shortens once the run has PROVEN a shot redundant, but nothing taken by hand is ever
+   thrown away.
+6. **Pixel measurements.** Per surviving capture, a bounded centre sample decoded with EXIF
+   rotation and colour conversion **suppressed** (and stating whether the browser understood
+   being told): the 8×8 block grid phase, the 2×2 colour-filter rhythm, the sensor pipeline's
+   channel balance and tone histogram, clipping **per channel**, a noise floor measured only
+   where the picture is flat and reported per colour, the comb a post-capture tone stretch
+   leaves, and the centre-to-corner falloff. The one kind of evidence in the run that is not a
+   header field.
+7. **Or, instead of all of it: the 640-only investigation.** A second run mode, chosen on the
+   way in. Two opens — back then front — each sent `{ video: { width: 640, facingMode } }` and
+   nothing else, recording what the phone chose in place of everything it was not told: the
+   size, the aspect ratio, the frame rate, which physical camera opened and everything that
+   camera says about itself. Two stills per open, down the platform and canvas paths. About a
+   minute. The sensor stage and the manual stage are named as deliberately absent rather than
+   left looking refused.
 
 **Export:** one raw dump ZIP (layout in `architecture.md` §6b) with the untouched
 captures stored uncompressed, a complete hex + ASCII dump of every byte, a real
@@ -483,34 +501,106 @@ pipeline is worth more than a second copy of a file already held. Shapes are com
 camera and one path at a time — the same tables coming out of two different lenses is a finding,
 not a duplicate, and is listed separately as one.
 
-**Not asking for what has already been answered.** The manual stage spends attention rather than
-time, so it shortens as evidence arrives. Once two *different* camera-app engines return the same
-shape for one facing, the third has been answered — this device routes them all to one camera
-app — and is not asked for. Two shots from the same engine agreeing proves only that the engine
-is consistent with itself, and is explicitly not enough. A camera that applied no zoom when asked
-has no range to walk, so its remaining zoom shots go too.
+**One file per side, with spares.** The camera-app stage used to cost six trips to the camera:
+three routes, both facings. On every device seen so far all three end at the same camera app and
+return the same kind of file, so five of those six were another copy of an answer already in
+hand. What the run needs from this stage is one **back** original and one **front** original —
+the only two files in a whole run the camera itself wrote.
 
-The asymmetry is deliberate: the sweep drops files it already took, but the manual stage stops
-asking instead. A photograph someone stood still to produce is never discarded. Every skip is
-listed on screen with the observation that caused it, so a shorter list is never a quieter one.
+So the three routes became one shot with two spares. The first route is tried; if it fails
+outright or the camera is closed without a picture, the next is offered for the same side, until
+that side has its file or the routes run out. Every attempt is recorded with what came of it, so
+"the front camera answered on the second route after the first came back empty" is a fact the
+archive holds rather than something a reader infers from a gap — and that fallback is itself a
+finding, because it says the routes are not interchangeable on this device. A side that exhausts
+every route says so plainly, names each attempt, and has nothing substituted for it. Closing the
+camera moves to the next route; **skip** drops the whole shot, and the wording says which is
+which. When the first route answers, the spares were never *needed* — recorded as exactly that,
+with no claim about what they would have returned.
+
+A camera that applied no zoom when asked has no range to walk, so its remaining zoom shots go
+too. The asymmetry is deliberate: the sweep drops files it already took, but the manual stage
+stops asking instead. A photograph someone stood still to produce is never discarded. Every skip
+is listed on screen with the observation that caused it, so a shorter list is never a quieter
+one.
 
 **What the pixels say.** Everything else here reads headers — which is what the writer *chose* to
 record. Consolidation made the other kind affordable: with a dozen genuinely different files
-instead of two hundred near-identical ones, each one earns a decode. Two measurements come out of
-a bounded centre sample. The **8×8 block grid**: on the boundary it is just this file's own
-compression and is reported as the non-finding it is; *off* the boundary it means the picture was
-compressed, then cropped or shifted, then compressed again — which a frame straight from a camera
-cannot be. And the **sensor pipeline**: channel balance, tone histogram, clipping at both ends,
-noise floor, distinct luma count.
+instead of two hundred near-identical ones, each one earns a decode.
 
-Four restraints, because a pixel statistic is the easiest thing here to over-read. Scene-dependent
+The decode itself was the first thing wrong with it, and it was silent. A browser will rotate a
+photo to its EXIF orientation and convert its colours to the display profile *before* handing
+over any pixels, and this pass asked for neither to be stopped. A quarter turn swaps the block
+grid's two axes — which is the difference between an ordinary photograph and an accusation of
+recompression — and a colour conversion rewrites every channel figure as partly the browser's
+arithmetic. Both are now switched off, and whether the browser *understood* being told is
+established rather than assumed; where it cannot be established the report says so, and where the
+instruction was ignored the reading warns that the axes may be the browser's rather than the
+file's.
+
+Six measurements come out of the sample. The **8×8 block grid**: on the boundary it is just this
+file's own compression and is reported as the non-finding it is; *off* the boundary it means the
+picture was compressed, then cropped or shifted, then compressed again — which a frame straight
+from a camera cannot be. The **2×2 colour-filter rhythm**: three quarters of the red and blue in a
+finished photograph were interpolated from neighbours, and that interpolation leaves a four-phase
+structure a render or a rescale does not — the closest this app comes to asking whether a picture
+was ever a photograph at all. The **sensor pipeline**: channel balance, tone histogram, clipping
+**per channel** as well as across all three, and a noise floor measured only in the flattest tiles
+and reported per colour. The **tone range**, where evenly spaced empty levels are the mark of a
+brightness or contrast stretch applied after capture. And the frame **from the middle out**:
+centre and four corners, the falloff between them, and whether the noise floor is even across the
+frame.
+
+Three of those exist because the old figures were describing the subject rather than the device.
+The noise floor was taken across the whole patch, so it rose on a bookshelf and fell on a blank
+wall and neither movement had anything to do with the sensor. Clipping was counted only where all
+three channels were pinned at once, so a sky blown out in blue alone registered as nothing. And
+only the dead centre was sampled, which threw away corner falloff — a real per-model trait, and
+the one check on whether corner amplification has left the noise uneven.
+
+Five restraints, because a pixel statistic is the easiest thing here to over-read. Scene-dependent
 numbers are labelled scene-dependent and compared only between photographs of the same scene. A
 frame this app encoded from a video track *will* show recompression, because that is literally
-what it is, and it says so itself rather than letting a reader discover it. The sample origin is
-forced onto an 8-pixel boundary so the sampling cannot create the misalignment it is looking for.
-And an axis showing no periodicity is given **no phase** — taking the winner of eight
-near-identical numbers would manufacture an offset out of noise, and an offset is the one serious
-claim this pass makes. Still no verdict, no score, no probability.
+what it is, and it says so itself rather than letting a reader discover it — and its
+colour-filter reading is stamped as proving nothing either way, since a video track is
+chroma-subsampled and re-encoded twice before this app sees it. **Absence is never proof**: no
+2×2 rhythm can mean a synthetic picture, or simply one compressed hard enough to erase it, and
+the reading says both every time. The sample origin is forced onto an 8-pixel boundary — even, so
+the colour-filter phase survives the crop as well — so the sampling cannot create the
+misalignment it is looking for. And an axis showing no periodicity is given **no phase**: taking
+the winner of eight near-identical numbers would manufacture an offset out of noise, and an offset
+is the one serious claim this pass makes. Still no verdict, no score, no probability.
+
+**What the sensor rows say.** The recorders were careful to keep every reading at full precision
+— rounding first would replace the device's real step with our formatting choice — and then
+nothing ever looked at them again. Four of the strongest traits in a motion trace were sitting in
+the rows unmeasured. The **quantisation step** is the smallest gap between distinct readings,
+which on real hardware is the converter's own resolution and is the cheapest sanity check on a
+trace there is, since synthetic data is almost always continuous where real data is not. The
+**repeats** matter because several platforms deliver on a timer and re-send the last reading when
+the sensor has not moved on — a rate counted from events is then the timer's rate, so the
+delivery rate and the true update rate are now reported side by side. The **regularity** of
+arrival separates a hardware interrupt from a JavaScript queue far better than the mean rate does.
+And the **gravity constant** the firmware subtracts is a vendor choice a device states without
+being asked; where the phone was moving during the window, the figure is reported with its spread
+rather than as a clean constant.
+
+**Asking for 640 and nothing else.** A second run mode, chosen on the way in, that asks the one
+question the sweep is built not to answer. The sweep pins a camera by ID and states both
+dimensions, because it is mapping a **range**; this sends `{ video: { width: 640, facingMode } }`
+and nothing else, because it is finding the **default**. That bare request is what real sites
+actually send — video-chat pages, scanners and document uploaders overwhelmingly send a width and
+let the platform fill in the rest — and what the platform fills in is undocumented.
+
+Two opens, about a minute. Recorded: the size that came back, the aspect ratio and frame rate the
+phone chose unasked, which physical camera it opened, and everything that camera says about
+itself, verbatim. Two stills per open, down the platform and canvas paths, so the files can be
+read against each other. The width verdict is exact, near, different, or unknown when the track
+reported no width — and *different* is the interesting one, because it means a bare width is a
+wish on this device rather than an instruction. A `facingMode` the track disagrees with is a
+finding, not an error. A track with no label leaves the camera unnamed rather than guessed at.
+The sensor stage and the manual stage are named as deliberately absent — not refused, not failed
+— and stop and pause behave exactly as they do in the full run.
 
 **What holds, and what moves.** A spec listing one photograph's tables describes one photograph.
 Each trait is now classified by what it moves *with* — nothing, the production path, one lens, or

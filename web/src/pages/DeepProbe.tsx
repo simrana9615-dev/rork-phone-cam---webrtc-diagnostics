@@ -33,14 +33,14 @@ import { Button } from "@/components/ui/button";
 import { downloadBlob, formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
-import { handoffDecision, zoomSkipReason, type AdaptiveSkip, type HandoffSighting, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
+import { fallbackReason, routesNotNeededReason, zoomSkipReason, type AdaptiveSkip, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
 import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
 import { readShape } from "@/lib/deep-probe/capture-signature";
 import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
 import { useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
-import { buildManualShotList, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
+import { buildManualShotList, ENGINE_NAME, RoutesExhaustedError, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
 import {
   collectOriginals,
   FACING_LABEL,
@@ -66,6 +66,8 @@ import {
   type ProbeRequest,
 } from "@/lib/deep-probe/permissions";
 import { buildRawPack, downloadRawPack, type RawPackResult } from "@/lib/deep-probe/raw-pack";
+import { PROBE_WIDTH, RUN_MODE_INFO, useRunMode, type RunMode } from "@/lib/deep-probe/run-mode";
+import { FACING_LABEL as WIDTH_FACING_LABEL, runWidthProbe, type WidthProbeReport } from "@/lib/deep-probe/width-probe";
 import { buildSheets, type RunFacts, type SheetSet, type StageOmission } from "@/lib/deep-probe/sheets";
 import {
   recordGenericSensor,
@@ -196,6 +198,7 @@ function Counter({ label, value }: { label: string; value: string }) {
 export default function DeepProbe() {
   const [phase, setPhase] = useState<Phase>("setup");
   const [tier, setTier] = useState<PermissionTier>("extended");
+  const [mode, setMode] = useRunMode();
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const [queue, setQueue] = useState<ProbeRequest[]>([]);
@@ -210,6 +213,7 @@ export default function DeepProbe() {
   const [sweepMessage, setSweepMessage] = useState<string>("");
   const [sweepPct, setSweepPct] = useState<number>(0);
   const [matrix, setMatrix] = useState<CameraMatrixReport | null>(null);
+  const [widthProbe, setWidthProbe] = useState<WidthProbeReport | null>(null);
   const [thermal, setThermal] = useState<string | null>(null);
 
   const [manualSteps, setManualSteps] = useState<ManualStep[]>([]);
@@ -248,13 +252,9 @@ export default function DeepProbe() {
    * and the production path are only known for certain at the moment of capture.
    */
   const originalCandidatesRef = useRef<OriginalCandidate[]>([]);
-  /**
-   * Camera-app files seen so far, reduced to their shapes. Two different
-   * engines returning one shape is what proves the remaining handoffs for that
-   * facing would collect a third copy of a file already in hand.
-   */
-  const handoffSightingsRef = useRef<HandoffSighting[]>([]);
   const adaptiveSkipsRef = useRef<AdaptiveSkip[]>([]);
+  /** The 640-only investigation's report. Null on a full run, which is most runs. */
+  const widthProbeRef = useRef<WidthProbeReport | null>(null);
   const passiveRef = useRef<PassiveGroup[]>([]);
   const statesBeforeRef = useRef<{ name: string; state: string | null }[]>([]);
   const statesAfterRef = useRef<{ name: string; state: string | null }[]>([]);
@@ -342,6 +342,7 @@ export default function DeepProbe() {
       permissionStatesAfter: statesAfterRef.current.length > 0 ? statesAfterRef.current : statesBeforeRef.current,
       sensors,
       matrix,
+      widthProbe: widthProbeRef.current,
       logs: suspensionLogs(logs, suspensionsRef.current),
       omissions: omissionsRef.current,
       devicesBeforePermission: devicesBeforeRef.current,
@@ -450,7 +451,13 @@ export default function DeepProbe() {
     setLogs([]);
     setPhotoCount(0);
     setByteCount(0);
-    addLog("info", `Deep Probe started at the ${TIER_INFO[tier].label} scope.`);
+    widthProbeRef.current = null;
+    addLog(
+      "info",
+      mode === "width-640"
+        ? `Deep Probe started in the ${PROBE_WIDTH}-only mode. One constraint per camera — a plain width — and nothing else.`
+        : `Deep Probe started at the ${TIER_INFO[tier].label} scope.`
+    );
     addLog("debug", "Reading everything available without a prompt first, so the passive baseline predates every request.");
     statesBeforeRef.current = await queryAllPermissions();
     try {
@@ -467,10 +474,17 @@ export default function DeepProbe() {
     passiveRef.current = await collectPassive();
     const total = passiveRef.current.reduce((sum, g) => sum + g.rows.length, 0);
     addLog("warn", `${total} facts were readable with no prompt, no indicator and no way to decline.`);
-    setQueue(requestsForTier(tier));
+    // The 640-only mode has one thing to ask for. Walking the whole permission
+    // tier to reach a camera would make a one-minute run cost twenty prompts,
+    // and every one of them would be answering a question this mode never asks.
+    const requests = mode === "width-640" ? requestsForTier("standard").filter((r) => r.id === "camera") : requestsForTier(tier);
+    if (mode === "width-640") {
+      addLog("debug", "Only the camera is requested in this mode. The other permissions are not refused and not skipped by you — they are simply not part of the question being asked, and the omissions list says so.");
+    }
+    setQueue(requests);
     setIndex(0);
     setPhase("permissions");
-  }, [addLog, tier]);
+  }, [addLog, tier, mode]);
 
   /* ---------------- stage one: permissions ---------------- */
   const fire = useCallback(
@@ -538,6 +552,19 @@ export default function DeepProbe() {
     if (phase !== "sensors" || ranRef.current.has("sensors")) return;
     ranRef.current.add("sensors");
     void (async () => {
+      // The 640-only mode asks one question and asks it of the camera. Recording
+      // sensors here would be collecting data nobody asked for, so the stage is
+      // named as deliberately absent rather than left to look like a failure.
+      if (mode === "width-640") {
+        addLog("debug", `Sensor recordings are not part of the ${PROBE_WIDTH}-only investigation, so the stage was not run. Nothing was refused and nothing failed.`);
+        omissionsRef.current.push({
+          stage: "Sensor recordings",
+          reason: `This run was the ${PROBE_WIDTH}-only investigation, which asks one question of the two cameras and nothing of the sensors. The stage was deliberately not run — it was not refused, and it did not fail. A full run records every granted sensor.`,
+        });
+        markStage("sensors", "skipped");
+        setPhase("camera");
+        return;
+      }
       const collected: SensorSeries[] = [];
       const push = (series: SensorSeries): void => {
         collected.push(series);
@@ -626,7 +653,7 @@ export default function DeepProbe() {
       markStage("sensors", collected.length === 0 ? "skipped" : "done");
       setPhase("camera");
     })();
-  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports]);
+  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports, mode]);
 
   /* ---------------- stage three: camera sweep ---------------- */
   useEffect(() => {
@@ -646,6 +673,45 @@ export default function DeepProbe() {
         });
         return;
       }
+
+      // The 640-only investigation replaces the sweep entirely. It asks the
+      // opposite kind of question — one bare width, no device pinned — so it
+      // cannot be a subset of the sweep and is not run as one.
+      if (mode === "width-640") {
+        addLog("info", `Asking each camera for ${PROBE_WIDTH} wide, and nothing else. Two opens, and the phone decides everything else on your behalf.`);
+        const probe = await runWidthProbe({
+          onProgress: (message, done, total) => {
+            setSweepMessage(message);
+            setSweepPct(Math.min(99, Math.round((done / Math.max(total, 1)) * 100)));
+          },
+          onCapture: (capture) => {
+            capturesRef.current.push(capture);
+            setPhotoCount(capturesRef.current.length);
+            setByteCount((b) => b + capture.blob.size);
+          },
+          shouldAbort: () => abortRef.current,
+          waitWhilePaused,
+        });
+        capturesRef.current = [...capturesRef.current];
+        widthProbeRef.current = probe;
+        setWidthProbe(probe);
+        setSweepPct(100);
+        setSweepMessage("");
+        for (const row of probe.rows) addLog(row.ok ? "success" : "warn", `${WIDTH_FACING_LABEL[row.facing]}: ${row.reading}`);
+        markStage("camera", probe.aborted ? "stopped" : probe.rows.length === 0 ? "skipped" : "done");
+        markStage("manual", "skipped");
+        omissionsRef.current.push({
+          stage: "Camera sweep and your own shots",
+          reason: `This run was the ${PROBE_WIDTH}-only investigation. It opens each camera once with a bare width and records what the phone chose, which is a different question from the sweep's — the sweep pins a device and states both dimensions to map a RANGE, this sends one number to find the DEFAULT. Neither the full sweep nor the manual shot list was run, and neither was refused or failed. A full run does both.`,
+        });
+        if (probe.aborted) {
+          toExports({ stage: `The ${PROBE_WIDTH}-only investigation (partially)`, reason: "You stopped before both cameras had been asked. The rows recorded really ran; the remaining facing was never attempted." });
+        } else {
+          toExports();
+        }
+        return;
+      }
+
       addLog("info", "Camera sweep starting — every camera, every resolution rung, every ratio, frame rate and control mode.");
       const { report, captures } = await runCameraSweep({
         onProgress: (message, done, total) => {
@@ -696,7 +762,7 @@ export default function DeepProbe() {
       setManualIndex(0);
       setPhase("manual");
     })();
-  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports]);
+  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports, mode]);
 
   /* ---------------- stage four: manual shots ---------------- */
   const manualStep = phase === "manual" ? manualSteps[manualIndex] : undefined;
@@ -755,7 +821,13 @@ export default function DeepProbe() {
         }
       } else if (step.spec) {
         const spec = step.spec;
-        const result = await runManualShot(spec);
+        const result = await runManualShot(spec, (engine, at, total) => {
+          if (at === 0) return;
+          // A second camera opening with no explanation reads as a bug rather
+          // than as a fallback, so the run says which route it is about to try.
+          setManualNotes((prev) => [...prev, `${step.title} — route ${at + 1} of ${total}: ${ENGINE_NAME[String(engine)] ?? engine}.`]);
+          addLog("info", `${step.title}: the previous route produced nothing, so this side is being offered ${ENGINE_NAME[String(engine)] ?? engine} instead. Each side needs one file and keeps trying until it has one.`);
+        });
         const isLibrary = result.path === "picker-file";
         const capture: ProbeCapture = {
           slug: `manual-${String(manualIndex + 1).padStart(2, "0")}-${step.id}`,
@@ -772,7 +844,7 @@ export default function DeepProbe() {
           fileRelativePath: result.file.webkitRelativePath ?? "",
           asked: isLibrary
             ? `${spec.engine}, no capture attribute, accept="${spec.accept ?? "image/*"}" — a library pick, not a fresh photo`
-            : `${spec.engine}, facing ${spec.facing ?? "unspecified"}`,
+            : `${result.engine}, facing ${spec.facing ?? "unspecified"} · routes offered: ${result.attempts.map((a) => `${a.engine} (${a.outcome})`).join(" → ")}`,
           granted: `file "${result.file.name}", type "${result.file.type || "(none declared)"}", ${result.file.size.toLocaleString("en-US")} bytes, last modified ${new Date(result.file.lastModified).toISOString()}${result.changeIsTrusted === undefined ? "" : ` · change event trusted: ${result.changeIsTrusted}`}`,
           takenAt: new Date().toISOString(),
         };
@@ -782,20 +854,28 @@ export default function DeepProbe() {
         if (!isLibrary && spec.facing != null) {
           originalCandidatesRef.current.push({ slug: capture.slug, facing: spec.facing, path: capture.path, origin: capture.origin });
         }
-        // A file taken by hand is never thrown away — it cost someone a minute
-        // of standing still. What its shape can do is stop the run ASKING for
-        // the next one, which is the same saving without the discourtesy.
+        // Each side needs exactly one file the camera itself wrote, and it now
+        // has one. The routes that were never opened are recorded as spares
+        // that went unused, which is a different thing from a shot skipped.
         if (!isLibrary && spec.facing != null) {
           const facing: ManualFacing = spec.facing;
-          const shape = await readShape(result.file);
-          handoffSightingsRef.current.push({ engine: String(spec.engine), facing, shapeId: shape.id, slug: capture.slug });
-          const remaining = manualSteps
-            .filter((candidate, i) => i > manualIndex && candidate.kind === "camera-app" && candidate.spec?.facing === facing)
-            .map((candidate) => String(candidate.spec?.engine ?? ""));
-          const decision = handoffDecision(handoffSightingsRef.current, facing, remaining);
-          if (decision.reason != null) {
-            const skipping = new Set(decision.skipEngines);
-            dropAhead((candidate) => candidate.kind === "camera-app" && candidate.spec?.facing === facing && skipping.has(String(candidate.spec?.engine ?? "")), decision.reason);
+          const tried = new Set(result.attempts.map((attempt) => String(attempt.engine)));
+          const unused = spec.routes.map((engine) => String(engine)).filter((engine) => !tried.has(engine));
+          if (unused.length > 0) {
+            const reason = routesNotNeededReason(facing, String(result.engine), unused);
+            adaptiveSkipsRef.current.push(
+              ...unused.map((engine) => ({
+                stepId: `${step.id}-route-${engine}`,
+                title: `${step.title} — spare route ${ENGINE_NAME[engine] ?? engine}`,
+                reason,
+              }))
+            );
+            setAdaptiveSkips([...adaptiveSkipsRef.current]);
+          }
+          if (result.attempts.length > 1) {
+            const note = fallbackReason(facing, result.attempts);
+            setManualNotes((prev) => [...prev, note]);
+            addLog("warn", note);
           }
         }
         setPhotoCount(capturesRef.current.length);
@@ -808,7 +888,18 @@ export default function DeepProbe() {
         );
       }
     } catch (err) {
-      if (err instanceof CaptureCancelledError) {
+      if (err instanceof RoutesExhaustedError) {
+        // Every route for this side was offered and none produced a file. That
+        // is reported route by route, because "the camera app failed" and "you
+        // closed it three times" are different facts about this device.
+        const facing = step.spec?.facing;
+        const note = facing != null ? fallbackReason(facing, err.attempts) : err.message;
+        setManualNotes((prev) => [...prev, note]);
+        addLog(err.cancelledEverywhere ? "info" : "warn", note);
+        for (const attempt of err.attempts) {
+          addLog("debug", `${step.title} · ${ENGINE_NAME[String(attempt.engine)] ?? attempt.engine}: ${attempt.outcome} — ${attempt.detail}`);
+        }
+      } else if (err instanceof CaptureCancelledError) {
         setManualNotes((prev) => [...prev, `${step.title} — skipped.`]);
         addLog("info", `${step.title}: skipped. Recorded as a skip, not as a photo.`);
       } else {
@@ -1138,7 +1229,9 @@ export default function DeepProbe() {
         </div>
       ) : null}
 
-      {phase === "setup" ? <Setup tier={tier} setTier={setTier} choice={choice} setChoice={setChoice} onStart={() => void start()} /> : null}
+      {phase === "setup" ? (
+        <Setup mode={mode} setMode={setMode} tier={tier} setTier={setTier} choice={choice} setChoice={setChoice} onStart={() => void start()} />
+      ) : null}
 
       {phase === "permissions" ? (
         <div className="space-y-3">
@@ -1619,7 +1712,7 @@ function buildManualSteps(inventory: CameraDeviceInfo[]): ManualStep[] {
       kind: isLibrary ? "library" : "camera-app",
       title: isLibrary
         ? `Photo library — ${spec.id === "library-original" ? "the same photo, asking for the original bytes" : "an ordinary upload"}`
-        : `Camera app — ${spec.facing === "environment" ? "back" : "front"} via ${spec.engine}`,
+        : `Camera app — ${spec.facing === "environment" ? "back" : "front"} camera original`,
       purpose: spec.purpose,
       deviceId: null,
       deviceLabel: isLibrary ? "the photo library" : "the phone's own camera app",
@@ -1850,18 +1943,23 @@ function ExportChoicePanel({
 }
 
 function Setup({
+  mode,
+  setMode,
   tier,
   setTier,
   choice,
   setChoice,
   onStart,
 }: {
+  mode: RunMode;
+  setMode: (next: RunMode) => void;
   tier: PermissionTier;
   setTier: (t: PermissionTier) => void;
   choice: ExportChoice;
   setChoice: (next: ExportChoice) => void;
   onStart: () => void;
 }) {
+  const short = mode === "width-640";
   const requestCount = useMemo(() => requestsForTier(tier).length, [tier]);
   const estimate = useMemo(() => {
     const promptMinutes = Math.ceil(requestCount * 0.2);
@@ -1881,16 +1979,56 @@ function Setup({
   return (
     <div className="space-y-3">
       <div className="overflow-hidden rounded-2xl border border-fuchsia-500/35 bg-gradient-to-br from-fuchsia-500/12 via-card to-card p-4">
-        <h2 className="text-[17px] font-semibold leading-tight">Everything a website can ask you for, in one run</h2>
+        <h2 className="text-[17px] font-semibold leading-tight">
+          {short ? `What does this phone do when a site asks for ${PROBE_WIDTH} wide?` : "Everything a website can ask you for, in one run"}
+        </h2>
         <p className="mt-1.5 text-[12px] leading-relaxed text-muted-foreground">
-          This deliberately behaves like the most demanding site you will ever visit: it asks for every permission it knows how to ask for, records
-          exactly what your device hands over, then photographs through every camera at every setting it supports. Nothing is uploaded — the whole
-          run happens on this phone and the archive is assembled in the browser.
+          {short
+            ? `One question, asked twice. The back camera and then the front camera are opened with a width of ${PROBE_WIDTH} as the only constraint — no height, no shape, no frame rate, no camera named — and the run records exactly what the phone decided on your behalf. That is the request most real websites actually send, and what a platform fills in around it is undocumented. Nothing is uploaded.`
+            : "This deliberately behaves like the most demanding site you will ever visit: it asks for every permission it knows how to ask for, records exactly what your device hands over, then photographs through every camera at every setting it supports. Nothing is uploaded — the whole run happens on this phone and the archive is assembled in the browser."}
         </p>
       </div>
 
       <div className="diag-card p-3.5">
+        <h3 className="text-[12.5px] font-semibold">Which run is this?</h3>
+        <p className="mb-2 mt-1 text-[10.5px] leading-relaxed text-muted-foreground">
+          Chosen now rather than part way through, because it decides what the run <em>is</em>. Both stop and pause the same way.
+        </p>
+        <div className="space-y-1.5">
+          {(Object.keys(RUN_MODE_INFO) as RunMode[]).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => setMode(m)}
+              className={cn(
+                "w-full rounded-xl border p-3 text-left transition-colors",
+                mode === m ? "border-sky-500/55 bg-sky-500/12" : "border-border/70 bg-background/40"
+              )}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className={cn("text-[13px] font-semibold", mode === m ? "text-sky-300" : "text-foreground")}>{RUN_MODE_INFO[m].label}</span>
+                {mode === m ? <Check className="h-3.5 w-3.5 shrink-0 text-sky-300" /> : null}
+              </div>
+              <p className="mt-1 text-[10.5px] leading-relaxed text-muted-foreground">{RUN_MODE_INFO[m].blurb}</p>
+              <p className="mt-1.5 text-[10px] font-semibold text-muted-foreground">{RUN_MODE_INFO[m].cost}</p>
+            </button>
+          ))}
+        </div>
+        {short ? (
+          <p className="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 p-2 text-[10px] leading-relaxed text-sky-200">
+            This mode asks for the camera and nothing else. The sensor recordings, the full camera sweep and the shots you take by hand are not part of
+            the question, so they are not run — and the sheets say that plainly rather than leaving them looking refused or failed.
+          </p>
+        ) : null}
+      </div>
+
+      <div className={cn("diag-card p-3.5", short && "opacity-50")}>
         <h3 className="text-[12.5px] font-semibold">How far should it reach?</h3>
+        {short ? (
+          <p className="mt-1 text-[10.5px] leading-relaxed text-muted-foreground">
+            Not used by the {PROBE_WIDTH}-only run, which asks for the camera and nothing else. Switch back to the full run to set this.
+          </p>
+        ) : null}
         <div className="mt-2 space-y-1.5">
           {TIER_ORDER.map((t) => (
             <button

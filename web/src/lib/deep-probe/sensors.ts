@@ -13,6 +13,7 @@
  */
 
 import { openMediaWithDeadline } from "./camera-timeout";
+import { analyseSeries, statsText, type SeriesStats } from "./sensor-stats";
 
 export type SensorSeries = {
   id: string;
@@ -28,7 +29,25 @@ export type SensorSeries = {
   durationMs: number;
   /** Plain-language account of what happened, including the disappointing cases. */
   note: string;
+  /**
+   * What the rows themselves say about the hardware: the quantisation step, how
+   * many events carried anything new, how evenly they arrived, and the gravity
+   * constant where the trace exposes one. Every recorder kept its readings at
+   * full precision so this could be worked out, and for a long time nothing
+   * worked it out.
+   */
+  stats: SeriesStats;
 };
+
+/**
+ * Finishes a series by measuring what it contains.
+ *
+ * Every recorder ends here, so no path can produce a series whose rows were
+ * never analysed — which is how the analysis went missing in the first place.
+ */
+function withStats(series: Omit<SensorSeries, "stats">): SensorSeries {
+  return { ...series, stats: analyseSeries(series.columns, series.rows, series.durationMs) };
+}
 
 export type SensorProgress = (message: string) => void;
 
@@ -105,7 +124,7 @@ export function recordMotion(ms: number, onProgress?: SensorProgress, shouldStop
       const elapsed = performance.now() - t0;
       const hz = measuredHz(rows.length, elapsed);
       const reported = rows.find((r) => r[10] !== "")?.[10];
-      resolve({
+      resolve(withStats({
         id: "motion",
         label: "Accelerometer and gyroscope (devicemotion)",
         columns: [
@@ -128,8 +147,8 @@ export function recordMotion(ms: number, onProgress?: SensorProgress, shouldStop
         note:
           rows.length === 0
             ? `No devicemotion events arrived at all during the window. Either permission was not actually in force, or this device delivers nothing on that event.${earlyNote(stoppedEarly)}`
-            : `${rows.length} samples in ${(elapsed / 1000).toFixed(1)}s — a measured ${hz ?? "?"} Hz.${reported ? ` The event reports its own interval as ${reported} ms, i.e. ${Math.round(1000 / Number(reported))} Hz nominal.` : ""} The measured figure is the one to trust; browsers throttle this event and the nominal rate is often optimistic. Axis values are written at full precision with no rounding applied here, so the smallest step between distinct readings is the device's own quantisation rather than an artefact of this file.${earlyNote(stoppedEarly)}`,
-      });
+            : `${rows.length} samples in ${(elapsed / 1000).toFixed(1)}s — a measured ${hz ?? "?"} Hz.${reported ? ` The event reports its own interval as ${reported} ms, i.e. ${Math.round(1000 / Number(reported))} Hz nominal.` : ""} The measured figure is the one to trust; browsers throttle this event and the nominal rate is often optimistic. Axis values are written at full precision with no rounding applied here, so the smallest step between distinct readings is the device's own quantisation rather than an artefact of this file — and that step, the share of events that repeated the one before, the evenness of their arrival and the gravity constant this firmware uses are all measured from these rows rather than left in them.${earlyNote(stoppedEarly)}`,
+      }));
     };
 
     window.addEventListener("devicemotion", handler);
@@ -182,7 +201,7 @@ export function recordOrientation(ms: number, onProgress?: SensorProgress, shoul
       if (interval != null) window.clearInterval(interval);
       if (timer != null) window.clearTimeout(timer);
       const elapsed = performance.now() - t0;
-      resolve({
+      resolve(withStats({
         id: "orientation",
         label: "Device orientation and compass",
         columns: ["ms", "event", "alpha", "beta", "gamma", "absolute", "webkit_compass_heading", "webkit_compass_accuracy"],
@@ -194,7 +213,7 @@ export function recordOrientation(ms: number, onProgress?: SensorProgress, shoul
           rows.length === 0
             ? `No orientation events arrived during the window.${earlyNote(stoppedEarly)}`
             : `${rows.length} samples in ${(elapsed / 1000).toFixed(1)}s. Absolute (true-north referenced) readings: ${absoluteSeen ? "present" : "absent"}. WebKit compass heading: ${webkitHeadingSeen ? "present — this is how Safari exposes a true compass bearing" : "absent"}.${earlyNote(stoppedEarly)}`,
-      });
+      }));
     };
 
     window.addEventListener("deviceorientation", relative);
@@ -234,7 +253,7 @@ export function recordGeolocation(maxMs: number, onProgress?: SensorProgress, sh
       if (poll != null) window.clearInterval(poll);
       if (timer != null) window.clearTimeout(timer);
       const elapsed = performance.now() - t0;
-      resolve({
+      resolve(withStats({
         id: "geolocation",
         label: "Location fixes",
         columns: ["ms", "latitude", "longitude", "accuracy_m", "altitude_m", "altitude_accuracy_m", "heading_deg", "speed_mps", "timestamp"],
@@ -246,7 +265,7 @@ export function recordGeolocation(maxMs: number, onProgress?: SensorProgress, sh
           rows.length === 0
             ? `No fix arrived. ${errorNote || reason}`
             : `${rows.length} fix(es) over ${(elapsed / 1000).toFixed(1)}s, tightening to ±${best.toFixed(1)} m. ${reason}${errorNote ? ` ${errorNote}` : ""}`,
-      });
+      }));
     };
 
     if (!navigator.geolocation) {
@@ -368,7 +387,7 @@ export async function recordMicrophoneLevel(ms: number, onProgress?: SensorProgr
   }
 
   const elapsed = performance.now() - t0;
-  return {
+  return withStats({
     id: "microphone-level",
     label: "Microphone loudness envelope",
     columns: ["ms", "rms", "peak", "dbfs"],
@@ -377,7 +396,7 @@ export async function recordMicrophoneLevel(ms: number, onProgress?: SensorProgr
     measuredHz: measuredHz(rows.length, elapsed),
     durationMs: Math.round(elapsed),
     note,
-  };
+  });
 }
 
 type SensorLike = {
@@ -412,7 +431,7 @@ export function recordGenericSensor(
       if (poll != null) window.clearInterval(poll);
       if (timer != null) window.clearTimeout(timer);
       const elapsed = performance.now() - t0;
-      resolve({
+      resolve(withStats({
         id: name.toLowerCase(),
         label,
         columns: ["ms", ...columns],
@@ -421,7 +440,7 @@ export function recordGenericSensor(
         measuredHz: measuredHz(rows.length, elapsed),
         durationMs: Math.round(elapsed),
         note,
-      });
+      }));
     };
 
     if (!Ctor) {
@@ -472,13 +491,15 @@ export function recordGenericSensor(
   });
 }
 
-/** CSV for one series, with the note carried as leading comment lines. */
+/** CSV for one series, with the note and the measured traits carried as leading comment lines. */
 export function seriesCsv(series: SensorSeries): string {
   const header = [
     `# ${series.label}`,
     `# ${series.note}`,
     `# duration ${series.durationMs} ms · requested ${series.requestedHz ?? "n/a"} Hz · measured ${series.measuredHz ?? "not enough samples to say"} Hz`,
     `# samples ${series.rows.length}`,
+    "#",
+    ...statsText(series.stats).map((line) => `# ${line.trim()}`),
   ];
   return [...header, series.columns.join(","), ...series.rows.map((r) => r.join(","))].join("\n");
 }

@@ -17,11 +17,12 @@
 import { describe, expect, it } from "vitest";
 
 import { buildZip, crcHex, isDeflateSupported } from "../zip-writer";
-import { buildMimicSpec, quantisationStep, type MimicCaptureFact, type MimicSpecInput } from "./mimic-spec";
+import { buildMimicSpec, type MimicCaptureFact, type MimicSpecInput } from "./mimic-spec";
 import { payloadStart, readEntry, readEntryText, readZip, verifyEntry } from "./zip-reader";
 import type { CameraMatrixReport } from "./camera-matrix";
 import type { PassiveGroup } from "./passive";
 import type { SensorSeries } from "./sensors";
+import { analyseSeries, quantisationStep } from "./sensor-stats";
 
 /** Every byte value plus a JPEG-looking header — anything that decodes or re-encodes will corrupt this. */
 function hostileBytes(): Uint8Array {
@@ -267,7 +268,7 @@ describe("buildMimicSpec", () => {
   });
 
   it("records the sensor rate and step it measured, and says when it could not", () => {
-    const series: SensorSeries = {
+    const recorded = {
       id: "motion",
       label: "Motion",
       columns: ["t_ms", "accel_x"],
@@ -277,6 +278,7 @@ describe("buildMimicSpec", () => {
       durationMs: 600,
       note: "",
     };
+    const series: SensorSeries = { ...recorded, stats: analyseSeries(recorded.columns, recorded.rows, recorded.durationMs) };
     const spec = buildMimicSpec(specInput({ sensors: [series] }));
     const facts = canonicalOf(spec).sections.flatMap((s) => s.facts);
     expect(facts.find((f) => f.key === "sensor.motion.rate")?.value).toMatch(/50 Hz measured.*asked for 60 Hz/);

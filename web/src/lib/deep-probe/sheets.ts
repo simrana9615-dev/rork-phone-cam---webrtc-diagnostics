@@ -26,6 +26,8 @@ import { buildMimicSpec } from "./mimic-spec";
 import type { PassiveGroup } from "./passive";
 import { OUTCOME_LABEL, TIER_INFO, type PermissionRecord, type PermissionTier } from "./permissions";
 import type { SensorSeries } from "./sensors";
+import { statsText } from "./sensor-stats";
+import { FACING_LABEL as WIDTH_FACING_LABEL, widthProbeText, type WidthProbeReport } from "./width-probe";
 
 /** A stage that did not run, and the honest reason. */
 export type StageOmission = { stage: string; reason: string };
@@ -41,6 +43,14 @@ export type RunFacts = {
   permissionStatesAfter: { name: string; state: string | null }[];
   sensors: SensorSeries[];
   matrix: CameraMatrixReport | null;
+  /**
+   * The 640-only investigation, when that mode was chosen. Null on a full run.
+   * Kept separate from the matrix rather than folded into it because the two
+   * ask opposite questions — the matrix pins a device and states both
+   * dimensions to measure a RANGE, this sends one bare width to measure a
+   * DEFAULT — and merging them would make each one read as the other.
+   */
+  widthProbe: WidthProbeReport | null;
   logs: LogEntry[];
   /** Stages that never ran — named, with the reason, so nothing is quietly partial. */
   omissions: StageOmission[];
@@ -385,8 +395,46 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
                 s.note,
               ]),
             },
+            {
+              kind: "prose",
+              text: "What the rows themselves say about the hardware. The delivery rate counts every event; the distinct rate counts only the events that carried a new reading, and on a device that re-sends the last value on a timer the two are different numbers. The step is the smallest gap between distinct readings, which is the converter's own quantisation and not this app's formatting.",
+            },
+            { kind: "mono", text: run.sensors.map((s) => [`── ${s.label} ──`, ...statsText(s.stats)].join("\n")).join("\n\n") },
           ],
   });
+
+  if (run.widthProbe) {
+    const probe = run.widthProbe;
+    sections.push({
+      id: "width-640",
+      title: `What this phone does when a site asks for ${probe.width} wide`,
+      blurb:
+        "One constraint per camera — a plain width — and everything the phone decided on its own around it. This is the request most real websites actually send; what a platform fills in around it is undocumented, and nothing here is a judgement about whether the behaviour is good.",
+      blocks: [
+        {
+          kind: "table",
+          head: ["Camera", "Open", "Granted size", "Width verdict", "Aspect", "Frame rate", "facingMode", "Camera opened"],
+          rows: probe.rows.map((row) => [
+            WIDTH_FACING_LABEL[row.facing],
+            row.ok ? `${row.openMs} ms` : `refused — ${row.error ?? "no reason given"}`,
+            row.grantedWidth != null && row.grantedHeight != null ? `${row.grantedWidth}×${row.grantedHeight}` : "—",
+            row.verdict === "exact"
+              ? `exactly ${probe.width}`
+              : row.verdict === "near"
+                ? `${row.grantedWidth} — near, not it`
+                : row.verdict === "different"
+                  ? `${row.grantedWidth} — nowhere near`
+                  : "no width reported",
+            row.grantedAspect != null ? String(Math.round(row.grantedAspect * 1000) / 1000) : "not reported",
+            row.grantedFrameRate != null ? `${Math.round(row.grantedFrameRate * 100) / 100} fps` : "not reported",
+            row.grantedFacing ?? "not reported",
+            row.trackLabel ?? "no track label",
+          ]),
+        },
+        { kind: "mono", text: widthProbeText(probe) },
+      ],
+    });
+  }
 
   if (run.matrix) {
     const matrix = run.matrix;

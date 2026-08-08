@@ -359,46 +359,44 @@ function rowsOf(groups: PassiveGroup[], title: string): { label: string; value: 
  * Sensors
  * ------------------------------------------------------------------ */
 
-/**
- * Smallest step observed between distinct readings of one column. On a real
- * sensor this exposes the quantisation of the underlying converter, which is a
- * hardware trait and one of the harder things to fake convincingly — synthetic
- * data is usually continuous where a real accelerometer is not.
- *
- * Reported as an estimate from the samples in hand, and withheld entirely when
- * there are too few of them to mean anything.
- */
-export function quantisationStep(values: number[]): number | null {
-  const distinct = Array.from(new Set(values.filter((v) => Number.isFinite(v)))).sort((a, b) => a - b);
-  if (distinct.length < 4) return null;
-  let smallest = Infinity;
-  for (let i = 1; i < distinct.length; i += 1) {
-    const delta = distinct[i] - distinct[i - 1];
-    if (delta > 0 && delta < smallest) smallest = delta;
-  }
-  return Number.isFinite(smallest) ? Number(smallest.toPrecision(6)) : null;
-}
-
 function columnFacts(series: SensorSeries): SpecFact[] {
   const facts: SpecFact[] = [];
+  const delivery = series.stats.delivery;
   facts.push({
     key: `sensor.${series.id}.rate`,
     value: `${series.measuredHz != null ? `${series.measuredHz} Hz measured` : "rate not measurable from this sample"}${series.requestedHz != null ? ` (asked for ${series.requestedHz} Hz)` : ""}, ${series.rows.length} samples over ${Math.round(series.durationMs)} ms`,
     stability: "HW",
   });
-  series.columns.forEach((column, index) => {
-    if (/^(t|time|timestamp)/i.test(column)) return;
-    const values = series.rows.map((row) => Number.parseFloat(row[index] ?? "")).filter((v) => Number.isFinite(v));
-    if (values.length < 3) return;
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const step = quantisationStep(values);
+  // The delivery rate and the sensor's own update rate are the same number on
+  // some devices and are not on others, and a spec that quotes only the first
+  // describes a timer where it means to describe a sensor.
+  if (delivery.distinctHz != null && delivery.deliveredHz != null) {
     facts.push({
-      key: `sensor.${series.id}.${column}`,
-      value: `min ${min.toPrecision(6)} max ${max.toPrecision(6)} step ${step != null ? step : "not determinable from this sample"}`,
+      key: `sensor.${series.id}.delivery`,
+      value:
+        `${delivery.deliveredHz} Hz delivered, ${delivery.distinctHz} Hz carrying a new reading (${delivery.repeats} of ${delivery.samples} repeated the one before)` +
+        `${delivery.medianGapMs != null ? `, median gap ${delivery.medianGapMs} ms` : ""}${delivery.jitter != null ? `, jitter ${delivery.jitter}` : ""}`,
       stability: "HW",
     });
-  });
+  }
+  if (series.stats.gravity) {
+    facts.push({
+      key: `sensor.${series.id}.gravity`,
+      value: `${series.stats.gravity.magnitude} m/s² over ${series.stats.gravity.samples} samples (spread ${series.stats.gravity.spread})`,
+      stability: "HW",
+    });
+  }
+  for (const column of series.stats.columns) {
+    if (column.samples < 3) continue;
+    facts.push({
+      key: `sensor.${series.id}.${column.column}`,
+      value:
+        `min ${column.min != null ? column.min.toPrecision(6) : "—"} max ${column.max != null ? column.max.toPrecision(6) : "—"} ` +
+        `step ${column.step != null ? column.step : "not determinable from this sample"} ` +
+        `· ${column.distinct} distinct values · written to ${column.decimals} decimals`,
+      stability: "HW",
+    });
+  }
   return facts;
 }
 

@@ -101,9 +101,11 @@ description in `coverage-report.md` §4.
 
 ### `DeepProbe.tsx` (`/deep-probe`)
 The maximum-demand run. Five stages behind a setup screen that states the cost up front
-(prompt count, minutes, photo count, archive size) and a three-position scope toggle
-(`standard` / `extended` / `everything`, the last one explicitly flagged as reaching data
-belonging to other apps).
+(prompt count, minutes, photo count, archive size), a two-position **run mode** toggle (the full
+run, or the 640-only investigation of §6b.13 — chosen on the way in because it decides what the
+run *is*), and a three-position scope toggle (`standard` / `extended` / `everything`, the last
+one explicitly flagged as reaching data belonging to other apps; unused by the 640-only mode,
+which asks for the camera and nothing else).
 
 1. **Permission sweep** — one card per request, stating what the site can reach and how long
    the grant lasts *before* it fires. Auto-advances on a 4 s countdown that pauses while the
@@ -113,20 +115,24 @@ belonging to other apps).
    probe before firing**, so a missing API can never be recorded as a refusal. Nothing is
    retried.
 2. **Sensor recordings** — for each granted sensor, a real timed sample with the *measured*
-   rate reported next to the requested one.
+   rate reported next to the requested one, and the rows themselves measured for what they say
+   about the hardware: quantisation step, repeated deliveries, arrival regularity and the
+   gravity constant (§6b.12). Not run in the 640-only mode, and named as deliberately absent.
 3. **Camera sweep** — `lib/deep-probe/camera-matrix.ts`, with live photo / byte / elapsed
    counters and a stop button. Watches `PressureObserver` where available and surfaces a
    load warning explicitly labelled as load, not temperature. The byte counter is the
    *smaller* of this stage's two memory costs — see §6b.2 — so the sweep enforces its own
    ceiling rather than trusting what is on screen. Every camera request runs under the
    ten-second deadline of §6b.6, and every still it takes is kept only if its shape is new
-   (§6b.8).
+   (§6b.8). In the 640-only mode this stage runs `width-probe.ts` instead — two opens, a bare
+   width each, and the run ends there (§6b.13).
 4. **Manual shots** — two library picks first, then every named camera in the pinned viewfinder
-   plus three zoom steps each, then both facings through all three camera-app handoffs. The
-   picks lead because they need no camera, no permission and no good light, and they are the
-   only evidence in the run for what an ordinary upload form receives from the photo library
-   (§6b.5). They are filed as `picker-file` and never as camera output. The list shortens as
-   evidence arrives — see §6b.9 — but nothing taken by hand is ever discarded.
+   plus three zoom steps each, then **one** camera-app shot per side. The picks lead because
+   they need no camera, no permission and no good light, and they are the only evidence in the
+   run for what an ordinary upload form receives from the photo library (§6b.5). They are filed
+   as `picker-file` and never as camera output. Each camera-app shot carries all three routes as
+   spares tried in turn until that side has its file (§6b.9); the list shortens as evidence
+   arrives, but nothing taken by hand is ever discarded.
 5. **Exports** — the four tick boxes of `lib/deep-probe/export-choice.ts`, the archive **off**
    by default (§6b.3), arriving pre-filled from the dashboard card and the setup screen. Kept
    here as the last checkpoint rather than the first sighting, because with the archive
@@ -220,16 +226,19 @@ renders the read-only session summary.
 | `device-spec.ts` | Device Camera Spec Report engine: environment collection, per-camera max-capability probes, measured fps, constraint suite runs, codec matrix, text + JSON report builders |
 | `deep-probe/permissions.ts` | The tiered permission registry (`standard` ⊂ `extended` ⊂ `everything`) — every request a site can make, each carrying its API name, what it reaches, how long the grant lasts, its `permissions.query` name, whether the browser demands a fresh gesture (and why), a feature probe and a runner that releases whatever it was granted in the same tick. `runRequest()` queries permission state either side of the ask and converts every throw into a recorded outcome; `unavailable` is decided by probe *before* firing so it can never be confused with a refusal |
 | `deep-probe/passive.ts` | Everything readable with no prompt at all: identity strings, hardware, GPU, network, power, locale/storage, display preferences, codec support, API surface, plus `permissions.query` for every name any browser answers to. Deliberately computes **no** uniqueness/fingerprint score — that would need a population this app cannot see |
-| `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one and exports as commented CSV |
+| `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one, ends through one `withStats()` call so its rows are always analysed, and exports as commented CSV |
+| `deep-probe/sensor-stats.ts` | What the recorded rows say about the hardware that produced them: the quantisation step, how many events repeated the one before, how evenly they arrived, and the gravity constant the firmware uses (§6b.12) |
 | `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
 | `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
 | `deep-probe/capture-signature.ts` | Reduces a file to its device-describing shape, and the ledger that keeps the first of each and records the repeats (§6b.8) |
-| `deep-probe/adaptive-manual.ts` | Decides when a camera-app handoff or a zoom step has been answered already, so the run stops asking (§6b.9) |
-| `deep-probe/pixel-probe.ts` | The bounded pixel sample: 8×8 block grid phase and the sensor pipeline numbers (§6b.10) |
+| `deep-probe/adaptive-manual.ts` | Says why the spare routes into the camera app were never opened, what happened when a side had to fall back, and when a zoom step has been answered already (§6b.9) |
+| `deep-probe/pixel-probe.ts` | The bounded pixel sample, decoded with EXIF rotation and colour conversion suppressed (and stating whether the browser understood being told): 8×8 block grid phase, the 2×2 colour-filter rhythm, the sensor pipeline numbers with per-channel clipping and a flat-region noise floor, the post-capture tone stretch, and the centre-to-corner falloff (§6b.10) |
 | `deep-probe/constancy.ts` | Classifies each trait by what it moves with — path, camera, size, or nothing (§6b.11) |
 | `deep-probe/camera-timeout.ts` | The ten-second deadline on every camera request, the sixty-second one on a prompt, and the adoption that stops a stream arriving after its deadline instead of leaving a camera lit behind the run (§6b.6) |
 | `deep-probe/originals.ts` | Chooses the back and front camera-app files, names the downloads and states why a missing one is missing. Only a real camera-app file qualifies (§6b.7) |
-| `deep-probe/manual-capture.ts` | The three camera-app handoffs (`native-camera`, `capture-boolean`, `capacitor`) driven imperatively, capturing the change event's trust at event time, plus the two library picks. A pick still cannot promise a fresh photo, so it is never offered as one — it is asked for explicitly as a library file and filed as `picker-file`. The pair differs only in `accept`, which is the measurement (§6b.5) |
+| `deep-probe/manual-capture.ts` | **One** camera-app shot per side, each carrying all three routes (`native-camera`, `capture-boolean`, `capacitor`) as spares tried in turn until that side has its file, capturing the change event's trust at event time — plus the two library picks. A pick still cannot promise a fresh photo, so it is never offered as one; it is asked for explicitly as a library file and filed as `picker-file`, and the pair differs only in `accept`, which is the measurement (§6b.5, §6b.9) |
+| `deep-probe/run-mode.ts` | Which of the two runs is about to start — the full sweep or the 640-only investigation — chosen on the setup screen and persisted, with an unreadable stored value falling back to the **full** run rather than to the short one (§6b.13) |
+| `deep-probe/width-probe.ts` | The 640-only investigation: one open per facing with a bare width as the only constraint, everything the phone chose in its place, and two stills per open down the platform and canvas paths (§6b.13) |
 | `deep-probe/hashes.ts` | MD5 (streaming, pure TS — Web Crypto dropped it), SHA-1 and SHA-256 via `crypto.subtle`, CRC-32 via the ZIP writer. MD5 is labelled an integrity check, never a security claim; digests that cannot be computed say so instead of being omitted. Verified against the RFC 1321 vectors in `deep-probe.test.ts` |
 | `deep-probe/raw-bytes.ts` | The raw dump: `hexDumpBlob` renders `xxd`-layout hex + ASCII in slices assembled as Blob parts (a windowed dump is labelled `WINDOWED` with the exact skipped-byte count, never silently truncated); `walkStructure` really parses JPEG / PNG / ISO-BMFF / RIFF and reports every section's true offset and length; carved regions cover the EXIF block, maker note, ICC profile, embedded thumbnail, XMP, JUMBF/C2PA and Photoshop IRB. Unknown containers are admitted as unknown rather than guessed |
 | `deep-probe/hex-budget.ts` | How much of a run may be rendered as hex and why. Holds the 4.94-characters-per-byte constant measured against `hexLines` itself, the device-derived total allowance, the equal per-capture share with its floor and ceiling, the heap-pressure threshold, and the policy statement written into the archive. Pure and fully unit-tested, because getting this number wrong does not degrade the archive — it destroys the run |
@@ -430,24 +439,43 @@ on a kept file so the numbering carries no gaps, and the identity is written ont
 repeat is evidence that two asks share one pipeline, which is worth more than a second copy of
 a file already held.
 
-### 6b.9 Not asking twice — `lib/deep-probe/adaptive-manual.ts`
+### 6b.9 One file per side — `lib/deep-probe/manual-capture.ts`, `adaptive-manual.ts`
 
 The manual stage is the only part of a run that spends the user's attention rather than the
-device's time. Two rules shorten it, and both fire only on something the run has actually
-observed.
+device's time, and it used to spend six trips to the camera app on it: three routes, both
+facings. On every device seen so far the three routes end at the same camera app and return the
+same kind of file, so five of those six were another copy of an answer already in hand.
 
-The three camera-app handoffs are worth trying because on some devices they genuinely return
-different files. Once **two different engines** return the same shape for one facing, the third
-has been answered — this device routes them all to one camera app — so the rest of that
-facing's handoffs are dropped. Two shots from the *same* engine agreeing proves only that the
-engine is consistent with itself, and is explicitly not enough. Likewise, three of the four
-viewfinder shots per camera exist to walk a zoom range; a camera that applied no zoom when
-asked has no range to walk.
+What the run actually needs from this stage is **one environment original and one user
+original**, because those two files are the only ones in a whole run the camera itself wrote —
+its own quantisation tables, its own maker note, its own colour profile, its own EXIF. So the
+three routes are no longer three shots. They are one shot with two spares: `runManualShot()`
+tries the first route, and if it fails outright or comes back empty it offers the next for the
+*same side*, until that side has its file or the routes run out. Every attempt is recorded with
+what came of it and travels with the file, so "the front camera answered on the second route
+after the first came back empty" is a fact the archive holds rather than something a reader has
+to infer from a gap. A side that exhausts every route throws `RoutesExhaustedError` carrying the
+attempts, and the run reports them one by one — "the camera app failed" and "you closed it three
+times" are different facts about a device, and `cancelledEverywhere` keeps them apart.
 
-The important asymmetry: the sweep drops files it already took, but the manual stage stops
-**asking** instead. A file someone stood still to produce is never discarded — same saving,
-without the discourtesy — and every skip is listed on screen with the observation that caused
-it, so a shorter list is never a quieter one.
+Closing the camera without taking a picture counts as a route that did not answer, so the next
+is offered; the way to leave the stage is **skip**, which drops the whole shot. The shot wording
+says exactly that, because a second camera opening with no explanation reads as a bug rather
+than as a fallback — and the page announces each fallback route before it opens, for the same
+reason. A library pick has one route and no spare: walking on would open a second picker for a
+shot that was just declined, which is nagging rather than thorough.
+
+When the first route answers, the spares were **never needed**, which is a different thing from
+being skipped and is recorded as exactly that — the side is not missing anything, and the note
+makes no claim about what the untried routes would have returned. `handoffDecision()` is gone
+with the six-shot list it served; `routesNotNeededReason()` and `fallbackReason()` replace it.
+The zoom rule is unchanged: three of the four viewfinder shots per camera exist to walk a zoom
+range, and a camera that applied no zoom when asked has no range to walk.
+
+The important asymmetry still holds: the sweep drops files it already took, but the manual stage
+stops **asking** instead. A file someone stood still to produce is never discarded — same
+saving, without the discourtesy — and every skip is listed on screen with the observation that
+caused it, so a shorter list is never a quieter one.
 
 ### 6b.10 What the pixels say — `lib/deep-probe/pixel-probe.ts`
 
@@ -456,21 +484,54 @@ picture is the other kind of evidence, and consolidation is what made it afforda
 capture list is a dozen genuinely different files rather than two hundred near-identical ones,
 a bounded 512×512 centre sample per capture costs little.
 
-Two measurements. The **8×8 block grid**: a grid on the boundary is just this file's own
+**The decode itself was the first bug, and it was silent.** A browser will happily rotate a photo
+to its EXIF orientation and convert its colours to the display profile *before* handing over any
+pixels, and this pass asked for neither to be suppressed. A quarter turn swaps the block grid's
+two axes, which is the difference between an ordinary photograph and an accusation of
+recompression; a colour conversion rewrites every channel mean as partly the browser's
+arithmetic. Both are now switched off through `createImageBitmap`, and whether the browser
+*understood* being told is established rather than assumed: an options-bag member a browser knows
+throws `TypeError` on an illegal value, and one it has never heard of is ignored in silence, so a
+one-pixel probe distinguishes the two. Where support cannot be established the report says
+`not established` and never either answer; where it is absent, the reading warns that the grid's
+axes may be the browser's rather than the file's.
+
+Six measurements. The **8×8 block grid**: a grid on the boundary is just this file's own
 compression and is reported as the non-finding it is, while a grid *off* the boundary means the
 picture was compressed, then cropped or shifted, then compressed again — which a frame straight
-from a camera cannot be. And the **sensor pipeline**: channel balance, tone histogram, clipping
-at both ends, noise floor, distinct luma count.
+from a camera cannot be. The **2×2 colour-filter rhythm**: three quarters of the red and blue in
+a finished photograph were interpolated from neighbours, and that interpolation leaves a
+four-phase structure a render or a rescale does not — the closest this app comes to asking *was
+this ever a photograph*. The **sensor pipeline**: channel balance, tone histogram, clipping **per
+channel** as well as across all three, and a noise floor measured only in the flattest tiles and
+reported per colour. The **tone range**, where regularly spaced empty levels are what a
+post-capture brightness or contrast stretch leaves behind. And the frame **from the middle out**:
+centre and four corners, the luma falloff between them, and whether the noise floor is even
+across the frame.
 
-Four rules, because a pixel statistic is the easiest thing in forensics to over-read. Scene‑
+Three of those exist because the old figures were measuring the subject rather than the device.
+The noise floor was taken across the whole patch, so it rose on a bookshelf and fell on a wall
+and neither movement had anything to do with the sensor; restricting it to the quietest tiles
+removes most of the scene, and splitting it by channel exposes the thing that genuinely is a
+device trait — red and blue are interpolated far more heavily than green in every Bayer
+pipeline. Clipping was counted only where all three channels were pinned at once, so a sky blown
+out in blue alone registered as nothing. And only the dead centre was sampled, which threw away
+corner falloff entirely — a real per-model trait, and the one check on whether corner
+amplification has left the noise floor uneven.
+
+Five rules, because a pixel statistic is the easiest thing in forensics to over-read. Scene‑
 dependent numbers are labelled scene-dependent and are comparable only between photographs of
 the same scene. A frame this app encoded from a video track *will* show recompression, because
 that is literally what it is, and the report says so itself rather than leaving a reader to
-discover it. The sample origin is forced onto an 8-pixel boundary so the sampling cannot create
-the misalignment it is looking for. And an axis with no measurable periodicity has **no phase** —
-taking the winner of eight near-identical numbers would manufacture an offset out of noise, and
-an offset is this pass's one serious claim. Nothing here produces a verdict, a score or a
-probability.
+discover it — and its colour-filter reading is stamped as proving nothing either way, because a
+video track is chroma-subsampled and re-encoded twice before this app sees it. **Absence is never
+proof**: no 2×2 rhythm can mean a synthetic picture or simply one compressed hard enough to
+erase it, and the reading says both, every time. The sample origin is forced onto an 8-pixel
+boundary — which is even, so the colour-filter phase survives the crop as well — so the sampling
+cannot create the misalignment it is looking for. And an axis with no measurable periodicity has
+**no phase**: taking the winner of eight near-identical numbers would manufacture an offset out
+of noise, and an offset is this pass's one serious claim. Nothing here produces a verdict, a
+score or a probability.
 
 ### 6b.11 What holds, and what moves — `lib/deep-probe/constancy.ts`
 
@@ -486,6 +547,67 @@ conservatism is the point: a trait is only **universal** when it held across mor
 scope, so one value seen ten times down a single path on a single camera reads as
 `unestablished` rather than as a law. A trait no capture could observe is dropped rather than
 reported empty, and the coverage the classification rests on is printed above it.
+
+### 6b.12 What the sensor rows say — `lib/deep-probe/sensor-stats.ts`
+
+The recorders were careful to keep every reading at full precision — the comment in `sensors.ts`
+says so explicitly, because rounding first would replace the device's real step with our
+formatting choice — and then nothing ever looked at them again. Each series reported how many
+samples arrived and how fast, and four of the strongest traits in a motion trace sat in the rows
+unmeasured.
+
+The **quantisation step** is the smallest non-zero gap between distinct readings, which on real
+hardware is the analogue-to-digital converter's own resolution. Synthetic data is almost always
+continuous where real data is not, which makes this both a device fingerprint and the cheapest
+sanity check on a trace there is. The **repeats** matter because several platforms deliver an
+event on a timer and re-send the last reading when the sensor has not moved on: a rate counted
+from events is then the *timer's* rate, and quoting it alone overstates the hardware by whatever
+the ratio is — so the delivery rate and the distinct-reading rate are now reported side by side.
+The **regularity** of arrival separates a hardware interrupt from a JavaScript queue far more
+clearly than the mean rate does; a metronome and a jittery queue can share a rate and share
+nothing else. And the **gravity constant** is `accelerationIncludingGravity` minus
+`acceleration`, whose magnitude is the constant that firmware was built with — 9.81, 9.80665 and
+a plain 9.8 are three different vendors' choices, and a device states which it uses without
+being asked. A wide spread there means the phone was moving while the window ran, so the figure
+is reported with its spread rather than as a clean constant.
+
+Every recorder ends through one `withStats()` call, so no path can produce a series whose rows
+were never analysed — which is how the analysis went missing in the first place. Columns whose
+name marks them as a clock are excluded, but `interval_ms` deliberately is not: the interval a
+motion event reports about *itself* is a device fact, not a timestamp.
+
+### 6b.13 The 640-only investigation — `lib/deep-probe/width-probe.ts`, `run-mode.ts`
+
+One question, asked twice: what does this phone do when a site sends
+`{ video: { width: 640, facingMode } }` and nothing else? That is the request real sites actually
+make — video-chat pages, scanners and document uploaders overwhelmingly send a bare width and
+let the platform fill in the rest — and what the platform fills in is undocumented. Which
+physical camera opens? What height comes back? What aspect ratio and frame rate does it settle
+on? Is 640 even honoured, or quietly rounded to whatever the sensor scaler prefers?
+
+The sweep cannot answer it, and not by accident: `camera-matrix.ts` pins the device by
+`deviceId` and states both dimensions exactly, because it is measuring the **range** a camera
+supports. This measures the **default** a camera falls back to, which is the opposite kind of
+request — so it is a separate mode rather than another row, and it is filed separately in the
+archive (`camera/width-640.txt` / `.json`) for the same reason. Folding the two together would
+make each one read as the other.
+
+The mode is chosen on the way in, from the setup screen, because it decides what the run *is*.
+It is persisted for the same reason the export choice is, and an unreadable stored value falls
+back to the **full** run: someone who does not remember choosing should get the run this page is
+for, not a one-minute subset of it. In this mode only the camera permission is requested, the
+sensor stage and the manual stage do not run, and all three are named in the omissions list as
+deliberately absent — not refused, not failed. Stop and pause are checked between facings and
+between stills, so both controls behave exactly as they do in the full sweep.
+
+Two opens, and two stills per open down the two paths that exist — the browser's own photo
+pipeline and a frame this app encodes from the track — because those paths are opposites, and
+having both is what makes the files readable against each other. The width verdict is `exact`,
+`near` (within 32 px), `different`, or `unknown` when the track reported no width at all;
+`different` is the interesting one, because it means a bare width is a *wish* on this device
+rather than an instruction. A `facingMode` the track disagrees with is reported as a finding
+rather than an error, and a track with no label leaves the camera unnamed rather than guessed at
+from the device list.
 
 ### 6b.6 The camera deadline — `lib/deep-probe/camera-timeout.ts`
 

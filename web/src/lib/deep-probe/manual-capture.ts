@@ -5,14 +5,27 @@
  * browser strips (or never writes) camera EXIF on a `getUserMedia` still. The
  * only way to obtain a file with the camera's own tags in it is to hand off to
  * the operating system's camera app and take the picture there. That is what
- * this module does, once per handoff, so the archive contains both kinds of
- * evidence and can show the difference between them.
+ * this module does — and it now does it exactly twice, once for each side of
+ * the phone.
  *
- * Three separate handoffs are used because they are genuinely different code
- * paths, not three names for one thing — and on some devices they return files
- * that differ in name, timestamp and even encoder. Each returned file is
- * declared `camera-file` only where the engine really does open the camera app;
- * picker-based engines are never allowed to claim that.
+ * WHY TWO AND NOT SIX. There are three genuinely different code paths into the
+ * camera app, and for a long time all three were offered for both facings: six
+ * handoffs, six trips to the camera, six files. On every device seen so far the
+ * three routes end at the same camera app and return the same kind of file, so
+ * five of those six were a second, third, fourth, fifth and sixth copy of an
+ * answer already in hand. What the run actually needs from this stage is ONE
+ * environment original and ONE user original, because those two files are the
+ * only ones in a whole run the camera itself wrote.
+ *
+ * So the three routes are no longer three shots. They are one shot with two
+ * spares: the first route is tried, and if it fails outright or comes back
+ * empty the next is tried for the same side, until the side has its file or the
+ * routes run out. A side that exhausts every route reports that plainly, with
+ * each attempt named, and nothing is substituted for it.
+ *
+ * Closing the camera without taking a picture counts as a route that did not
+ * answer, so the next one is offered. The way to leave the stage entirely is the
+ * skip control, which drops the whole shot rather than moving to the next route.
  *
  * The stage also takes two LIBRARY picks, which are the opposite kind of
  * evidence and are filed as such. A pick cannot promise a fresh photo, so it is
@@ -38,7 +51,17 @@ export type ManualShotSpec = {
   id: string;
   /** What the shot is for — shown before the camera opens. */
   purpose: string;
+  /**
+   * The route tried first. The library picks have exactly one route and this is
+   * it; a camera-app shot uses this as the head of `routes`.
+   */
   engine: CaptureEngine;
+  /**
+   * Every route into the camera app for this side, in the order they are tried.
+   * A camera-app shot must end with ONE file, so a route that fails or comes
+   * back empty hands over to the next rather than losing the side entirely.
+   */
+  routes: CaptureEngine[];
   /** Null on the library picks, where a facing would be a fiction. */
   facing: "user" | "environment" | null;
   /**
@@ -51,6 +74,13 @@ export type ManualShotSpec = {
   accept?: string;
 };
 
+/** One route into the camera app, and what came of it. */
+export type RouteAttempt = {
+  engine: CaptureEngine;
+  outcome: "file" | "cancelled" | "failed";
+  detail: string;
+};
+
 export type ManualShotResult = {
   file: File;
   origin: PackOrigin;
@@ -58,25 +88,62 @@ export type ManualShotResult = {
   path: "camera-file" | "picker-file";
   /** Whether the change event carried browser trust. Undefined = not observable on this path. */
   changeIsTrusted?: boolean;
+  /** The route that actually answered. */
   engine: CaptureEngine;
+  /** Every route tried, in order, including the one that answered. */
+  attempts: RouteAttempt[];
 };
 
 /**
+ * Thrown when a side has been offered every route and none of them produced a
+ * file. Carries the attempts so the run can say exactly what was tried rather
+ * than reporting one anonymous failure.
+ */
+export class RoutesExhaustedError extends Error {
+  readonly attempts: RouteAttempt[];
+  /** True when every route was closed without taking a picture, rather than failing. */
+  readonly cancelledEverywhere: boolean;
+
+  constructor(attempts: RouteAttempt[]) {
+    const cancelledEverywhere = attempts.length > 0 && attempts.every((attempt) => attempt.outcome === "cancelled");
+    super(
+      cancelledEverywhere
+        ? `Every route into the camera app was closed without a picture (${attempts.map((a) => a.engine).join(", ")}).`
+        : `Every route into the camera app was tried and none returned a file: ${attempts.map((a) => `${a.engine} — ${a.detail}`).join("; ")}.`
+    );
+    this.name = "RoutesExhaustedError";
+    this.attempts = attempts;
+    this.cancelledEverywhere = cancelledEverywhere;
+  }
+}
+
+/**
  * The three engines that hand off to the phone's own camera app, in the order
- * they are offered. Each is a distinct pipeline: a direct `capture` attribute,
+ * they are tried. Each is a distinct pipeline: a direct `capture` attribute,
  * the bare boolean form of that attribute, and Capacitor driving its own hidden
  * input. Picker-only engines are deliberately excluded from this stage — they
  * cannot promise a fresh photo, so asking for one here would be misleading.
+ *
+ * The order is deliberate: the direct attribute is the one nearly every device
+ * honours, so it answers first on nearly every device and the other two are
+ * never needed. They exist for the devices where it does not.
  */
 export const CAMERA_APP_ENGINES: CaptureEngine[] = ["native-camera", "capture-boolean", "capacitor"];
+
+/** Human names for the routes, used in the shot wording and in the fallback notes. */
+export const ENGINE_NAME: Record<string, string> = {
+  "native-camera": "the direct capture attribute",
+  "capture-boolean": "the bare boolean capture attribute",
+  capacitor: "Capacitor's camera API",
+};
 
 /**
  * Opens the OS camera app through a hidden file input and resolves with the
  * file it returns. The change event's trust flag is captured at event time
  * rather than reconstructed afterwards.
  */
-function fileInputCapture(spec: ManualShotSpec): Promise<ManualShotResult> {
-  const { engine, facing, source } = spec;
+function fileInputCapture(spec: ManualShotSpec, engine: CaptureEngine): Promise<ManualShotResult> {
+  const { facing, source } = spec;
   return new Promise((resolve, reject) => {
     const input = document.createElement("input");
     input.type = "file";
@@ -109,6 +176,7 @@ function fileInputCapture(spec: ManualShotSpec): Promise<ManualShotResult> {
         path: source === "camera-app" ? "camera-file" : "picker-file",
         changeIsTrusted: trusted,
         engine,
+        attempts: [],
       });
     };
 
@@ -133,19 +201,56 @@ function fileInputCapture(spec: ManualShotSpec): Promise<ManualShotResult> {
   });
 }
 
-/** Runs one manual shot through whichever engine the spec names. */
-export async function runManualShot(spec: ManualShotSpec): Promise<ManualShotResult> {
-  if (spec.engine === "capacitor" && spec.source === "camera-app") {
+/** Runs one shot through one named route, with no fallback of its own. */
+async function runOneRoute(spec: ManualShotSpec, engine: CaptureEngine): Promise<ManualShotResult> {
+  if (engine === "capacitor" && spec.source === "camera-app") {
     const result = await capacitorCapturePhoto(spec.facing ?? "environment");
     return {
       file: result.file,
       origin: "camera-file",
       path: "camera-file",
       changeIsTrusted: result.changeIsTrusted,
-      engine: spec.engine,
+      engine,
+      attempts: [],
     };
   }
-  return fileInputCapture(spec);
+  return fileInputCapture(spec, engine);
+}
+
+/**
+ * Runs one manual shot, walking its routes until one of them answers.
+ *
+ * `onRoute` is called before each attempt so the page can say which route it is
+ * about to open — a second camera opening with no explanation reads as a bug
+ * rather than as a fallback.
+ *
+ * Every attempt is recorded whether or not it succeeded, and the record travels
+ * with the file, so "the front camera answered on the second route after the
+ * first came back empty" is a fact the archive holds rather than something a
+ * reader has to infer from a gap.
+ */
+export async function runManualShot(spec: ManualShotSpec, onRoute?: (engine: CaptureEngine, index: number, total: number) => void): Promise<ManualShotResult> {
+  const routes = spec.routes.length > 0 ? spec.routes : [spec.engine];
+  const attempts: RouteAttempt[] = [];
+  for (let i = 0; i < routes.length; i += 1) {
+    const engine = routes[i];
+    onRoute?.(engine, i, routes.length);
+    try {
+      const result = await runOneRoute(spec, engine);
+      attempts.push({ engine, outcome: "file", detail: `returned "${result.file.name || "(unnamed)"}", ${result.file.size.toLocaleString("en-US")} bytes` });
+      return { ...result, attempts };
+    } catch (err) {
+      if (err instanceof CaptureCancelledError) {
+        attempts.push({ engine, outcome: "cancelled", detail: "the camera was closed without a picture" });
+      } else {
+        attempts.push({ engine, outcome: "failed", detail: err instanceof Error ? `${err.name}: ${err.message}` : String(err) });
+      }
+      // A library pick has one route and no spare. Walking on would open a
+      // second picker for a shot that was declined, which is nagging.
+      if (spec.source !== "camera-app") break;
+    }
+  }
+  throw new RoutesExhaustedError(attempts);
 }
 
 /**
@@ -158,6 +263,7 @@ export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
   {
     id: "library-plain",
     engine: "system-picker",
+    routes: ["system-picker"],
     facing: null,
     source: "library",
     accept: "image/*",
@@ -167,6 +273,7 @@ export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
   {
     id: "library-original",
     engine: "system-picker",
+    routes: ["system-picker"],
     facing: null,
     source: "library",
     accept: "image/*,image/heic,image/heif,.heic,.heif",
@@ -175,26 +282,32 @@ export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
   },
 ];
 
-/** Builds the full manual shot list for the run: both facings through every camera-app handoff. */
+/**
+ * Builds the full manual shot list for the run: the two library picks, then one
+ * camera-app shot for each side of the phone.
+ *
+ * Two camera-app shots, not six. Each carries every route as a spare rather
+ * than as a separate trip, so the stage costs two visits to the camera app on a
+ * device where the first route works — which is every device seen so far — and
+ * still gets its file on one where it does not.
+ */
 export function buildManualShotList(): ManualShotSpec[] {
   // Library picks lead: they need no camera, no permission and no good light,
   // and they close the one requested item that nothing else in the run can.
   const shots: ManualShotSpec[] = [...LIBRARY_PICK_SHOTS];
-  const engineName: Record<string, string> = {
-    "native-camera": "the direct capture attribute",
-    "capture-boolean": "the bare boolean capture attribute",
-    capacitor: "Capacitor's camera API",
-  };
-  for (const engine of CAMERA_APP_ENGINES) {
-    for (const facing of ["environment", "user"] as const) {
-      shots.push({
-        id: `${engine}-${facing}`,
-        engine,
-        facing,
-        source: "camera-app",
-        purpose: `${facing === "environment" ? "Back" : "Front"} camera via ${engineName[engine] ?? engine}. This one goes through the phone's own camera app, so the file should come back with real camera metadata attached — that is the whole point of taking it by hand.`,
-      });
-    }
+  for (const facing of ["environment", "user"] as const) {
+    const side = facing === "environment" ? "Back" : "Front";
+    shots.push({
+      id: `camera-app-${facing}`,
+      engine: CAMERA_APP_ENGINES[0],
+      routes: [...CAMERA_APP_ENGINES],
+      facing,
+      source: "camera-app",
+      purpose:
+        `${side} camera, through the phone's own camera app. This is the one shot in the entire run that produces a file the CAMERA wrote — its own quantisation tables, its own maker note, its own colour profile, its own EXIF — which is why it is worth taking by hand. ` +
+        `It opens by ${ENGINE_NAME[CAMERA_APP_ENGINES[0]]}. If that route fails or you close the camera without taking anything, the next route is offered for this same side, so the ${side.toLowerCase()} camera still ends up with its one file. ` +
+        `To leave this shot out altogether, use skip rather than closing the camera — skip drops the whole shot, closing it moves on to the next route.`,
+    });
   }
   return shots;
 }

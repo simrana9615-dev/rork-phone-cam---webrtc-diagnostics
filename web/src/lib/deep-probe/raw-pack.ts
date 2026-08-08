@@ -36,6 +36,7 @@ import { seriesCsv } from "./sensors";
 import { checksumsText, permissionLedgerText, sensorsText, stamp, VERIFY_HOW_TO, type RunFacts, type SheetSet, type StageOmission } from "./sheets";
 import { hexDumpBlob, structureText } from "./raw-bytes";
 import { TIER_INFO } from "./permissions";
+import { widthProbeText } from "./width-probe";
 
 export type { StageOmission } from "./sheets";
 
@@ -367,10 +368,22 @@ export async function buildRawPack(input: RawPackInput, facts: CaptureFacts[], s
       ).join("\n"),
       compress: true,
     });
-  } else {
+  } else if (!input.widthProbe) {
     entries.push({
       path: "camera/NOT-RUN.txt",
       data: "The camera sweep did not run in this session. See READ-ME.txt for the reason. No camera data is claimed anywhere in this archive.",
+    });
+  }
+  // The 640-only investigation is filed apart from the matrix on purpose. The
+  // two ask opposite questions — the matrix pins a device and states both
+  // dimensions to map a RANGE, this sends one bare width to find the DEFAULT —
+  // and putting them in one file would make each read as the other.
+  if (input.widthProbe) {
+    entries.push({ path: "camera/width-640.txt", data: widthProbeText(input.widthProbe), compress: true });
+    entries.push({
+      path: "camera/width-640.json",
+      data: JSON.stringify({ kind: "deep-probe-width-only", version: 1, ...input.widthProbe }, null, 2),
+      compress: true,
     });
   }
   tick("Writing the camera matrix");

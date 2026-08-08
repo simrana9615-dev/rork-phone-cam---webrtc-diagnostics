@@ -1,73 +1,63 @@
 import { describe, expect, it } from "vitest";
 
-import { handoffDecision, zoomSkipReason, type HandoffSighting } from "./adaptive-manual";
+import { fallbackReason, routesNotNeededReason, zoomSkipReason } from "./adaptive-manual";
 
-const ENGINES = ["native-camera", "capture-boolean", "capacitor"];
+describe("the spare routes into the camera app", () => {
+  const reason = routesNotNeededReason("environment", "native-camera", ["capture-boolean", "capacitor"]);
 
-function sighting(engine: string, shapeId: string, facing: "user" | "environment" = "environment"): HandoffSighting {
-  return { engine, facing, shapeId, slug: `${engine}-${facing}` };
-}
-
-describe("stopping the camera-app handoffs once they have been answered", () => {
-  it("asks for nothing less after only one engine has returned", () => {
-    const decision = handoffDecision([sighting("native-camera", "aaaa")], "environment", ["capture-boolean", "capacitor"]);
-    expect(decision.skipEngines).toEqual([]);
-    expect(decision.reason).toBeNull();
+  it("names the route that answered and the ones that were never opened", () => {
+    expect(reason).toContain("native-camera");
+    expect(reason).toContain("capture-boolean and capacitor");
   });
 
-  it("drops the remaining engines once two of them return one shape", () => {
-    const seen = [sighting("native-camera", "aaaa"), sighting("capture-boolean", "aaaa")];
-    const decision = handoffDecision(seen, "environment", ["capacitor"]);
-    expect(decision.skipEngines).toEqual(["capacitor"]);
+  it("says the side has its file, rather than that shots were dropped", () => {
+    expect(reason).toContain("ONE file the camera itself wrote for each side");
+    expect(reason).toContain("the side is not missing anything");
   });
 
-  it("keeps asking when two engines returned genuinely different files", () => {
-    const seen = [sighting("native-camera", "aaaa"), sighting("capture-boolean", "bbbb")];
-    const decision = handoffDecision(seen, "environment", ["capacitor"]);
-    expect(decision.skipEngines).toEqual([]);
-    expect(decision.reason).toBeNull();
+  it("makes no claim about what the untried routes would have returned", () => {
+    expect(reason).toContain("Nothing here is a claim about what those routes would have returned");
   });
 
-  it("will not take one engine agreeing with itself as agreement", () => {
-    const seen = [sighting("native-camera", "aaaa"), { ...sighting("native-camera", "aaaa"), slug: "again" }];
-    expect(handoffDecision(seen, "environment", ["capture-boolean", "capacitor"]).skipEngines).toEqual([]);
+  it("states the spares would have been offered had the first failed", () => {
+    expect(reason).toMatch(/Had native-camera failed or come back empty/);
   });
 
-  it("keeps the two facings separate, because one proves nothing about the other", () => {
-    const seen = [sighting("native-camera", "aaaa", "environment"), sighting("capture-boolean", "aaaa", "environment")];
-    expect(handoffDecision(seen, "user", ENGINES).skipEngines).toEqual([]);
+  it("uses the right word for a single spare", () => {
+    expect(routesNotNeededReason("user", "native-camera", ["capacitor"])).toContain("capacitor was never opened");
   });
 
-  it("drops the front handoffs on the front camera's own evidence", () => {
-    const seen = [sighting("native-camera", "cccc", "user"), sighting("capture-boolean", "cccc", "user")];
-    expect(handoffDecision(seen, "user", ["capacitor"]).skipEngines).toEqual(["capacitor"]);
-  });
-
-  it("says nothing when the agreeing engines are the only ones left anyway", () => {
-    const seen = [sighting("native-camera", "aaaa"), sighting("capture-boolean", "aaaa")];
-    expect(handoffDecision(seen, "environment", []).reason).toBeNull();
+  it("names the side it is talking about", () => {
+    expect(routesNotNeededReason("user", "native-camera", ["capacitor"])).toContain("front camera");
+    expect(routesNotNeededReason("environment", "native-camera", ["capacitor"])).toContain("back camera");
   });
 });
 
-describe("what the skip says for itself", () => {
-  const seen = [sighting("native-camera", "aaaa"), sighting("capture-boolean", "aaaa")];
-  const reason = handoffDecision(seen, "environment", ["capacitor"]).reason ?? "";
+describe("what the run says when a side had to fall back", () => {
+  const attempts = [
+    { engine: "native-camera", outcome: "cancelled", detail: "the camera was closed without a picture" },
+    { engine: "capture-boolean", outcome: "file", detail: 'returned "IMG_0002.HEIC", 3,101,244 bytes' },
+  ];
 
-  it("names both engines that agreed and the shape they agreed on", () => {
-    expect(reason).toContain("native-camera and capture-boolean");
-    expect(reason).toContain("aaaa");
+  it("names every route tried and the one that finally answered", () => {
+    const reason = fallbackReason("user", attempts);
+    expect(reason).toContain("native-camera");
+    expect(reason).toContain("It answered on capture-boolean");
   });
 
-  it("names the engine that was not asked for", () => {
-    expect(reason).toContain("capacitor");
+  it("treats the fallback itself as a fact about the device", () => {
+    expect(fallbackReason("user", attempts)).toContain("the routes into a camera app are not interchangeable here");
   });
 
-  it("states it was proven redundant rather than that anything failed", () => {
-    expect(reason).toContain("PROVEN redundant, not because it failed");
-  });
-
-  it("explains why a third copy would not have been evidence", () => {
-    expect(reason).toContain("third copy of a file already held is not evidence");
+  it("says plainly when no route produced anything, and substitutes nothing", () => {
+    const nothing = fallbackReason("environment", [
+      { engine: "native-camera", outcome: "cancelled", detail: "closed empty" },
+      { engine: "capture-boolean", outcome: "failed", detail: "NotAllowedError" },
+      { engine: "capacitor", outcome: "failed", detail: "not installed" },
+    ]);
+    expect(nothing).toContain("none produced a file");
+    expect(nothing).toContain("nothing has been substituted for it");
+    expect(nothing).toContain("a library pick is not a photo taken just now");
   });
 });
 
@@ -86,5 +76,14 @@ describe("the zoom skip", () => {
   it("makes clear the camera answered, and the answer was none", () => {
     expect(reason).toContain('the answer was "none"');
     expect(reason).toContain("Nothing about the lens is being assumed");
+  });
+});
+
+describe("the policy note the archive carries", () => {
+  it("explains the two-file goal rather than the old six-shot list", async () => {
+    const { ADAPTIVE_POLICY } = await import("./adaptive-manual");
+    const text = ADAPTIVE_POLICY.join("\n");
+    expect(text).toContain("exactly TWO files");
+    expect(text).toContain("as spares, tried in turn, not as three separate trips");
   });
 });

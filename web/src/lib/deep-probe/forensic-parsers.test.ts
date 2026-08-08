@@ -12,6 +12,7 @@ import { briefChecklist, briefItems, buildCorrelationBrief, imageFamily, type Br
 import { readExifIfds } from "./exif-ifd";
 import { readJpegEncoderBytes } from "./jpeg-encoder";
 import { buildManualShotList, LIBRARY_PICK_SHOTS } from "./manual-capture";
+import { analyseSeries } from "./sensor-stats";
 
 /* ------------------------------------------------------------------ *
  * Byte builders
@@ -353,6 +354,7 @@ describe("correlation brief", () => {
             measuredHz: 100,
             durationMs: 30,
             note: "",
+            stats: analyseSeries(["ms", "accel_x"], [["0", "0.1"], ["10", "0.2"], ["20", "0.3"]], 30),
           },
         ],
       })
@@ -407,7 +409,9 @@ describe("library pick shots", () => {
   it("leads the manual stage, because it needs no camera and closes the one gap nothing else can", () => {
     const list = buildManualShotList();
     expect(list.slice(0, 2).map((s) => s.id)).toEqual(["library-plain", "library-original"]);
-    expect(list.length).toBe(LIBRARY_PICK_SHOTS.length + 6);
+    // Two camera-app shots, not six: one per side, each carrying the other
+    // routes as spares rather than as separate trips to the camera.
+    expect(list.length).toBe(LIBRARY_PICK_SHOTS.length + 2);
   });
 
   it("never claims a facing or a camera it did not use", () => {

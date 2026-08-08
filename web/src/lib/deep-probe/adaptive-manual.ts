@@ -9,13 +9,12 @@
  * So the list shortens as evidence arrives. Two rules, both of which only ever
  * fire on something the run has actually observed:
  *
- *   • THE HANDOFFS. Three engines open the phone's camera app by three
- *     different routes. They are worth trying because on some devices they
- *     genuinely return different files. Once two of them have returned the
- *     SAME byte shape for one facing, the third has been answered: this device
- *     routes them all to one camera app. Asking again would collect a third
- *     copy of a file already held, so the remaining handoffs for that facing
- *     are dropped and the identity is recorded as the finding it is.
+ *   • THE SPARE ROUTES. Three engines open the phone's camera app by three
+ *     different routes, and each side of the phone is asked for ONE file. The
+ *     first route is tried, and the other two exist only as spares for the case
+ *     where it fails. When the first route answers, the spares were never
+ *     needed — which is a different thing from being skipped, and is recorded
+ *     as exactly that: the side has its file, so nothing was left undone.
  *
  *   • THE ZOOM STEPS. Three of the four viewfinder shots per camera exist to
  *     exercise a zoom range. A camera that exposes no zoom control cannot
@@ -31,53 +30,48 @@
 
 export type ManualFacing = "user" | "environment";
 
-/** One camera-app file that came back, reduced to the facts a skip decision needs. */
-export type HandoffSighting = {
-  engine: string;
-  facing: ManualFacing;
-  /** The file's forensic shape. Two engines sharing one shape share one pipeline. */
-  shapeId: string;
-  slug: string;
-};
-
-export type HandoffDecision = {
-  /** Engines whose remaining shots for this facing are no longer worth taking. */
-  skipEngines: string[];
-  /** Why, in the words the run log and the archive both use. Null when nothing is skipped. */
-  reason: string | null;
-};
+function sideName(facing: ManualFacing): string {
+  return facing === "environment" ? "back" : "front";
+}
 
 /**
- * Decides whether the remaining handoffs for one facing have been answered.
+ * Why the spare routes into the camera app were never opened.
  *
- * Requires two DIFFERENT engines to agree. One engine returning one file says
- * nothing about the others, and two shots from the same engine agreeing says
- * only that the engine is consistent with itself.
+ * Called only once a side already HAS its file, so this is never a claim about
+ * what the untried routes would have done — it is a statement that the question
+ * they exist to answer has been answered. If the first route had failed, they
+ * would each have been tried in turn.
  */
-export function handoffDecision(sightings: HandoffSighting[], facing: ManualFacing, remainingEngines: string[]): HandoffDecision {
-  const forFacing = sightings.filter((sighting) => sighting.facing === facing);
-  const byShape = new Map<string, HandoffSighting[]>();
-  for (const sighting of forFacing) {
-    const list = byShape.get(sighting.shapeId) ?? [];
-    list.push(sighting);
-    byShape.set(sighting.shapeId, list);
-  }
+export function routesNotNeededReason(facing: ManualFacing, answered: string, skipped: string[]): string {
+  return (
+    `The ${sideName(facing)} camera returned its file on the first route that was tried (${answered}), so ${skipped.join(" and ")} ` +
+    `${skipped.length === 1 ? "was" : "were"} never opened. They are spares, not separate shots: this stage needs ONE file the camera itself wrote for each side of the phone, ` +
+    `and it has one. Had ${answered} failed or come back empty, each spare would have been offered in turn until the side had its file. ` +
+    `Nothing here is a claim about what those routes would have returned — only that the side is not missing anything.`
+  );
+}
 
-  for (const [shapeId, group] of byShape) {
-    const engines = [...new Set(group.map((sighting) => sighting.engine))];
-    if (engines.length < 2) continue;
-    const skipEngines = remainingEngines.filter((engine) => !engines.includes(engine));
-    if (skipEngines.length === 0) return { skipEngines: [], reason: null };
-    return {
-      skipEngines,
-      reason:
-        `${engines.join(" and ")} both returned byte-shape ${shapeId} for the ${facing === "environment" ? "back" : "front"} camera — same container, same frame, same tables, same metadata layout. ` +
-        `Two different routes into the camera app producing one identical file means this device sends them all to the same place, so ${skipEngines.join(" and ")} ` +
-        `${skipEngines.length === 1 ? "was" : "were"} not asked for: the answer is already in hand, and a third copy of a file already held is not evidence. ` +
-        `This is a skip because it was PROVEN redundant, not because it failed.`,
-    };
+/**
+ * What the run says when a side had to fall back.
+ *
+ * Every attempt is named with what came of it, because "the front camera
+ * answered on the second route after the first came back empty" is a fact about
+ * this device and is worth more than the file alone.
+ */
+export function fallbackReason(facing: ManualFacing, attempts: { engine: string; outcome: string; detail: string }[]): string {
+  const failed = attempts.filter((attempt) => attempt.outcome !== "file");
+  const answered = attempts.find((attempt) => attempt.outcome === "file");
+  const list = failed.map((attempt) => `${attempt.engine} (${attempt.detail})`).join(", then ");
+  if (!answered) {
+    return (
+      `The ${sideName(facing)} camera was offered every route and none produced a file: ${list}. There is no original for this side, and nothing has been ` +
+      `substituted for it — a sweep frame is a canvas encode and a library pick is not a photo taken just now.`
+    );
   }
-  return { skipEngines: [], reason: null };
+  return (
+    `The ${sideName(facing)} camera fell back: ${list}. It answered on ${answered.engine}. That fallback is itself a fact about this device — the routes into a ` +
+    `camera app are not interchangeable here, and a site using only the first one would have got nothing from this side.`
+  );
 }
 
 /**
@@ -107,10 +101,11 @@ export const ADAPTIVE_POLICY: string[] = [
   "-".repeat(78),
   "The manual list shortens as evidence arrives, and only ever on something this run observed.",
   "",
-  "Three engines open the phone's camera app by three different routes, and they are all worth trying",
-  "because on some devices they return genuinely different files. The moment two of them return the SAME",
-  "byte shape for one facing, the third has been answered — this device routes them all to one camera app —",
-  "so the rest of that facing's handoffs are dropped and the identity is recorded instead.",
+  "The camera-app stage asks for exactly TWO files: one the back camera wrote and one the front camera",
+  "wrote. Those two are the only files in an entire run that the camera itself produced, which is why they",
+  "are taken by hand at all. Three different routes into the phone's camera app exist, and each side is",
+  "given all three — but as spares, tried in turn, not as three separate trips. When the first route",
+  "answers, the spares were never needed, and that is recorded as what it is rather than as a skip.",
   "",
   "Likewise, three of the four viewfinder shots per camera exist to walk a zoom range. A camera that",
   "applied no zoom when asked has no range to walk, and three more identical unzoomed frames would record",
