@@ -115,8 +115,8 @@ function ExportToggle({
 /**
  * The Deep Probe entry: the run's four outputs are chosen here, on the way in.
  *
- * They used to be offered only after the last photo — twenty-odd minutes in,
- * and never reached at all by a run that ended early. Choosing on the front
+ * They used to be offered only after the last photo — a long way in, and never
+ * reached at all by a run that ended early. Choosing on the front
  * door means the setting survives a tab the run kills, and that a refused
  * camera prompt still lands somewhere useful.
  */
@@ -136,7 +136,7 @@ function DeepProbeCard({ choice, setChoice, onOpen }: { choice: ExportChoice; se
           </div>
           <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
             Asks for every permission a website can ask you for, records what your device actually hands over, then photographs through every camera at
-            every resolution, ratio and mode it supports. 15–30 minutes; stop at any point and you still get everything gathered so far.
+            the sizes, shapes and modes it says it supports. 8–15 minutes; stop at any point and you still get everything gathered so far.
           </p>
         </div>
         <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />

@@ -1,9 +1,11 @@
 /**
  * Which of the two Deep Probe runs you are about to start.
  *
- * The full run is the maximal one: every permission, every sensor, every camera
- * at every resolution, ratio, frame rate and control mode, plus the shots you
- * take by hand. It is twenty-odd minutes and several hundred megabytes.
+ * The full run is the broad one: every permission, every sensor, every camera at
+ * every size, shape, frame rate and control mode that camera says it supports,
+ * plus the shots you take by hand. It is under a quarter of an hour on most
+ * phones — the plan is cut to each camera's own stated limits, and a photograph
+ * is not taken twice of the same size down the same path.
  *
  * The 640-only run is a single question asked twice. It opens the back camera
  * and the front camera with `width: 640` as the ONLY constraint — no height, no
@@ -82,8 +84,8 @@ export const RUN_MODE_INFO: Record<RunMode, { label: string; blurb: string; cost
   full: {
     label: "The full run",
     blurb:
-      "Every permission this app knows how to ask for, real recordings from every sensor that was granted, then every camera photographed at every resolution, ratio, frame rate and control mode it supports — plus the two shots you take through the phone's own camera app.",
-    cost: "Twenty minutes or so, a few hundred photos, and your attention throughout.",
+      "Every permission this app knows how to ask for, real recordings from every sensor that was granted, then every camera photographed at the sizes, shapes, frame rates and control modes it says it supports — plus the two shots you take through the phone's own camera app. Nothing is asked twice: sizes a camera has already been photographed at are not photographed again, and limits it has already stated are not tested against.",
+    cost: "Eight to fifteen minutes, and your attention for the shots you take by hand.",
   },
   "width-640": {
     label: "640 wide, and nothing else",

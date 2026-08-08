@@ -127,7 +127,8 @@ which asks for the camera and nothing else).
    (§6b.8). In the 640-only mode this stage runs `width-probe.ts` instead — two opens, a bare
    width each, and the run ends there (§6b.13).
 4. **Manual shots** — two library picks first, then every named camera in the pinned viewfinder
-   plus three zoom steps each, then **one** camera-app shot per side. The picks lead because
+   plus **one** zoom shot each, asked for only where the sweep already watched that camera's zoom
+   move (§6b.14), then **one** camera-app shot per side. The picks lead because
    they need no camera, no permission and no good light, and they are the only evidence in the
    run for what an ordinary upload form receives from the photo library (§6b.5). They are filed
    as `picker-file` and never as camera output. Each camera-app shot carries all three routes as
@@ -228,10 +229,10 @@ renders the read-only session summary.
 | `deep-probe/passive.ts` | Everything readable with no prompt at all: identity strings, hardware, GPU, network, power, locale/storage, display preferences, codec support, API surface, plus `permissions.query` for every name any browser answers to. Deliberately computes **no** uniqueness/fingerprint score — that would need a population this app cannot see |
 | `deep-probe/sensors.ts` | Timed recorders for motion, orientation/compass, geolocation (watched until the accuracy figure settles), microphone loudness (level only — no audio is retained), and the generic sensors. Every series reports the **measured** rate beside the requested one, ends through one `withStats()` call so its rows are always analysed, and exports as commented CSV |
 | `deep-probe/sensor-stats.ts` | What the recorded rows say about the hardware that produced them: the quantisation step, how many events repeated the one before, how evenly they arrived, and the gravity constant the firmware uses (§6b.12) |
-| `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, an 8K canvas 126.6 MiB, and the sweep takes ~14 per camera); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
-| `deep-probe/camera-matrix.ts` | The exhaustive sweep: per camera, native max + the full resolution ladder in both orientations, six aspect ratios, five frame rates, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. Leaves the torch off on exit |
+| `deep-probe/capture-memory.ts` | The two memory costs of a camera sweep that no byte counter sees. One `<canvas>` is reused for the whole run with its backing store released immediately after each encode (a 4K canvas is 31.6 MiB, and the sweep now takes a handful of canvas stills per camera rather than one at every step — §6b.14); dimensions are parsed from the file header (`jpeg-sof`, `png-ihdr`, `iso-bmff-ispe`, WebP, GIF) instead of decoding the whole image for two numbers. Also holds the held-bytes ceiling and the policy text the archive prints. The encoded bytes are untouched by any of it — same context, same draw, same quality |
+| `deep-probe/camera-matrix.ts` | The sweep: per camera, native max first (which reads the ceiling), then the plan **built from that ceiling** — four resolution rungs filtered to what the camera advertises plus one over-ask, one portrait ask, three aspect ratios, four frame rates likewise filtered, then every advertised focus / exposure / white-balance / resize mode, zoom extremes and torch applied to a live track. Records asked vs granted for every row; a rejection is a result, not an error. Stills are taken at a declared subset of steps and `stillPolicy` states exactly which, so an empty capture list is never mistaken for a failure. The torch fires once per run and is left off on exit (§6b.14) |
 | `deep-probe/capture-signature.ts` | Reduces a file to its device-describing shape, and the ledger that keeps the first of each and records the repeats (§6b.8) |
-| `deep-probe/adaptive-manual.ts` | Says why the spare routes into the camera app were never opened, what happened when a side had to fall back, and when a zoom step has been answered already (§6b.9) |
+| `deep-probe/adaptive-manual.ts` | Says why the spare routes into the camera app were never opened, what happened when a side had to fall back, and why a camera the sweep saw refuse to zoom is not asked for a zoom shot (§6b.9, §6b.14) |
 | `deep-probe/pixel-probe.ts` | The bounded pixel sample, decoded with EXIF rotation and colour conversion suppressed (and stating whether the browser understood being told): 8×8 block grid phase, the 2×2 colour-filter rhythm, the sensor pipeline numbers with per-channel clipping and a flat-region noise floor, the post-capture tone stretch, and the centre-to-corner falloff (§6b.10) |
 | `deep-probe/constancy.ts` | Classifies each trait by what it moves with — path, camera, size, or nothing (§6b.11) |
 | `deep-probe/camera-timeout.ts` | The ten-second deadline on every camera request, the sixty-second one on a prompt, and the adoption that stops a stream arriving after its deadline instead of leaving a camera lit behind the run (§6b.6) |
@@ -328,7 +329,7 @@ question: not *is this capture authentic* but *what did this device actually han
 | `permissions/ledger.txt` / `.json` | Every request: API name, the moment it fired, your response time, what it reaches, how long the grant lasts, what came back, and the browser's own permission state before and after |
 | `environment/passive-dump.txt` / `.json` | Everything readable with **no prompt at all**, plus `permissions.query` for every name any browser answers to |
 | `sensors/*.csv` | One commented CSV per granted sensor, each stating the measured rate beside the requested one |
-| `camera/matrix.txt` / `.json` | Every asked-versus-granted pair across every camera, resolution, ratio, frame rate and control mode, plus the `stillPolicy` statement of which steps were expected to produce a photo |
+| `camera/matrix.txt` / `.json` | Every asked-versus-granted pair across every camera, size, ratio, frame rate and control mode that was sent, with a note beside each camera wherever its own advertised ceiling shortened its plan (§6b.14), plus the `stillPolicy` statement of which steps were expected to produce a photo and which rows deliberately produced none |
 | `camera/memory-policy.txt` | The run's real memory figures — bytes held, the device's ceiling, the largest canvas used — and whether stills stopped early. Keeps the three causes of an empty capture list apart: never expected, attempted and failed, or stopped for memory |
 | `camera/surface.json` | `track.getSettings()`, `getCapabilities()` and `getConstraints()` **verbatim** per camera — key order preserved, nested `{min,max}` ranges intact — plus `track.id` / `label` / `readyState`, `stream.id`, the `<video>` element's `videoWidth`/`videoHeight`, the measured `getUserMedia` open time, and `ImageCapture.getPhotoCapabilities()` / `getPhotoSettings()`. Read on the track the sweep already had open, so it costs no extra prompt and no extra camera cycle |
 | `camera/devices.json` | Three `enumerateDevices()` snapshots with full untruncated IDs and every kind included: before any permission was requested, before the sweep opened anything, and after it finished. Two snapshots would be ambiguous about which moment they captured |
@@ -608,6 +609,57 @@ having both is what makes the files readable against each other. The width verdi
 rather than an instruction. A `facingMode` the track disagrees with is reported as a finding
 rather than an error, and a track with no label leaves the camera unnamed rather than guessed at
 from the device list.
+
+### 6b.14 Asking less — `camera-matrix.ts`, `DeepProbe.tsx`
+
+The run was long in three places, and all three were length without evidence.
+
+**The plan is built from the camera's own answer.** Every camera used to get the same 28-step
+plan: seven rungs in both orientations, six ratios, five frame rates. That meant asking a 720p
+front camera for 8K, 4K and 1440p and asking a 30 fps sensor for 60 and 120 — questions the
+camera had already answered in `getCapabilities()` before the first one was sent, at the cost of
+one camera open each. The native-maximum step now runs first and reads the ceiling, and
+`planFor(deviceId, ceiling)` builds the rest from it: rungs above `width.max`/`height.max`, rates
+above `frameRate.max` and ratios outside the advertised `aspectRatio` range are not asked for, and
+the camera's own figures are quoted in a note beside the camera wherever that shortened its plan.
+
+**One over-ask survives in each direction, deliberately.** Whether a camera CLAMPS to its ceiling
+or REFUSES outright is a real difference between platforms and is not in the capability object, so
+exactly one rung and one frame rate above the ceiling are still sent. The rungs beyond would each
+answer the same way.
+
+**A shorter ladder.** 8K went (no phone camera has ever granted it, and the native-max row already
+asks for the ceiling with `ideal`), 1440p went (it resolved to a neighbouring rung on every device
+seen), QVGA went (VGA already probes the bottom). 3:2, 9:16 and 21:9 went — 9:16 is 16:9 turned
+round, which the **one** portrait ask now covers, where portrait used to be asked once per rung.
+24 fps went, sitting between 15 and 30.
+
+**A photograph is not taken twice of the same size.** The shape ledger (§6b.8) compares bytes
+*after* a still exists; `photographedSizes` stops the still being taken at all when this camera has
+already been photographed at the size this row was granted, on that path. Those rows carry a
+`taken: false` entry naming the file that already holds that size, so the row still says what
+happened. At the native maximum only the platform photo path runs: a canvas frame at 4K is several
+megabytes this app encoded from the video track — the least evidential and most expensive file the
+sweep could hold — and the canvas path is exercised at every smaller rung anyway.
+
+**The flash fires once per run.** Every rear camera on a phone drives the same LED, so the second
+camera to advertise a torch is advertising the first camera's torch. Cameras after the first record
+that the torch was not fired again, name the camera it fired on, and claim nothing about whether
+their own constraint would have been granted.
+
+**An identical control surface is not walked twice.** A second camera advertising the same focus,
+exposure, white-balance and resize lists, the same zoom range and the same torch flag skips the
+mode-by-mode block. The note says exactly what that is: a decision about where the run spends its
+time, *not* a claim that the camera would have answered the same way — nothing about its control
+behaviour beyond the advertised surface was recorded, and the absence is stated rather than filled
+in.
+
+**Four hand-held shots per camera became two.** Full frame, then one zoom shot at the maximum —
+the middle of a range is the least informative point on it, and the full-frame shot is already the
+other end. The zoom shot is only asked for where the **sweep** watched that camera's zoom actually
+move: two distinct `zoom` values across its own zoom rows. A camera that reported the same value at
+both ends is not asked to demonstrate that by hand, and the shot it was not asked for is listed as
+a skip carrying the sweep observation that caused it.
 
 ### 6b.6 The camera deadline — `lib/deep-probe/camera-timeout.ts`
 

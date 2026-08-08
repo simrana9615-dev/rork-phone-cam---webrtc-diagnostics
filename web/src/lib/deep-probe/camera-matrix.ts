@@ -1,9 +1,17 @@
 /**
- * Stage three — the exhaustive camera sweep.
+ * Stage three — the camera sweep.
  *
- * For every camera the device names, this asks for every resolution rung,
- * every aspect ratio, every frame rate and every control mode the hardware
- * advertises, and records ASKED versus GRANTED side by side.
+ * For every camera the device names, this asks for the resolution rungs, aspect
+ * ratios, frame rates and control modes that camera's own capabilities make a
+ * real question, and records ASKED versus GRANTED side by side.
+ *
+ * It used to send one identical 28-step plan to every camera, which meant
+ * asking a 720p front camera for 8K, 4K and 1440p and asking a 30 fps sensor
+ * for 60 and 120 — questions the camera had already answered in
+ * `getCapabilities()` before the first one was sent, at the price of a camera
+ * open each. The plan is now built from that answer. One rung and one frame
+ * rate above the ceiling survive on purpose, because clamping and refusing are
+ * different behaviours and the capability object does not say which you get.
  *
  * The central discipline here: a refusal is a result. `OverconstrainedError`
  * is not an app bug and is never reported as one — it is the camera stating
@@ -82,15 +90,20 @@ export type MatrixRow = {
   /** Slugs of any captures taken at this step. Empty is normal and stated. */
   captureSlugs: string[];
   /**
-   * Stills that WERE taken at this step and then not kept, because their
-   * byte shape was already on file for this camera and this path.
+   * Photographs this step did not end up contributing, and why.
    *
-   * Recorded on the row rather than discarded, because the identity is the
-   * finding: it says this request and an earlier one came out of one pipeline.
-   * A row with entries here is a row where the camera answered — never one
-   * where it failed.
+   * Two different things live here and `taken` says which. `taken: true` is a
+   * still that WAS photographed and then not kept, because its byte shape was
+   * already on file for this camera and this path — the identity is the
+   * finding, since it says this request and an earlier one came out of one
+   * pipeline. `taken: false` is a photograph that was never made, because the
+   * size this step was granted had already been photographed on that path; the
+   * request still ran and its granted settings are on the row.
+   *
+   * A row with entries here is always a row where the camera answered — never
+   * one where it failed.
    */
-  duplicates: { path: ProbeCapture["path"]; sameAsSlug: string; shapeId: string; reason: string }[];
+  duplicates: { path: ProbeCapture["path"]; sameAsSlug: string; shapeId: string; reason: string; taken: boolean }[];
 };
 
 /**
@@ -165,30 +178,48 @@ export type CameraMatrixReport = {
 
 export type MatrixProgress = (message: string, done: number, total: number) => void;
 
-/** The resolution ladder, largest first, each also asked in portrait. */
+/**
+ * The resolution ladder, largest first.
+ *
+ * Four rungs, not seven. 8K went because no phone camera has ever granted it,
+ * and the native-maximum row already asks for the ceiling with `ideal`, so an
+ * exact 8K ask was one guaranteed rejection per camera recorded a second time.
+ * 1440p sits between two rungs that are both still here and resolved to one of
+ * them on every device seen. QVGA went because VGA already probes the bottom,
+ * and a camera that clamps 320 up clamps 640 up the same way.
+ *
+ * This is the widest set anything might be asked for. Each camera is only asked
+ * the part of it that its own advertised ceiling makes a real question — see
+ * `planFor`.
+ */
 const LADDER: { w: number; h: number; name: string }[] = [
-  { w: 7680, h: 4320, name: "8K UHD" },
   { w: 3840, h: 2160, name: "4K UHD" },
-  { w: 2560, h: 1440, name: "1440p" },
   { w: 1920, h: 1080, name: "1080p" },
   { w: 1280, h: 720, name: "720p" },
   { w: 640, h: 480, name: "VGA" },
-  { w: 320, h: 240, name: "QVGA" },
 ];
 
+/**
+ * Three ratios, not six. 4:3 is the sensor's own shape on nearly every phone,
+ * 16:9 is what video asks for, and 1:1 is the one that forces a crop. 3:2
+ * landed on one of the first two every time; 9:16 is 16:9 turned round, which
+ * the one portrait ask covers; and 21:9 is a cinema shape no phone sensor has.
+ */
 const ASPECTS: { ratio: number; name: string }[] = [
   { ratio: 4 / 3, name: "4:3" },
   { ratio: 16 / 9, name: "16:9" },
   { ratio: 1, name: "1:1" },
-  { ratio: 3 / 2, name: "3:2" },
-  { ratio: 9 / 16, name: "9:16" },
-  { ratio: 21 / 9, name: "21:9" },
 ];
 
-const FRAME_RATES: number[] = [15, 24, 30, 60, 120];
+/**
+ * 24 fps went: it sits between 15 and 30, and every camera that granted it
+ * granted 30 as well. What is left is filtered per camera against the range the
+ * camera itself advertises, plus exactly one ask above that ceiling.
+ */
+const FRAME_RATES: number[] = [15, 30, 60, 120];
 
 const STILL_POLICY =
-  "A still was ATTEMPTED at the native maximum, at every landscape resolution rung, and at every aspect ratio — down BOTH available paths at each of those steps (the browser's own photo pipeline, and a frame this app encoded from the video track). Portrait variants, frame-rate steps and control-mode steps deliberately attempt none: they change how the track behaves, not what a photo of it looks like. A still that WAS taken is only kept when its byte shape is new for that camera and that path; one repeating a shape already held is recorded on its row and dropped, since a second copy of a file already in the archive is weight rather than evidence. So an empty capture list on a row means one of two stated things — no still was attempted there, or the still that was taken had a shape already on file — and never that the camera failed.";
+  "A still was ATTEMPTED at the native maximum, and at every resolution rung and aspect ratio whose GRANTED size this camera had not been photographed at yet on that path. That second rule is most of the policy: a resolution rung and an aspect ratio that are both answered with 1920×1080 are one photograph and not two, and the second is not taken at all rather than taken and then dropped on arrival. At the native maximum only the browser's own photo pipeline runs — a canvas frame at that size is several megabytes THIS APP encoded from the video track rather than anything the camera produced, and the canvas path is exercised at every smaller rung anyway. Portrait, frame-rate and control-mode steps attempt none: they change how the track behaves, not what a photo of it looks like. A still that WAS taken is only kept when its byte shape is new for that camera and that path; one repeating a shape already held is recorded on its row and dropped. So an empty capture list on a row means one of three stated things — no still was attempted there, the granted size had already been photographed on that path, or the file repeated a shape already held — and never that the camera failed.";
 
 type PhotoCaps = { imageWidth?: { max?: number }; imageHeight?: { max?: number } };
 type ImageCaptureLike = {
@@ -374,39 +405,143 @@ async function platformStill(track: MediaStreamTrack): Promise<{ blob: Blob; wid
   }
 }
 
-type StepPlan = {
+export type StepPlan = {
   kind: MatrixRow["kind"];
   asked: string;
   constraints: MediaTrackConstraints;
   takeStills: boolean;
+  /**
+   * Set on the native-maximum step only. A canvas re-encode of a 4K frame is a
+   * several-megabyte file this app made rather than anything the camera did,
+   * and the same path is exercised at every smaller rung, so the biggest step
+   * takes the platform photo and nothing else.
+   */
+  platformOnly?: boolean;
 };
 
-/** Builds every constraint variation for one camera. Order is coarse-to-fine so an early abort still yields the useful rows. */
-function planFor(deviceId: string): StepPlan[] {
+/** What one camera says its own limits are, read off the track it opened first. */
+export type CameraCeiling = {
+  maxWidth: number | null;
+  maxHeight: number | null;
+  maxFrameRate: number | null;
+  aspectRange: { min: number; max: number } | null;
+};
+
+function numberOr(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Reads the ceiling out of `getCapabilities()`.
+ *
+ * Every field is optional and every one of them is missing on some browser, so
+ * an absent figure becomes `null` and means "this camera did not say" — which
+ * the plan treats as permission to ask, never as a limit.
+ */
+export function ceilingFrom(caps: MediaTrackCapabilities | null): CameraCeiling {
+  if (!caps) return { maxWidth: null, maxHeight: null, maxFrameRate: null, aspectRange: null };
+  const ext = caps as MediaTrackCapabilities & {
+    width?: { max?: number };
+    height?: { max?: number };
+    frameRate?: { max?: number };
+    aspectRatio?: { min?: number; max?: number };
+  };
+  const arMin = numberOr(ext.aspectRatio?.min);
+  const arMax = numberOr(ext.aspectRatio?.max);
+  return {
+    maxWidth: numberOr(ext.width?.max),
+    maxHeight: numberOr(ext.height?.max),
+    maxFrameRate: numberOr(ext.frameRate?.max),
+    aspectRange: arMin != null && arMax != null && arMax >= arMin ? { min: arMin, max: arMax } : null,
+  };
+}
+
+/** The one step every camera gets first: it returns the ceiling the rest of the plan is built from. */
+export function nativeMaxStep(deviceId: string): StepPlan {
+  return {
+    kind: "native-max",
+    asked: "native maximum (8K ideal, no other constraint)",
+    constraints: { deviceId: { exact: deviceId }, width: { ideal: 7680 }, height: { ideal: 4320 } } as MediaTrackConstraints,
+    takeStills: true,
+    platformOnly: true,
+  };
+}
+
+/**
+ * Builds the constraint variations for one camera, from what that camera has
+ * already said about itself.
+ *
+ * The sweep used to send an identical 28-step plan to every camera, which meant
+ * asking a 720p-capable front camera for 8K, 4K and 1440p, and asking a 30 fps
+ * sensor for 60 and 120 — questions whose answers the camera had already given
+ * in `getCapabilities()` before the first one was sent. Those rows are not
+ * dropped for being uninteresting; they are dropped because the camera answered
+ * them already, and asking anyway costs a camera open each.
+ *
+ * One over-ask survives in each direction, deliberately. Whether a camera
+ * CLAMPS to its ceiling or REFUSES outright is a real difference between
+ * platforms and cannot be read from the capability object, so exactly one rung
+ * above the ceiling and one frame rate above it are still asked. The rungs
+ * beyond that would each answer the same way.
+ *
+ * Order stays coarse-to-fine so an early stop still leaves the useful rows.
+ */
+export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: StepPlan[]; notes: string[] } {
   const pin = { deviceId: { exact: deviceId } } as MediaTrackConstraints;
-  const steps: StepPlan[] = [
-    {
-      kind: "native-max",
-      asked: "native maximum (8K ideal, no other constraint)",
-      constraints: { ...pin, width: { ideal: 7680 }, height: { ideal: 4320 } },
-      takeStills: true,
-    },
-  ];
-  for (const rung of LADDER) {
+  const steps: StepPlan[] = [];
+  const notes: string[] = [];
+
+  const fits = (rung: { w: number; h: number }): boolean =>
+    (ceiling.maxWidth == null || rung.w <= ceiling.maxWidth) && (ceiling.maxHeight == null || rung.h <= ceiling.maxHeight);
+
+  const within = LADDER.filter(fits);
+  const above = LADDER.filter((rung) => !fits(rung));
+  // LADDER runs largest first, so the last entry above the ceiling is the one
+  // nearest to it — the only over-ask worth a camera open.
+  const overAsk = above.length > 0 ? above[above.length - 1] : null;
+  if (above.length > 1 && overAsk) {
+    notes.push(
+      `this camera advertises a ceiling of ${ceiling.maxWidth ?? "?"}×${ceiling.maxHeight ?? "?"}, so ${above.length - 1} rung(s) above it were not asked for. ` +
+        `${overAsk.name} was still asked, one rung over the top, because whether a camera clamps to its ceiling or refuses outright is a real difference and cannot be read from the capability object. ` +
+        `The rungs beyond it would each answer the same way, and each one costs a camera open. Nothing here is a claim about what they would have returned.`
+    );
+  }
+
+  for (const rung of overAsk ? [overAsk, ...within] : within) {
     steps.push({
       kind: "resolution",
-      asked: `${rung.name} landscape — exactly ${rung.w}×${rung.h}`,
+      asked:
+        rung === overAsk
+          ? `${rung.name} landscape — exactly ${rung.w}×${rung.h} (one rung above the ceiling this camera advertised: does it clamp or refuse?)`
+          : `${rung.name} landscape — exactly ${rung.w}×${rung.h}`,
       constraints: { ...pin, width: { exact: rung.w }, height: { exact: rung.h } },
       takeStills: true,
     });
+  }
+
+  // One portrait ask, not one per rung. Whether a camera accepts a
+  // taller-than-wide request is one question about the camera, and it was being
+  // asked six more times at sizes that only re-tested the ladder. 720p is used
+  // where it fits, because it is modest enough that a refusal means "not
+  // portrait" rather than "not that big".
+  const portrait = within.find((rung) => rung.name === "720p") ?? within[within.length - 1] ?? null;
+  if (portrait) {
     steps.push({
       kind: "resolution",
-      asked: `${rung.name} portrait — exactly ${rung.h}×${rung.w}`,
-      constraints: { ...pin, width: { exact: rung.h }, height: { exact: rung.w } },
+      asked: `${portrait.name} portrait — exactly ${portrait.h}×${portrait.w} (the one portrait ask)`,
+      constraints: { ...pin, width: { exact: portrait.h }, height: { exact: portrait.w } },
       takeStills: false,
     });
   }
+
   for (const aspect of ASPECTS) {
+    const range = ceiling.aspectRange;
+    if (range && (aspect.ratio < range.min - 0.001 || aspect.ratio > range.max + 0.001)) {
+      notes.push(
+        `${aspect.name} lies outside the aspect-ratio range this camera advertised (${range.min}–${range.max}), so it was not asked for. That is the camera's own statement about itself, not an assumption about it.`
+      );
+      continue;
+    }
     steps.push({
       kind: "aspect-ratio",
       asked: `aspect ratio ${aspect.name} (exact ${Math.round(aspect.ratio * 10000) / 10000})`,
@@ -414,15 +549,27 @@ function planFor(deviceId: string): StepPlan[] {
       takeStills: true,
     });
   }
-  for (const fps of FRAME_RATES) {
+
+  const maxFps = ceiling.maxFrameRate;
+  const fpsWithin = FRAME_RATES.filter((fps) => maxFps == null || fps <= maxFps);
+  const fpsAbove = FRAME_RATES.filter((fps) => maxFps != null && fps > maxFps);
+  // FRAME_RATES runs ascending, so the first above the ceiling is the nearest.
+  const fpsOverAsk = fpsAbove.length > 0 ? fpsAbove[0] : null;
+  if (fpsAbove.length > 1 && fpsOverAsk != null) {
+    notes.push(
+      `this camera advertises a maximum of ${maxFps} fps, so ${fpsAbove.length - 1} higher rate(s) were not asked for. ${fpsOverAsk} fps was still asked, one step over, for the same clamp-or-refuse reason as the resolution ladder.`
+    );
+  }
+  for (const fps of fpsOverAsk != null ? [...fpsWithin, fpsOverAsk] : fpsWithin) {
     steps.push({
       kind: "frame-rate",
-      asked: `exactly ${fps} fps`,
+      asked: fps === fpsOverAsk ? `exactly ${fps} fps (above the rate this camera advertised)` : `exactly ${fps} fps`,
       constraints: { ...pin, frameRate: { exact: fps } },
       takeStills: false,
     });
   }
-  return steps;
+
+  return { steps, notes };
 }
 
 /**
@@ -440,16 +587,52 @@ function advanced(set: AdvancedConstraint): MediaTrackConstraints {
 /** Control modes are applied to an already-open track, since they are not opening constraints. */
 type ControlStep = { kind: MatrixRow["kind"]; asked: string; constraints: MediaTrackConstraints };
 
-function controlStepsFor(caps: MediaTrackCapabilities | null): ControlStep[] {
+type ControlCaps = MediaTrackCapabilities & {
+  focusMode?: string[];
+  exposureMode?: string[];
+  whiteBalanceMode?: string[];
+  resizeMode?: string[];
+  zoom?: { min?: number; max?: number };
+  torch?: boolean;
+};
+
+/** True when this camera claims a torch, which is the only claim worth checking twice. */
+function torchAdvertised(caps: MediaTrackCapabilities | null): boolean {
+  return (caps as ControlCaps | null)?.torch === true;
+}
+
+/**
+ * The control surface a camera advertises, reduced to a comparable string.
+ *
+ * Used to notice when a second camera lists exactly the same modes, ranges and
+ * flags as one already swept. It is a statement about what was ADVERTISED and
+ * nothing more — see the note the sweep writes when it acts on this.
+ */
+function controlSignature(caps: MediaTrackCapabilities | null): string | null {
+  if (!caps) return null;
+  const ext = caps as ControlCaps;
+  const parts = [
+    (ext.focusMode ?? []).join(","),
+    (ext.exposureMode ?? []).join(","),
+    (ext.whiteBalanceMode ?? []).join(","),
+    (ext.resizeMode ?? []).join(","),
+    ext.zoom?.min != null && ext.zoom.max != null ? `${ext.zoom.min}-${ext.zoom.max}` : "",
+    ext.torch === true ? "torch" : "",
+  ];
+  return parts.every((part) => part === "") ? null : parts.join("|");
+}
+
+/**
+ * Builds the control steps for one camera.
+ *
+ * `allowTorch` is false once the flash has already been fired somewhere in this
+ * run. Every rear camera on a phone drives the same physical LED, so firing it
+ * on each of them is one demonstration repeated into the user's face — and the
+ * second camera to claim a torch is claiming the first camera's torch.
+ */
+function controlStepsFor(caps: MediaTrackCapabilities | null, allowTorch: boolean): ControlStep[] {
   if (!caps) return [];
-  const ext = caps as MediaTrackCapabilities & {
-    focusMode?: string[];
-    exposureMode?: string[];
-    whiteBalanceMode?: string[];
-    resizeMode?: string[];
-    zoom?: { min?: number; max?: number };
-    torch?: boolean;
-  };
+  const ext = caps as ControlCaps;
   const steps: ControlStep[] = [];
   for (const mode of ext.focusMode ?? []) {
     steps.push({ kind: "focus", asked: `focusMode "${mode}"`, constraints: advanced({ focusMode: mode }) });
@@ -467,7 +650,7 @@ function controlStepsFor(caps: MediaTrackCapabilities | null): ControlStep[] {
     steps.push({ kind: "zoom", asked: `zoom at minimum (${ext.zoom.min})`, constraints: advanced({ zoom: ext.zoom.min }) });
     steps.push({ kind: "zoom", asked: `zoom at maximum (${ext.zoom.max})`, constraints: advanced({ zoom: ext.zoom.max }) });
   }
-  if (ext.torch === true) {
+  if (ext.torch === true && allowTorch) {
     steps.push({ kind: "torch", asked: "torch on", constraints: advanced({ torch: true }) });
     steps.push({ kind: "torch", asked: "torch off", constraints: advanced({ torch: false }) });
   }
@@ -534,12 +717,34 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   const ledger = createShapeLedger();
   let stillsTaken = 0;
 
+  // Sizes already photographed, keyed by camera, path and granted size. This is
+  // the cheaper half of the same idea as the ledger: the ledger compares bytes
+  // AFTER a photograph has been taken, and this stops the photograph being
+  // taken at all when the step has been granted a size the camera has already
+  // been photographed at on that path. A resolution rung and an aspect ratio
+  // that both land on 1920×1080 are one photograph, and the second round trip
+  // through ImageCapture and the canvas is time and memory spent on a file that
+  // would have been dropped on arrival.
+  const photographedSizes = new Map<string, string>();
+
+  // The flash is fired once per run, on the first camera that claims one.
+  let torchFiredOn: string | null = null;
+
+  // Advertised control surfaces already walked, so the second camera listing an
+  // identical set does not repeat the whole block.
+  const controlSurfaces = new Map<string, string>();
+
   /**
    * Offers a still to the ledger. Kept stills consume a slug and are recorded;
    * repeats are written onto the row and dropped without ever being counted as
    * photographs taken.
    */
-  const offer = async (build: (slug: string) => ProbeCapture, row: { captureSlugs: string[]; duplicates: MatrixRow["duplicates"] }, prefix: string): Promise<void> => {
+  const offer = async (
+    build: (slug: string) => ProbeCapture,
+    row: { captureSlugs: string[]; duplicates: MatrixRow["duplicates"] },
+    prefix: string,
+    sizeKey: string | null
+  ): Promise<void> => {
     // The slug is only peeked at: the counter moves when a still survives, so
     // the numbering never carries a gap where a duplicate used to be.
     const capture = build(`${String(counter + 1).padStart(3, "0")}-${prefix}`);
@@ -551,9 +756,13 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       asked: capture.asked,
     });
     if (verdict.repeat != null) {
-      row.duplicates.push({ path: capture.path, sameAsSlug: verdict.repeat.sameAsSlug, shapeId: verdict.shape.id, reason: verdict.repeat.reason });
+      row.duplicates.push({ path: capture.path, sameAsSlug: verdict.repeat.sameAsSlug, shapeId: verdict.shape.id, reason: verdict.repeat.reason, taken: true });
+      // The size is remembered against the file it matched, so the next step
+      // that lands on it does not repeat the round trip either.
+      if (sizeKey) photographedSizes.set(sizeKey, verdict.repeat.sameAsSlug);
       return;
     }
+    if (sizeKey) photographedSizes.set(sizeKey, capture.slug);
     counter += 1;
     captures.push(capture);
     heldBytes += capture.blob.size;
@@ -618,8 +827,17 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     );
   }
 
-  const perDevice = planFor("x").length;
-  const total = Math.max(1, inventory.length * (perDevice + 6));
+  notes.push(
+    "The plan sent to each camera is built from what that camera advertised on the first open, not from one fixed list. Resolution rungs above the ceiling it stated, frame rates above the rate it stated, " +
+      "and aspect ratios outside the range it stated are not asked for — the camera answered those in getCapabilities() before the first request was sent, and asking anyway costs one camera open each. " +
+      "Exactly one rung and one frame rate ABOVE the ceiling are still asked, because whether a camera clamps or refuses is a real difference that the capability object does not contain. Portrait is asked once " +
+      "per camera rather than once per rung. Where any of this shortened a camera's plan, the camera's own figures are quoted in a note beside it."
+  );
+
+  // An estimate for the progress bar only. The real plan is built per camera
+  // from what that camera advertises, so it is shorter than this on most of
+  // them; the bar is clamped rather than allowed to overrun.
+  const total = Math.max(1, inventory.length * (LADDER.length + ASPECTS.length + FRAME_RATES.length + 8));
   let done = 0;
 
   for (const device of inventory) {
@@ -631,14 +849,35 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     const name = device.label || `camera ${device.deviceId.slice(0, 8)}`;
     let capabilities: MediaTrackCapabilities | null = null;
 
-    for (const step of planFor(device.deviceId)) {
+    // The plan starts as one step — the native maximum — and the rest is
+    // appended once that step has read the camera's capabilities. Extending the
+    // array the loop is walking is deliberate: it keeps one body for every step
+    // and keeps the plan honest, since it is built from a reading rather than
+    // from an assumption about what this camera can do.
+    let plan: StepPlan[] = [nativeMaxStep(device.deviceId)];
+    let planned = false;
+    const extendPlan = (): void => {
+      if (planned) return;
+      planned = true;
+      const built = planFor(device.deviceId, ceilingFrom(capabilities));
+      plan = plan.concat(built.steps);
+      for (const note of built.notes) notes.push(`${name}: ${note}`);
+      if (!capabilities) {
+        notes.push(
+          `${name}: no capability object could be read on the first open, so nothing was trimmed from this camera's plan — every rung, ratio and frame rate was asked for. An unreadable ceiling is treated as permission to ask, never as a limit.`
+        );
+      }
+    };
+
+    for (let index = 0; index < plan.length; index += 1) {
+      const step = plan[index];
       await options.waitWhilePaused?.();
       if (options.shouldAbort()) {
         aborted = true;
         break;
       }
       done += 1;
-      options.onProgress(`${name} — ${step.asked}`, done, total);
+      options.onProgress(`${name} — ${step.asked}`, done, Math.max(total, done));
 
       const stepStart = performance.now();
       let stream: MediaStream | null = null;
@@ -661,6 +900,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
           captureSlugs: [],
           duplicates: [],
         });
+        // A camera that could not open on its first step still needs a plan, or
+        // the whole camera would silently vanish from the sweep.
+        extendPlan();
         continue;
       }
 
@@ -676,36 +918,76 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
 
       const stepRow = { captureSlugs: [] as string[], duplicates: [] as MatrixRow["duplicates"] };
       let videoDims: { width: number; height: number } | null = null;
+
+      // What this step was actually GRANTED decides whether a photograph here
+      // would be a new one. Two different asks answered with the same size are
+      // the same picture of the same scene, and the second is not taken.
+      const grantedSize = settings?.width != null && settings.height != null ? `${settings.width}×${settings.height}` : null;
+      const sizeKeyFor = (path: ProbeCapture["path"]): string | null => (grantedSize ? `${device.deviceId}|${path}|${grantedSize}` : null);
+      const alreadyShot = (path: ProbeCapture["path"]): string | null => {
+        const key = sizeKeyFor(path);
+        return key ? photographedSizes.get(key) ?? null : null;
+      };
+
       if (step.takeStills && track && stillsAllowed()) {
+        const priorPlatform = alreadyShot("image-capture");
+        const priorCanvas = step.platformOnly ? null : alreadyShot("canvas");
         const video = await attachVideo(stream);
         if (video) videoDims = { width: video.videoWidth, height: video.videoHeight };
 
-        const platform = await platformStill(track);
-        if (platform) {
-          await offer(
-            (slug) => ({
-              slug,
-              label: `${name} — ${step.asked} — platform photo pipeline`,
-              blob: platform.blob,
-              origin: "platform-photo",
-              stage: "camera-sweep",
-              deviceLabel: name,
-              path: "image-capture",
-              width: platform.width,
-              height: platform.height,
-              fileName: null,
-              fileLastModified: null,
-              fileRelativePath: null,
-              asked: step.asked,
-              granted: settingsText(settings),
-              takenAt: new Date().toISOString(),
-            }),
-            stepRow,
-            "platform"
-          );
+        if (priorPlatform != null) {
+          stepRow.duplicates.push({
+            path: "image-capture",
+            sameAsSlug: priorPlatform,
+            shapeId: "(no file — none was taken)",
+            taken: false,
+            reason: `This camera had already been photographed at ${grantedSize} down the platform photo pipeline, and this request was granted that same size, so no second photograph was taken. The request itself ran and its granted settings are on this row; what was skipped is a file that would have been the same picture at the same size.`,
+          });
+        } else {
+          const platform = await platformStill(track);
+          if (platform) {
+            await offer(
+              (slug) => ({
+                slug,
+                label: `${name} — ${step.asked} — platform photo pipeline`,
+                blob: platform.blob,
+                origin: "platform-photo",
+                stage: "camera-sweep",
+                deviceLabel: name,
+                path: "image-capture",
+                width: platform.width,
+                height: platform.height,
+                fileName: null,
+                fileLastModified: null,
+                fileRelativePath: null,
+                asked: step.asked,
+                granted: settingsText(settings),
+                takenAt: new Date().toISOString(),
+              }),
+              stepRow,
+              "platform",
+              sizeKeyFor("image-capture")
+            );
+          }
         }
 
-        if (video) {
+        if (step.platformOnly) {
+          stepRow.duplicates.push({
+            path: "canvas",
+            sameAsSlug: "",
+            shapeId: "(no file — none was taken)",
+            taken: false,
+            reason: `No canvas frame was encoded at the native maximum. At this size that file is several megabytes THIS APP produced from the video track rather than anything the camera made, and the canvas path is exercised at every smaller rung below, where the same pipeline is visible for a fraction of the memory.`,
+          });
+        } else if (priorCanvas != null) {
+          stepRow.duplicates.push({
+            path: "canvas",
+            sameAsSlug: priorCanvas,
+            shapeId: "(no file — none was taken)",
+            taken: false,
+            reason: `This camera had already been photographed at ${grantedSize} down the canvas path, and this request was granted that same size, so no second frame was encoded.`,
+          });
+        } else if (video) {
           const drawn = await drawVideoStill(video, CANVAS_ENCODE_QUALITY);
           if (drawn) peakCanvasBytes = Math.max(peakCanvasBytes, drawn.canvasBytes);
           if (drawn) {
@@ -728,11 +1010,12 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
                 takenAt: new Date().toISOString(),
               }),
               stepRow,
-              "canvas"
+              "canvas",
+              sizeKeyFor("canvas")
             );
           }
-          detachVideo(video);
         }
+        if (video) detachVideo(video);
       } else if (step.takeStills && track) {
         // Read the video dimensions anyway: it is the one reading that costs no
         // memory, and losing it would make the row less complete than it needs
@@ -775,10 +1058,25 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     if (aborted) break;
 
     // Control modes need one open track they can be applied to in sequence.
-    const controls = controlStepsFor(capabilities);
-    if (controls.length === 0) {
+    const signature = controlSignature(capabilities);
+    const walkedOn = signature ? controlSurfaces.get(signature) : undefined;
+    const controls = walkedOn ? [] : controlStepsFor(capabilities, torchFiredOn == null);
+    if (torchAdvertised(capabilities) && torchFiredOn != null && torchFiredOn !== name && !walkedOn) {
+      notes.push(
+        `${name}: advertises a torch, and the flash was not fired again. It was fired once already, on ${torchFiredOn}, and that row is above. Every rear camera on a phone drives the same physical LED, so a second firing is one demonstration repeated into the room — the torch rows for this camera are absent for that reason and for no other. Nothing is claimed here about whether this camera's torch constraint would have been granted.`
+      );
+    }
+    if (walkedOn && signature) {
+      notes.push(
+        `${name}: advertises exactly the same control surface as ${walkedOn} — the same focus, exposure, white-balance and resize lists, the same zoom range and the same torch flag — so the mode-by-mode rows were not walked a second time. They were walked once, on ${walkedOn}, and those rows are above. ` +
+          `This is a decision about where the run spends its time, NOT a claim that this camera would have answered the same way: nothing about its control behaviour beyond the surface it advertises was recorded, and that absence is stated here rather than filled in.`
+      );
+    } else if (controls.length === 0) {
       notes.push(`${name}: the platform advertised no focus, exposure, white-balance, resize, zoom or torch controls, so there was nothing to apply.`);
-    } else {
+    }
+    if (controls.length > 0) {
+      if (signature) controlSurfaces.set(signature, name);
+      if (torchAdvertised(capabilities) && torchFiredOn == null) torchFiredOn = name;
       let stream: MediaStream | null = null;
       try {
         stream = await openMediaWithDeadline({ audio: false, video: { deviceId: { exact: device.deviceId } } }, { what: `${name} (control-mode reopen)`, onLate: noteLate });
@@ -794,7 +1092,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
           break;
         }
         done += 1;
-        options.onProgress(`${name} — ${control.asked}`, done, total);
+        options.onProgress(`${name} — ${control.asked}`, done, Math.max(total, done));
         const stepStart = performance.now();
         if (!track) {
           rows.push({
@@ -865,6 +1163,13 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     notes.push(
       `${ledger.droppedCount()} of ${stillsTaken} still(s) repeated a byte shape already held for the same camera and the same path, and were not kept — saving ${(ledger.bytesSaved() / 1024 / 1024).toFixed(1)} MB. ` +
         `Each one is named on its own row with the file it matched. Those requests all succeeded; nothing here is a camera failing, and nothing that was dropped is counted as a photograph taken.`
+    );
+  }
+  const notTaken = rows.reduce((sum, row) => sum + row.duplicates.filter((duplicate) => !duplicate.taken).length, 0);
+  if (notTaken > 0) {
+    notes.push(
+      `${notTaken} photograph(s) were never taken, on rows where the camera had already been photographed at the size that row was granted. Those rows say so individually, and each one names the file that already holds that size. ` +
+        `This is the cheaper half of the same rule as the shapes above: the ledger compares bytes after a photograph exists, and this stops the photograph being made when the size is already answered. Every one of those requests still ran and every asked-versus-granted row is complete.`
     );
   }
   for (const shared of ledger.sharedShapes()) {
@@ -980,7 +1285,14 @@ export function matrixText(report: CameraMatrixReport): string {
       );
       if (row.captureSlugs.length > 0) lines.push(`             stills: ${row.captureSlugs.join(", ")}`);
       for (const duplicate of row.duplicates) {
-        lines.push(`             repeat: a ${duplicate.path} still was taken here and matched ${duplicate.sameAsSlug} exactly (shape ${duplicate.shapeId}), so it was not kept.`);
+        if (duplicate.taken) {
+          lines.push(`             repeat: a ${duplicate.path} still was taken here and matched ${duplicate.sameAsSlug} exactly (shape ${duplicate.shapeId}), so it was not kept.`);
+        } else {
+          lines.push(
+            `             not taken: no ${duplicate.path} still was made at this step${duplicate.sameAsSlug ? ` — that size was already photographed as ${duplicate.sameAsSlug}` : ""}.`,
+            `                        ${duplicate.reason}`
+          );
+        }
       }
     }
   }

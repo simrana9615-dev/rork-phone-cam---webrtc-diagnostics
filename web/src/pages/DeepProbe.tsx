@@ -33,7 +33,7 @@ import { Button } from "@/components/ui/button";
 import { downloadBlob, formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
-import { fallbackReason, routesNotNeededReason, zoomSkipReason, type AdaptiveSkip, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
+import { fallbackReason, routesNotNeededReason, zoomNotAskedReason, type AdaptiveSkip, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
 import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
 import { readShape } from "@/lib/deep-probe/capture-signature";
@@ -712,7 +712,7 @@ export default function DeepProbe() {
         return;
       }
 
-      addLog("info", "Camera sweep starting — every camera, every resolution rung, every ratio, frame rate and control mode.");
+      addLog("info", "Camera sweep starting — every camera, at the sizes, ratios, frame rates and control modes it says it supports. Rungs above a camera's own stated ceiling are not asked for, apart from one deliberate over-ask.");
       const { report, captures } = await runCameraSweep({
         onProgress: (message, done, total) => {
           setSweepMessage(message);
@@ -758,7 +758,15 @@ export default function DeepProbe() {
 
       markStage("camera", "done");
       const inventory = await enumerateVideoInputs();
-      setManualSteps(buildManualSteps(inventory));
+      const manual = buildManualSteps(inventory, report);
+      setManualSteps(manual.steps);
+      if (manual.skips.length > 0) {
+        // Recorded before the stage starts, because these were decided by rows
+        // the sweep already produced rather than by anything the user did.
+        adaptiveSkipsRef.current.push(...manual.skips);
+        setAdaptiveSkips([...adaptiveSkipsRef.current]);
+        addLog("info", `${manual.skips.length} zoom shot(s) are not on the list: the sweep already watched those cameras refuse to zoom.`);
+      }
       setManualIndex(0);
       setPhase("manual");
     })();
@@ -813,12 +821,6 @@ export default function DeepProbe() {
         setByteCount((b) => b + shot.blob.size);
         addLog("success", `${step.title}: ${shot.width}×${shot.height}, ${formatBytes(shot.blob.size)} via ${shot.path === "image-capture" ? "the platform photo pipeline" : "a canvas encode by this app"}.`);
         if (shot.zoomNote) addLog("debug", shot.zoomNote);
-        // A zoom step that applied no zoom is the camera saying it has no range.
-        // The remaining two would each be an identical unzoomed frame carrying
-        // an identical note, which is one fact recorded twice more.
-        if (step.zoom != null && shot.zoomApplied == null) {
-          dropAhead((candidate) => candidate.kind === "viewfinder" && candidate.deviceId === step.deviceId && candidate.zoom != null, zoomSkipReason(step.deviceLabel));
-        }
       } else if (step.spec) {
         const spec = step.spec;
         const result = await runManualShot(spec, (engine, at, total) => {
@@ -1678,9 +1680,40 @@ export default function DeepProbe() {
   );
 }
 
-/** Builds the manual shot list: every named camera in the viewfinder, three zoom steps each, then the camera-app handoffs. */
-function buildManualSteps(inventory: CameraDeviceInfo[]): ManualStep[] {
+/**
+ * True when the SWEEP already saw this camera's zoom actually move.
+ *
+ * The sweep asks every camera that advertises a range for its minimum and its
+ * maximum, and writes what the settings object said afterwards. Two distinct
+ * values there is the camera demonstrating a real range; one value, or no zoom
+ * rows at all, is the camera saying it has none. Either way the answer comes
+ * from this run rather than from an expectation about the lens.
+ */
+function zoomWasObserved(deviceId: string, matrix: CameraMatrixReport | null): boolean {
+  if (!matrix) return false;
+  const seen = new Set<number>();
+  for (const row of matrix.rows) {
+    if (row.deviceId !== deviceId || row.kind !== "zoom" || !row.ok) continue;
+    const zoom = (row.grantedSettings as { zoom?: unknown } | null)?.zoom;
+    if (typeof zoom === "number" && Number.isFinite(zoom)) seen.add(zoom);
+  }
+  return seen.size > 1;
+}
+
+/**
+ * Builds the manual shot list: every named camera at full frame, one zoom shot
+ * where the sweep proved a range, then the camera-app handoffs.
+ *
+ * Four shots per camera became two at most. The minimum and the middle of a
+ * zoom range are answered by holding the frame at full width and then at the
+ * maximum — the middle of a range is the least informative point on it — and a
+ * camera the sweep already saw refuse to zoom is not asked to prove that again
+ * by hand. Every shot not asked for is returned as a skip carrying the sweep
+ * observation that caused it.
+ */
+function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixReport | null): { steps: ManualStep[]; skips: AdaptiveSkip[] } {
   const steps: ManualStep[] = [];
+  const skips: AdaptiveSkip[] = [];
   for (const device of inventory) {
     const label = device.label || `camera ${device.deviceId.slice(0, 8)}`;
     steps.push({
@@ -1693,15 +1726,22 @@ function buildManualSteps(inventory: CameraDeviceInfo[]): ManualStep[] {
       deviceLabel: label,
       zoom: null,
     });
-    for (const zoom of ["min", "mid", "max"] as const) {
+    if (zoomWasObserved(device.deviceId, matrix)) {
       steps.push({
-        id: `vf-${device.deviceId.slice(0, 8)}-${zoom}`,
+        id: `vf-${device.deviceId.slice(0, 8)}-max`,
         kind: "viewfinder",
-        title: `${label} — zoom ${zoom}`,
-        purpose: `Same camera, held at the ${zoom} of the zoom range it reports. If this camera exposes no zoom control the shot is still taken and clearly recorded as unzoomed, rather than quietly pretending otherwise.`,
+        title: `${label} — zoom max`,
+        purpose:
+          "Same camera, held at the top of the zoom range the sweep watched it move through. One zoom shot, at the end of the range: the middle of a range is the least informative point on it, and the full-frame shot above is already the other end. What this one shows is whether zooming crops the sensor or drives a different lens.",
         deviceId: device.deviceId,
         deviceLabel: label,
-        zoom,
+        zoom: "max",
+      });
+    } else {
+      skips.push({
+        stepId: `vf-${device.deviceId.slice(0, 8)}-max`,
+        title: `${label} — zoom max`,
+        reason: zoomNotAskedReason(label),
       });
     }
   }
@@ -1720,7 +1760,7 @@ function buildManualSteps(inventory: CameraDeviceInfo[]): ManualStep[] {
       spec,
     });
   }
-  return steps;
+  return { steps, skips };
 }
 
 function ResultList({ records }: { records: PermissionRecord[] }) {

@@ -16,11 +16,14 @@
  *     needed — which is a different thing from being skipped, and is recorded
  *     as exactly that: the side has its file, so nothing was left undone.
  *
- *   • THE ZOOM STEPS. Three of the four viewfinder shots per camera exist to
- *     exercise a zoom range. A camera that exposes no zoom control cannot
- *     exercise one, and the three shots collapse to three identical frames
- *     plus three identical "this camera has no zoom" notes. One shot and one
- *     note say the same thing.
+ *   • THE ZOOM SHOT. Each camera used to be photographed four times: once at
+ *     full frame and once at each of the minimum, middle and maximum of its
+ *     zoom range. Three of those four were asking one question — does this
+ *     lens crop or does it move? — and the middle of a range is answered by
+ *     its ends. So there is one zoom shot now, at the maximum, and it is only
+ *     asked for on cameras the SWEEP already showed to have a range. A camera
+ *     that reported the same zoom at both ends of its own range is not asked
+ *     to demonstrate that again by hand.
  *
  * What this deliberately does NOT do is guess. Nothing is skipped on the
  * strength of what a device is expected to do, only on what it has already been
@@ -75,16 +78,19 @@ export function fallbackReason(facing: ManualFacing, attempts: { engine: string;
 }
 
 /**
- * Why the zoom shots for one camera are not worth taking.
+ * Why a camera was not asked for a zoom shot at all.
  *
- * Called only after a real zoom step has come back with no zoom applied, which
- * is the camera itself saying it has no range to walk.
+ * Called only where the SWEEP already asked this camera for zoom at its minimum
+ * and at its maximum and the settings came back the same both times, or where
+ * it advertised no zoom range to ask about. Either way the camera has answered
+ * the question the shot exists to ask, and answered it in the run the user is
+ * already looking at.
  */
-export function zoomSkipReason(deviceLabel: string): string {
+export function zoomNotAskedReason(deviceLabel: string): string {
   return (
-    `${deviceLabel} applied no zoom when asked for one, so it exposes no zoom control at all. The remaining zoom shots for this camera would each produce ` +
-    `an identical unzoomed frame and an identical note saying so, which is one fact recorded three more times. They were dropped and the fact is kept: this ` +
-    `camera has no zoom range. Nothing about the lens is being assumed here — the camera answered, and the answer was "none".`
+    `${deviceLabel} showed no zoom range in the sweep — it either advertised none, or was asked for its minimum and its maximum and reported the same value both ` +
+    `times. A zoom shot from it would be an ordinary unzoomed frame with a note saying the zoom did not move, which is a fact the sweep rows already hold. Nothing ` +
+    `about the lens is assumed here: the camera answered, and the answer was "none".`
   );
 }
 
@@ -107,9 +113,10 @@ export const ADAPTIVE_POLICY: string[] = [
   "given all three — but as spares, tried in turn, not as three separate trips. When the first route",
   "answers, the spares were never needed, and that is recorded as what it is rather than as a skip.",
   "",
-  "Likewise, three of the four viewfinder shots per camera exist to walk a zoom range. A camera that",
-  "applied no zoom when asked has no range to walk, and three more identical unzoomed frames would record",
-  "one fact three more times.",
+  "Each camera used to be photographed four times: full frame, then the minimum, middle and maximum of its",
+  "zoom range. Three of those asked one question, and the middle of a range is answered by its two ends. One",
+  "zoom shot is taken now, at the maximum, and only on cameras the SWEEP already showed to have a range — a",
+  "camera that reported the same zoom at both ends of its own range is not asked to demonstrate that by hand.",
   "",
   "Every one of these is a PROVEN redundancy, never a prediction, and each is listed below with the",
   "observation that caused it. A shot that was skipped is never counted as a shot that was taken, and no",

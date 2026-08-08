@@ -482,7 +482,8 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
     sections.push({
       id: "camera",
       title: "Camera sweep",
-      blurb: "Every camera, every resolution, ratio, frame rate and control mode that was tried — asked against granted, including the silent substitutions.",
+      blurb:
+        "Every camera, at the sizes, ratios, frame rates and control modes it says it supports — asked against granted, including the silent substitutions. Rungs above a camera's own stated ceiling are not asked for, apart from one deliberate over-ask that shows whether it clamps or refuses.",
       blocks: cameraBlocks,
     });
   } else {

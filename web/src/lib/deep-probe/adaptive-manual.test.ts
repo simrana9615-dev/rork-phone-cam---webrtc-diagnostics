@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { fallbackReason, routesNotNeededReason, zoomSkipReason } from "./adaptive-manual";
+import { fallbackReason, routesNotNeededReason, zoomNotAskedReason } from "./adaptive-manual";
 
 describe("the spare routes into the camera app", () => {
   const reason = routesNotNeededReason("environment", "native-camera", ["capture-boolean", "capacitor"]);
@@ -61,21 +61,22 @@ describe("what the run says when a side had to fall back", () => {
   });
 });
 
-describe("the zoom skip", () => {
-  const reason = zoomSkipReason("Back Ultra Wide Camera");
+describe("the zoom shot that was not asked for", () => {
+  const reason = zoomNotAskedReason("Back Ultra Wide Camera");
 
   it("names the camera that answered", () => {
     expect(reason).toContain("Back Ultra Wide Camera");
   });
 
-  it("keeps the fact it learned rather than only the shots it dropped", () => {
-    expect(reason).toContain("this");
-    expect(reason).toContain("camera has no zoom range");
+  it("points at the sweep rows that already hold the answer", () => {
+    expect(reason).toContain("showed no zoom range in the sweep");
+    expect(reason).toContain("the sweep rows already hold");
   });
 
   it("makes clear the camera answered, and the answer was none", () => {
     expect(reason).toContain('the answer was "none"');
-    expect(reason).toContain("Nothing about the lens is being assumed");
+    expect(reason).toContain("Nothing");
+    expect(reason).toContain("about the lens is assumed here");
   });
 });
 

@@ -79,7 +79,12 @@ describe("how each mode describes itself", () => {
 
   it("states the cost of each up front", () => {
     expect(RUN_MODE_INFO["width-640"].cost).toContain("about a minute");
-    expect(RUN_MODE_INFO.full.cost).toContain("Twenty minutes");
+    expect(RUN_MODE_INFO.full.cost).toContain("minutes");
+  });
+
+  it("does not promise the full run is longer than it now is", () => {
+    expect(RUN_MODE_INFO.full.cost).not.toContain("Twenty minutes");
+    expect(RUN_MODE_INFO.full.cost).not.toContain("hundred");
   });
 
   it("says plainly that the short run sends one constraint and nothing else", () => {

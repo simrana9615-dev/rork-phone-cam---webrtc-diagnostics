@@ -289,25 +289,32 @@ count, minutes, photo count, archive size — before anything runs.
    many events merely **repeated** the one before (and so the true update rate beside the
    delivery rate), how **evenly** they arrived, and the **gravity constant** this firmware
    subtracts.
-4. **Camera matrix.** Per camera: native max, the full resolution ladder in landscape
-   **and** portrait, six aspect ratios, five frame rates, then every advertised focus /
-   exposure / white-balance / resize mode, zoom extremes and torch applied to a live
-   track. Asked vs granted recorded for every row — a request that succeeds while quietly
-   delivering a different size is the more revealing case, so the two are never merged.
-   **Rejections are results**, exactly as in §4. Stills are taken at a declared subset of
-   steps and `stillPolicy` states which, so an empty capture list reads as designed. The
-   torch is always left off. Every request runs under a **ten-second deadline**, and a
-   timed-out row says only that — it is never presented as a refusal or as a limit the
-   camera stated. A still is kept only when its **shape** is new for that camera and that
-   path; one repeating a shape already held is recorded on its row and dropped.
-5. **Manual shots.** Two library picks, then every named camera in a pinned viewfinder plus
-   three zoom steps each (resolved against that camera's own reported range, not a hardcoded
-   factor), then **one** camera-app shot per side — the path that yields real camera EXIF.
-   Each of those two carries all three routes into the camera app as spares, tried in turn
-   until that side has its file, so the stage costs two trips rather than six and still gets
-   its file where the first route fails. A camera with no zoom control produces a
-   clearly-recorded unzoomed shot rather than a fake one. Skips are recorded as skips. The
-   list shortens once the run has PROVEN a shot redundant, but nothing taken by hand is ever
+4. **Camera matrix.** Native max first, which reads the camera's own ceiling, and then a
+   plan built from that ceiling: the resolution rungs it can actually reach, one portrait
+   ask, the aspect ratios inside the range it advertises, the frame rates inside the rate
+   it advertises, then every advertised focus / exposure / white-balance / resize mode,
+   zoom extremes and torch applied to a live track. Exactly **one rung and one frame rate
+   above the ceiling** are still asked, because clamping and refusing are different
+   behaviours and the capability object does not say which you get. Asked vs granted
+   recorded for every row — a request that succeeds while quietly delivering a different
+   size is the more revealing case, so the two are never merged. **Rejections are
+   results**, exactly as in §4. Stills are taken at a declared subset of steps and
+   `stillPolicy` states which, so an empty capture list reads as designed. The torch fires
+   **once per run** and is always left off. Every request runs under a **ten-second
+   deadline**, and a timed-out row says only that — it is never presented as a refusal or
+   as a limit the camera stated. A still is kept only when its **shape** is new for that
+   camera and that path; one repeating a shape already held is recorded on its row and
+   dropped, and one whose granted size has already been photographed on that path is not
+   taken at all.
+5. **Manual shots.** Two library picks, then every named camera at full frame plus **one**
+   zoom shot at the top of its range — and that one only where the sweep already watched
+   that camera's zoom move, since a camera that reported the same value at both ends of its
+   own range has answered the question by hand-shot would ask. Then **one** camera-app shot
+   per side — the path that yields real camera EXIF. Each of those two carries all three
+   routes into the camera app as spares, tried in turn until that side has its file, so the
+   stage costs two trips rather than six and still gets its file where the first route
+   fails. Skips are recorded as skips, each with the observation that caused it. The list
+   shortens once the run has PROVEN a shot redundant, but nothing taken by hand is ever
    thrown away.
 6. **Pixel measurements.** Per surviving capture, a bounded centre sample decoded with EXIF
    rotation and colour conversion **suppressed** (and stating whether the browser understood
@@ -473,7 +480,7 @@ of three, carved segments are lazy `Blob.slice` views the writer reads once each
 byte-identity re-check streams rather than materialising the archive a second time.
 
 **A hundred photographs of one photograph.** The sweep used to keep every still it took. Four
-cameras through eight resolution rungs and six aspect ratios down two paths is well over a
+cameras through fourteen resolution asks and six aspect ratios down two paths is well over a
 hundred files, and most of them were the same file twice — same container, same quantisation
 tables, same Huffman tables, same marker order, same metadata layout, same dimensions, differing
 only in what the lens happened to be pointed at. That difference is the one thing this app is
@@ -493,6 +500,30 @@ the shape, the values behind them are the moment and must not be. A camera writi
 directories in a fixed order is telling you about its firmware; the exposure time it wrote there
 is telling you about the light. Two photographs of two different scenes from one camera at one
 setting are *meant* to collapse into one shape — the collapse is the measurement, not a loss.
+
+**And then not taking it at all.** The shape ledger compares bytes, which means the photograph has
+to exist before it can be dropped — the round trip through the camera, the encode and the memory
+are all spent on a file that dies on arrival. So the cheaper half of the same rule runs first: when
+a step is granted a size this camera has already been photographed at on that path, no photograph
+is taken. A resolution rung and an aspect ratio both answered with 1920×1080 are one picture of one
+scene at one size, and the second was only ever going to be deleted. Those rows say so
+individually, naming the file that already holds that size, and the request itself still ran with
+its granted settings recorded — what was skipped is a file, not a measurement. The native maximum
+takes only the platform photo for the same reason in reverse: a canvas frame at 4K is several
+megabytes this app encoded from the video track, the least evidential and most expensive file in
+the run, and the canvas path is visible at every smaller rung for a fraction of the memory.
+
+**And not asking what the camera has already answered.** The sweep sent every camera the same
+plan, which meant asking a 720p front camera for 8K, 4K and 1440p, and asking a 30 fps sensor for
+60 and 120. Those are not hard questions; they are questions the camera answered in
+`getCapabilities()` before the first one was sent, and each one cost a camera open. The plan is now
+built per camera from the ceiling it stated on the first open. Exactly one rung and one frame rate
+*above* that ceiling survive, because whether a camera clamps or refuses is a genuine difference
+between platforms and is not in the capability object. Portrait is asked once rather than once per
+rung. The flash fires once in a run rather than on every camera that claims the same LED. And a
+second camera advertising an identical control surface does not have the mode-by-mode block walked
+again — stated as a decision about where the time goes, explicitly not as a claim that it would
+have answered the same way.
 
 Three things keep that honest. A dropped still is never counted as one that was taken. The
 numbering only advances on a file that survived, so there are no gaps where a duplicate used to
