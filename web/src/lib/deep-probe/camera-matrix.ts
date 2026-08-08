@@ -297,6 +297,29 @@ const STILL_POLICY =
 const NO_STILL_PREFIX =
   "No photograph was taken at this step. Each camera in this run is photographed exactly twice — its native maximum down the browser's own photo pipeline, and its smallest rung down the path this app encodes — and this step is neither of those.";
 
+/**
+ * Why a control row carries no photograph, said in that row's own terms.
+ *
+ * Control rows never produced stills, but they used to say nothing about it,
+ * which left the reason to be deduced from an empty capture list — the one
+ * thing the two-per-camera policy exists to stop. Every row in the sweep now
+ * states it.
+ */
+function controlStillNote(kind: MatrixRow["kind"]): string {
+  switch (kind) {
+    case "zoom":
+      return `${NO_STILL_PREFIX} A zoom row records whether the number moved when it was asked to, which is read back from the track itself. The photograph of a zoomed frame is taken by hand instead, and only on a camera this sweep actually watched move.`;
+    case "torch":
+      return `${NO_STILL_PREFIX} The flash is fired once in the whole run, and what it changes is the room rather than the file. This row records whether the constraint was accepted.`;
+    case "focus":
+    case "exposure":
+    case "white-balance":
+      return `${NO_STILL_PREFIX} A mode applied to a running track is answered by what the track says about itself afterwards, which is on this row in full. A picture of the scene in front of you would not say whether the mode was granted.`;
+    default:
+      return `${NO_STILL_PREFIX} This row applies a setting to a track that is already open and records what came back — a measurement of the answer, not a picture of it.`;
+  }
+}
+
 type PhotoCaps = { imageWidth?: { max?: number }; imageHeight?: { max?: number } };
 type ImageCaptureLike = {
   takePhoto: (s?: { imageWidth?: number; imageHeight?: number }) => Promise<Blob>;
@@ -1371,6 +1394,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             durationMs: 0,
             captureSlugs: [],
             duplicates: [],
+            stillNote: controlStillNote(control.kind),
           });
           continue;
         }
@@ -1397,6 +1421,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             durationMs: Math.round(performance.now() - stepStart),
             captureSlugs: [],
             duplicates: [],
+            stillNote: controlStillNote(control.kind),
           });
         } catch (err) {
           rows.push({
@@ -1413,6 +1438,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             durationMs: Math.round(performance.now() - stepStart),
             captureSlugs: [],
             duplicates: [],
+            stillNote: controlStillNote(control.kind),
           });
         }
       }

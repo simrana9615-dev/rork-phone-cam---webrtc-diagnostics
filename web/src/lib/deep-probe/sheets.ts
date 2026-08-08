@@ -467,8 +467,17 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
     });
   }
 
-  const impossibleAnswers: ImpossibleAnswer[] = [...(run.matrix?.impossible ?? []), ...(run.impossible?.answers ?? [])];
-  const impossibleObservations: string[] = [...(run.matrix?.impossibleObservations ?? []), ...(run.impossible?.observations ?? [])];
+  // Every place an impossible round can have run: inside the sweep, inside the
+  // 640-only investigation, or on its own. The 640 run's short battery belongs
+  // here as much as the other two — leaving it out put answers in the archive
+  // that the sheet and the viewer never mentioned.
+  const impossibleAnswers: ImpossibleAnswer[] = [...(run.matrix?.impossible ?? []), ...(run.widthProbe?.impossible ?? []), ...(run.impossible?.answers ?? [])];
+  const impossibleObservations: string[] = [
+    ...(run.matrix?.impossibleObservations ?? []),
+    ...(run.widthProbe?.impossibleObservations ?? []),
+    ...(run.impossible?.observations ?? []),
+  ];
+  const shortBattery = run.widthProbe != null && run.matrix == null && run.impossible == null;
   if (impossibleAnswers.length > 0) {
     const refused = impossibleAnswers.filter((answer) => answer.outcome === "refused").length;
     const granted = impossibleAnswers.filter((answer) => answer.outcome === "granted").length;
@@ -477,7 +486,10 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
       id: "impossible",
       title: "The impossible asks",
       blurb:
-        "Requests designed to be unanswerable, and how this platform turned them down. Succeeding is easy to imitate; refusing correctly — the right error, naming the right setting, in the right time, identically every time — is not. A refusal here is the informative answer, not a failure, and no photograph is taken anywhere in this stage.",
+        "Requests designed to be unanswerable, and how this platform turned them down. Succeeding is easy to imitate; refusing correctly — the right error, naming the right setting, in the right time, identically every time — is not. A refusal here is the informative answer, not a failure, and no photograph is taken anywhere in this stage." +
+        (shortBattery
+          ? " This run sent the SHORT battery, which is the fast-answering core of it. The asks it leaves out — among them the repeat-and-drift pair and the demand made of a camera already switched off — were never sent here, and nothing is inferred about what they would have returned."
+          : ""),
       blocks: [
         {
           kind: "rows",
@@ -1002,7 +1014,7 @@ export function buildSheets(run: RunFacts, facts: CaptureFacts[]): SheetSet {
       permissions: run.permissions,
       sensors: run.sensors,
       matrix: run.matrix,
-      impossible: run.impossible?.answers ?? [],
+      impossible: [...(run.widthProbe?.impossible ?? []), ...(run.impossible?.answers ?? [])],
       captures: facts.map((f) => f.spec),
       omissions: run.omissions,
       briefChecklist: checklist,
