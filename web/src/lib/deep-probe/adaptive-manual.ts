@@ -108,6 +108,28 @@ export function zoomNotAskedReason(deviceLabel: string, asked: boolean = true): 
   );
 }
 
+/**
+ * Why a camera got no viewfinder shot of its own.
+ *
+ * The viewfinder shot is one per RUN now, not one per camera. What it exists to
+ * show is a frame from the `getUserMedia` path — no camera metadata, because no
+ * browser writes any there — and that is a property of the PATH rather than of
+ * the lens: the same encoder, the same absence of tags, on every camera the
+ * phone has. Both sides of the phone are covered anyway by the two camera-app
+ * trips, which produce the only files in a run the camera itself wrote.
+ *
+ * The sweep still opens every camera and still records every row for it. This
+ * is a statement about one photograph not being taken by hand, and nothing at
+ * all about the camera.
+ */
+export function viewfinderNotAskedReason(deviceLabel: string, takenOn: string): string {
+  return (
+    `${deviceLabel} was not photographed by hand. One viewfinder shot is taken for the whole run — it was taken on ${takenOn} — because what that shot shows is a property of the getUserMedia path rather than of the lens: ` +
+    `a frame this app encoded, carrying no camera metadata, which is true on every camera this phone has. Both sides of the phone are covered separately by the two trips to the camera app, and those files are the only ones in the run the camera itself wrote. ` +
+    `${deviceLabel} was still opened by the sweep and every one of its rows is above. Nothing here is a claim about what a hand shot from it would have looked like — only that it would have shown the same path a second time.`
+  );
+}
+
 /** A shot the run decided not to ask for, and the observation that decided it. */
 export type AdaptiveSkip = {
   stepId: string;
@@ -135,6 +157,12 @@ export const ADAPTIVE_POLICY: string[] = [
   "as a repeat of an earlier camera's: zoom is the one control that genuinely differs lens to lens, and it is",
   "the one this stage reads. Where a camera could not be asked at all, the skip says it was never asked — not",
   "that it answered \"none\".",
+  "",
+  "The full-frame viewfinder shot is taken ONCE for the whole run rather than once per camera. What it shows",
+  "is a property of the getUserMedia path — a frame this app encoded, carrying no camera metadata, because no",
+  "browser writes any there — and that is the same on every lens the phone has. Both sides of the phone are",
+  "covered by the two camera-app trips, whose files are the only ones in the run the camera itself wrote.",
+  "Every other camera is still opened and still measured by the sweep; only the hand shot is not repeated.",
   "",
   "Every one of these is a PROVEN redundancy, never a prediction, and each is listed below with the",
   "observation that caused it. A shot that was skipped is never counted as a shot that was taken, and no",

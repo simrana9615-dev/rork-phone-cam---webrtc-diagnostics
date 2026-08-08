@@ -116,29 +116,43 @@ function describeFile(capture: BriefCapture): string {
 }
 
 /**
- * What the two library picks show when read against each other. Both are needed
- * for the comparison to mean anything, and where one is missing that is said
- * rather than worked around.
+ * What the library picks show about conversion on the way in.
+ *
+ * This used to be a controlled pair: the same photo asked for twice, once with
+ * a plain `accept` and once with HEIC named, so a format difference was a
+ * transcode caught in the act. The plain half is no longer a separate tap — the
+ * multi-pick trip sends up to five photos down an ordinary picker instead, and
+ * it asks for photos that are DIFFERENT from each other on purpose. That makes
+ * those files a sample rather than a control, and a format difference between
+ * them and the named-HEIC pick could as easily be two differently-stored photos
+ * as a conversion.
+ *
+ * So the pair comparison is not made any more, and this says so rather than
+ * making it anyway on files that cannot carry it.
  */
-function transcodeNote(plain: BriefCapture | null, original: BriefCapture | null): string {
-  if (plain == null || original == null) {
-    return "Only one of the two picks completed, so the pair cannot be read against each other and no conversion claim is made either way.";
+function transcodeNote(ordinary: BriefCapture[], original: BriefCapture | null): string {
+  if (original == null) {
+    return "The pick that names HEIC explicitly did not complete, so the one request in this run that gives a device no reason to convert was never answered, and no conversion claim is made either way.";
   }
-  const a = imageFamily(plain);
-  const b = imageFamily(original);
-  if (a === b) {
-    return `Both requests received ${a.toUpperCase()}, so nothing converted on the way in — on the assumption the same photo was picked twice, which this app cannot verify.`;
-  }
-  return `The two requests received different formats — ${a.toUpperCase()} for the plain one, ${b.toUpperCase()} where HEIC was named — which is a conversion performed by the browser during upload, observed directly rather than assumed. If the same photo was picked both times, the plain file is not the stored file.`;
+  const named = imageFamily(original);
+  const others = Array.from(new Set(ordinary.map(imageFamily)));
+  const sample =
+    others.length === 0
+      ? "No ordinary picker file came back alongside it to compare against."
+      : `The ordinary picker trip returned ${others.join(" and ").toUpperCase()}. Those are a SAMPLE, not a control: that request deliberately asks for several DIFFERENT photos, so a format difference between them and the file above can be two differently-stored photos just as easily as a conversion, and it is not read as one.`;
+  return `The request that named HEIC received ${named.toUpperCase()}. ${sample}`;
 }
 
 /** The 0.9 inference, stated at the strength the evidence actually supports. */
-function transcodeVerdict(plain: BriefCapture | null, original: BriefCapture | null, heicSeen: boolean): string {
-  if (plain != null && original != null && imageFamily(plain) !== imageFamily(original)) {
-    return `The two library picks came back in different formats, which is a browser-side conversion caught in the act. Where the HEIC-accepting request received HEIC, the library is holding HEIC — the High Efficiency setting — and every ordinary upload form on this device would have seen JPEG and concluded the opposite. That is the confound this pair exists to expose; it is still an inference about one photo, not a reading of the setting.`;
+function transcodeVerdict(original: BriefCapture | null, heicSeen: boolean): string {
+  if (original != null && imageFamily(original) === "heic") {
+    return "The one request in this run that names HEIC explicitly — giving the device no reason to convert — received HEIC. That is the library handing over stored bytes, which the camera writes only under High Efficiency. It remains an inference about one photo: a file received from another device would look the same, and this app cannot see the setting itself.";
+  }
+  if (original != null) {
+    return `The request that named HEIC received ${imageFamily(original).toUpperCase()} instead. Two situations produce that and cannot be told apart from here: the library really holds JPEG, or it holds HEIC and converted anyway despite being asked not to. Neither is asserted.`;
   }
   if (heicSeen) {
-    return "HEIC reached this page uncoverted, which the camera writes only under High Efficiency. It remains an inference about the photos seen here: a file received from another device would look the same.";
+    return "HEIC reached this page unconverted, which the camera writes only under High Efficiency. It remains an inference about the photos seen here: a file received from another device would look the same.";
   }
   return "No HEIC arrived. That is consistent with Most Compatible, and equally consistent with High Efficiency plus a transcode on every path tried — the two cannot be told apart from what this run holds, so neither is asserted.";
 }
@@ -194,8 +208,9 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
   const ua = passiveValue(input.passive, "User agent");
   /** Every capture that arrived as a real file rather than as something this app drew. */
   const fileCaptures = [...cameraFiles, ...pickerFiles];
-  const pickPlain = pickerFiles.find((c) => c.slug.includes("library-plain")) ?? null;
   const pickOriginal = pickerFiles.find((c) => c.slug.includes("library-original")) ?? null;
+  /** Files from the ordinary picker paths — the multi-pick trip and the alternate forms. */
+  const pickOrdinary = pickerFiles.filter((c) => !c.slug.includes("library-original"));
 
   items.push({
     section: "0.1",
@@ -212,8 +227,8 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
     status: pickerFiles.length > 0 ? "captured" : "not-run",
     answer:
       pickerFiles.length > 0
-        ? `${pickerFiles.length} file(s) on this path, taken twice on purpose: once with the plain \`accept="image/*"\` an ordinary upload form uses, and once with HEIC named explicitly so the device has no reason to convert. ${pickerFiles.map(describeFile).join(" — ")}. ${transcodeNote(pickPlain, pickOriginal)} The bytes are whatever the library handed over: this app cannot know what happened to them before that and does not guess, and nothing on this path is treated as a fresh photo.`
-        : "The manual stage offers two library picks and neither was completed — skipped, or the stage was not reached. This is the gap that matters most in this run: it is the only path here that shows what an ordinary upload form receives from the photo library, and without it the comparison at the top of this document has evidence for one side only.",
+        ? `${pickerFiles.length} file(s) on this path. One tap names HEIC explicitly, so the device has no reason to convert; the rest arrive down ordinary picker requests, including the single trip that returns several photos at once. ${pickerFiles.map(describeFile).join(" — ")}. ${transcodeNote(pickOrdinary, pickOriginal)} The bytes are whatever the library handed over: this app cannot know what happened to them before that and does not guess, and nothing on this path is treated as a fresh photo.`
+        : "No library pick was completed — skipped, or the stage was not reached. This is the gap that matters most in this run: it is the only path here that shows what an upload form receives from the photo library, and without it the comparison at the top of this document has evidence for one side only.",
     where: pickerFiles.map((c) => c.archivePath).join(", "),
   });
   items.push({
@@ -299,7 +314,7 @@ function captureMatrixItems(input: CorrelationInput): BriefItem[] {
     answer:
       fileCaptures.length === 0
         ? "No file arrived from either the camera app or the library, so there is nothing to infer from."
-        : `Not a readable setting — it is never exposed to a web page — so this stays an inference, and it is reported as one. What this run received: ${heicSeen ? "at least one HEIC/HEIF file" : jpegSeen ? "JPEG only" : "no clearly-typed image file"}. ${transcodeVerdict(pickPlain, pickOriginal, heicSeen)} File types are listed verbatim in the manifest rather than resolved into a setting, because one photo's format is not a device-wide setting and this run cannot see the setting itself.`,
+        : `Not a readable setting — it is never exposed to a web page — so this stays an inference, and it is reported as one. What this run received: ${heicSeen ? "at least one HEIC/HEIF file" : jpegSeen ? "JPEG only" : "no clearly-typed image file"}. ${transcodeVerdict(pickOriginal, heicSeen)} File types are listed verbatim in the manifest rather than resolved into a setting, because one photo's format is not a device-wide setting and this run cannot see the setting itself.`,
     where: "MANIFEST.txt · raw/*.structure.txt",
   });
 

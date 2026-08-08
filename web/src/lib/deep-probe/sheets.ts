@@ -30,6 +30,7 @@ import { formatDuration, type RunCost } from "./run-cost";
 import type { SensorSeries } from "./sensors";
 import { statsText } from "./sensor-stats";
 import { FACING_LABEL as WIDTH_FACING_LABEL, widthProbeText, type WidthProbeReport } from "./width-probe";
+import { FAMILY_LABEL, impossibleText, type ImpossibleAnswer, type ImpossibleReport } from "./impossible-asks";
 
 /** A stage that did not run, and the honest reason. */
 export type StageOmission = { stage: string; reason: string };
@@ -53,6 +54,12 @@ export type RunFacts = {
    * DEFAULT — and merging them would make each one read as the other.
    */
   widthProbe: WidthProbeReport | null;
+  /**
+   * The impossible-asks run, when that mode was chosen. Null otherwise — on a
+   * full run the same answers live inside the matrix instead, because there
+   * they belong to the cameras the sweep was already walking.
+   */
+  impossible: ImpossibleReport | null;
   logs: LogEntry[];
   /** Stages that never ran — named, with the reason, so nothing is quietly partial. */
   omissions: StageOmission[];
@@ -456,6 +463,57 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
           ]),
         },
         { kind: "mono", text: widthProbeText(probe) },
+      ],
+    });
+  }
+
+  const impossibleAnswers: ImpossibleAnswer[] = [...(run.matrix?.impossible ?? []), ...(run.impossible?.answers ?? [])];
+  const impossibleObservations: string[] = [...(run.matrix?.impossibleObservations ?? []), ...(run.impossible?.observations ?? [])];
+  if (impossibleAnswers.length > 0) {
+    const refused = impossibleAnswers.filter((answer) => answer.outcome === "refused").length;
+    const granted = impossibleAnswers.filter((answer) => answer.outcome === "granted").length;
+    const rejectedValue = impossibleAnswers.filter((answer) => answer.outcome === "rejected-value").length;
+    sections.push({
+      id: "impossible",
+      title: "The impossible asks",
+      blurb:
+        "Requests designed to be unanswerable, and how this platform turned them down. Succeeding is easy to imitate; refusing correctly — the right error, naming the right setting, in the right time, identically every time — is not. A refusal here is the informative answer, not a failure, and no photograph is taken anywhere in this stage.",
+      blocks: [
+        {
+          kind: "rows",
+          rows: [
+            { label: "Impossible asks sent", value: String(impossibleAnswers.length) },
+            { label: "Refused — the platform stated a limit", value: String(refused), tone: "ok" },
+            { label: "Granted — the platform agreed to it", value: String(granted), tone: granted > 0 ? "warn" : "muted" },
+            { label: "Value thrown out before any camera saw it", value: String(rejectedValue), tone: "muted" },
+            { label: "Timed out — not a refusal", value: String(impossibleAnswers.filter((answer) => answer.outcome === "timed-out").length), tone: "muted" },
+            { label: "Places the answers disagree with each other", value: String(impossibleObservations.length), tone: impossibleObservations.length > 0 ? "warn" : "ok" },
+          ],
+        },
+        {
+          kind: "table",
+          head: ["Camera", "Family", "Asked", "Outcome", "Error", "Blamed", "ms"],
+          rows: impossibleAnswers.map((answer) => [
+            answer.deviceLabel,
+            FAMILY_LABEL[answer.family],
+            answer.asked,
+            answer.outcome,
+            answer.errorName ?? (answer.granted ?? "—"),
+            answer.blamedConstraint ?? "—",
+            String(answer.durationMs),
+          ]),
+        },
+        impossibleObservations.length > 0
+          ? {
+              kind: "table",
+              head: ["Where the answers disagree with each other"],
+              rows: impossibleObservations.map((observation) => [observation]),
+            }
+          : {
+              kind: "prose",
+              text: "Nothing in this round contradicted anything else in it: every refusal was consistent with every other refusal, and no published limit was exceeded. That is an observation about what was seen, not a pass mark.",
+            },
+        { kind: "mono", text: impossibleText(impossibleAnswers, impossibleObservations, run.impossible?.notes ?? []) },
       ],
     });
   }
@@ -944,6 +1002,7 @@ export function buildSheets(run: RunFacts, facts: CaptureFacts[]): SheetSet {
       permissions: run.permissions,
       sensors: run.sensors,
       matrix: run.matrix,
+      impossible: run.impossible?.answers ?? [],
       captures: facts.map((f) => f.spec),
       omissions: run.omissions,
       briefChecklist: checklist,

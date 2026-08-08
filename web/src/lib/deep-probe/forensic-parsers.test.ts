@@ -408,7 +408,11 @@ const ORIGINAL_PICK: Partial<BriefCapture> = {
 describe("library pick shots", () => {
   it("leads the manual stage, because it needs no camera and closes the one gap nothing else can", () => {
     const list = buildManualShotList();
-    expect(list.slice(0, 2).map((s) => s.id)).toEqual(["library-plain", "library-original"]);
+    expect(list[0].id).toBe("library-original");
+    // One library tap now, not two. The plain image/* half is exactly what the
+    // multi-pick trip sends five photos down, so asking for it by hand again
+    // spent a tap on an answer the run already holds.
+    expect(LIBRARY_PICK_SHOTS).toHaveLength(1);
     // One camera-app shot up front, not two. The second cannot be built until
     // the first file has been read, because which side it asks for is decided
     // by what the first one turned out to be.
@@ -445,11 +449,13 @@ describe("library pick shots", () => {
     expect(namedCameraShot("environment", "x").purpose).toContain("that IS the finding");
   });
 
-  it("differs only in the accept attribute — that difference is the whole measurement", () => {
-    const [plain, original] = LIBRARY_PICK_SHOTS;
-    expect(plain.accept).toBe("image/*");
+  it("keeps the half that names the original format, because that is the revealing one", () => {
+    const [original] = LIBRARY_PICK_SHOTS;
+    expect(original.id).toBe("library-original");
     expect(original.accept).toMatch(/heic/i);
-    expect(plain.engine).toBe(original.engine);
+    expect(original.engine).toBe("system-picker");
+    // The pick states what it is and what it cannot be, in the same breath.
+    expect(original.purpose).toContain("filed as a library pick");
   });
 
   it("reads as captured once a pick lands, and names what arrived", () => {
@@ -466,19 +472,20 @@ describe("library pick shots", () => {
     expect(item?.answer).toMatch(/evidence for one side only/);
   });
 
-  it("calls a format change between the two picks a conversion, and a match no conversion", () => {
-    const converted = briefItems(correlationInput({ captures: [pick(), pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.2");
-    expect(converted?.answer).toMatch(/conversion performed by the browser/);
-
-    const matched = briefItems(
-      correlationInput({ captures: [pick(), pick({ ...ORIGINAL_PICK, fileName: "IMG_0001.JPG", mime: "image/jpeg" })] })
-    ).find((i) => i.section === "0.2");
-    expect(matched?.answer).toMatch(/nothing converted on the way in/);
+  it("names what the HEIC-asking request received, and refuses to read the rest as a control", () => {
+    const item = briefItems(correlationInput({ captures: [pick(), pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.2");
+    expect(item?.answer).toMatch(/The request that named HEIC received HEIC/);
+    // The other picker files come from a trip that asks for photos which are
+    // DIFFERENT from each other, so a format difference between them and the
+    // named-HEIC file is not evidence of a conversion and is not read as one.
+    expect(item?.answer).toMatch(/SAMPLE, not a control/);
+    expect(item?.answer).toMatch(/two differently-stored photos just as easily as a conversion/);
   });
 
-  it("refuses to compare a pair when only one pick completed", () => {
+  it("says plainly when the request that names HEIC never happened", () => {
     const item = briefItems(correlationInput({ captures: [pick()] })).find((i) => i.section === "0.2");
-    expect(item?.answer).toMatch(/cannot be read against each other/);
+    expect(item?.answer).toMatch(/did not complete/);
+    expect(item?.answer).toMatch(/no conversion claim is made either way/);
   });
 
   it("keeps the untouched reference not-obtainable even with the closest approximation in hand", () => {
@@ -490,8 +497,14 @@ describe("library pick shots", () => {
   it("never resolves the Photos setting into a reading, however strong the evidence", () => {
     const withProof = briefItems(correlationInput({ captures: [pick(), pick(ORIGINAL_PICK)] })).find((i) => i.section === "0.9");
     expect(withProof?.status).toBe("partial");
-    expect(withProof?.answer).toMatch(/caught in the act/);
-    expect(withProof?.answer).toMatch(/not a reading of the setting/);
+    expect(withProof?.answer).toMatch(/giving the device no reason to convert/);
+    expect(withProof?.answer).toMatch(/remains an inference about one photo/);
+    expect(withProof?.answer).toMatch(/cannot see the setting itself/);
+
+    // Asked for HEIC and given something else: two situations produce that and
+    // this run cannot tell them apart, so it asserts neither.
+    const converted = briefItems(correlationInput({ captures: [pick({ ...ORIGINAL_PICK, fileName: "IMG_0001.JPG", mime: "image/jpeg" })] })).find((i) => i.section === "0.9");
+    expect(converted?.answer).toMatch(/Neither is asserted/);
 
     const noHeic = briefItems(correlationInput({ captures: [pick()] })).find((i) => i.section === "0.9");
     expect(noHeic?.answer).toMatch(/neither is asserted/);

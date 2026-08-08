@@ -41,6 +41,8 @@ function report(overrides: Partial<WidthProbeReport> = {}): WidthProbeReport {
     durationMs: 60_000,
     width: PROBE_WIDTH,
     rows: [row(), row({ facing: "user", grantedWidth: 480, grantedHeight: 640, verdict: "different", trackLabel: "Front Camera" })],
+    impossible: [],
+    impossibleObservations: [],
     aborted: false,
     devicesBefore: [],
     devicesAfter: [],

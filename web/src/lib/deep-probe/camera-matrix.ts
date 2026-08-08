@@ -22,11 +22,20 @@
  *
  * Stills are taken at a declared subset of steps, and the report says exactly
  * which — implying a photo exists for every row would be a lie by omission.
+ * That subset is now TWO photographs per camera and no more: the native
+ * maximum down the browser's own photo pipeline, and the smallest rung down the
+ * path this app encodes. Everything else is still asked for and still recorded;
+ * it simply no longer produces a picture, and every such row says so.
+ *
+ * The time that buys is spent on the impossible round — see `impossible-asks.ts`
+ * — which asks each camera for things it cannot do. Succeeding is easy to
+ * imitate; refusing correctly is not.
  */
 
 import type { PackOrigin } from "../evidence-pack";
 import { type CameraDeviceInfo, classifyCameraLabel } from "../device-camera";
 import { CAMERA_DEADLINE_POLICY, CAMERA_OPEN_TIMEOUT_MS, isCameraTimeout, openMediaWithDeadline, withCameraDeadline, type LateArrival } from "./camera-timeout";
+import { impossibleAsksFor, impossibleObservations, impossibleText, runImpossibleRound, type ImpossibleAnswer, type ImpossibleTarget } from "./impossible-asks";
 import { drawVideoStill, heldBytesCeiling, readPixelSize, releaseScratchCanvas } from "./capture-memory";
 import { CONSOLIDATION_POLICY, createShapeLedger, shapeScope, type ShapeGroup } from "./capture-signature";
 import { readMemoryHints } from "./hex-budget";
@@ -118,6 +127,16 @@ export type MatrixRow = {
     taken: boolean;
     notTakenKind?: "already-photographed" | "native-max-canvas";
   }[];
+  /**
+   * Why no photograph was taken at this step, on the rows where the two-per-
+   * camera policy is the reason.
+   *
+   * Set on every row that was never going to produce a picture, so a reader
+   * never has to deduce it from an empty capture list. It is a statement about
+   * this app's policy, never about the camera: the request on the row ran in
+   * full and its granted settings are complete.
+   */
+  stillNote?: string;
 };
 
 /**
@@ -168,7 +187,8 @@ export type CameraSurfaceRecord = {
 export type UntriedStep = {
   deviceId: string;
   deviceLabel: string;
-  kind: MatrixRow["kind"];
+  /** `impossible` covers the impossible round, whose answers are not matrix rows. */
+  kind: MatrixRow["kind"] | "impossible";
   asked: string;
   reason: string;
 };
@@ -189,6 +209,14 @@ export type CameraMatrixReport = {
   perCameraBudgetMs: number | null;
   /** Steps at which a still was deliberately taken. */
   stillPolicy: string;
+  /**
+   * The impossible round: every ask designed to be unanswerable, and what came
+   * back. Kept apart from `rows` because these are not measurements of a
+   * camera's range — they are measurements of how it refuses.
+   */
+  impossible: ImpossibleAnswer[];
+  /** Places where those answers disagree with each other. Observations, never verdicts. */
+  impossibleObservations: string[];
   notes: string[];
   /** True when the user stopped the sweep before it finished. */
   aborted: boolean;
@@ -263,7 +291,11 @@ const ASPECTS: { ratio: number; name: string }[] = [
 const FRAME_RATES: number[] = [15, 30, 60, 120];
 
 const STILL_POLICY =
-  "A still was ATTEMPTED at the native maximum, and at every resolution rung and aspect ratio whose GRANTED size this camera had not been photographed at yet on that path. That second rule is most of the policy: a resolution rung and an aspect ratio that are both answered with 1920×1080 are one photograph and not two, and the second is not taken at all rather than taken and then dropped on arrival. At the native maximum only the browser's own photo pipeline runs — a canvas frame at that size is several megabytes THIS APP encoded from the video track rather than anything the camera produced, and the canvas path is exercised at every smaller rung anyway. Portrait, frame-rate and control-mode steps attempt none: they change how the track behaves, not what a photo of it looks like. A still that WAS taken is only kept when its byte shape is new for that camera and that path; one repeating a shape already held is recorded on its row and dropped. So an empty capture list on a row means one of three stated things — no still was attempted there, the granted size had already been photographed on that path, or the file repeated a shape already held — and never that the camera failed.";
+  "TWO photographs per camera, and no more. One at the native maximum down the browser's own photo pipeline, and one at the smallest resolution rung that camera accepts, down the path THIS APP encodes from the video track. Those two are opposites — one may carry platform metadata and quantisation tables the camera itself wrote, the other carries none by construction — which is the entire reason for having both, and is also why a third and fourth photograph of the same scene at a different size add nothing. Every other step in the sweep is still ASKED and still recorded in full: what was requested, what came back, how long it took and whether they match. It simply does not produce a picture, and each of those rows says so in its own words rather than leaving an empty list to be interpreted. A still that WAS taken is kept only when its byte shape is new for that camera and that path; one repeating a shape already held is recorded on its row and dropped. So an empty capture list on a row means one of three stated things — no photograph was ever going to be taken there, the granted size had already been photographed on that path, or the file repeated a shape already held — and never that the camera failed. The time this saves is spent on the impossible round instead, which is the part of a camera's behaviour that is hardest to imitate.";
+
+/** Said on every row that was never going to produce a photograph. */
+const NO_STILL_PREFIX =
+  "No photograph was taken at this step. Each camera in this run is photographed exactly twice — its native maximum down the browser's own photo pipeline, and its smallest rung down the path this app encodes — and this step is neither of those.";
 
 type PhotoCaps = { imageWidth?: { max?: number }; imageHeight?: { max?: number } };
 type ImageCaptureLike = {
@@ -449,18 +481,23 @@ async function platformStill(track: MediaStreamTrack): Promise<{ blob: Blob; wid
   }
 }
 
+/**
+ * Which of the two photographs this step is responsible for, if either.
+ *
+ * `platform-native-max` is the browser's own photo pipeline at the camera's
+ * ceiling. `canvas-small` is a frame this app encodes at the smallest rung the
+ * camera accepts. `none` is every other step in the sweep, and carries the
+ * sentence that will be written onto its row.
+ */
+export type StepStill = "platform-native-max" | "canvas-small" | "none";
+
 export type StepPlan = {
   kind: MatrixRow["kind"];
   asked: string;
   constraints: MediaTrackConstraints;
-  takeStills: boolean;
-  /**
-   * Set on the native-maximum step only. A canvas re-encode of a 4K frame is a
-   * several-megabyte file this app made rather than anything the camera did,
-   * and the same path is exercised at every smaller rung, so the biggest step
-   * takes the platform photo and nothing else.
-   */
-  platformOnly?: boolean;
+  still: StepStill;
+  /** Why this step takes no photograph. Always set when `still` is `none`. */
+  stillNote?: string;
 };
 
 /** What one camera says its own limits are, read off the track it opened first. */
@@ -506,8 +543,7 @@ export function nativeMaxStep(deviceId: string): StepPlan {
     kind: "native-max",
     asked: "native maximum (8K ideal, no other constraint)",
     constraints: { deviceId: { exact: deviceId }, width: { ideal: 7680 }, height: { ideal: 4320 } } as MediaTrackConstraints,
-    takeStills: true,
-    platformOnly: true,
+    still: "platform-native-max",
   };
 }
 
@@ -551,7 +587,14 @@ export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: Step
     );
   }
 
+  // The one canvas frame this camera contributes is taken at the SMALLEST rung
+  // it accepts. Small on purpose: the file is one this app encoded rather than
+  // anything the camera wrote, so its value is as a specimen of this browser's
+  // encoder, and a specimen does not need to be four megabytes.
+  const smallest = within.length > 0 ? within[within.length - 1] : null;
+
   for (const rung of overAsk ? [overAsk, ...within] : within) {
+    const isCanvasRung = rung === smallest;
     steps.push({
       kind: "resolution",
       asked:
@@ -559,7 +602,10 @@ export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: Step
           ? `${rung.name} landscape — exactly ${rung.w}×${rung.h} (one rung above the ceiling this camera advertised: does it clamp or refuse?)`
           : `${rung.name} landscape — exactly ${rung.w}×${rung.h}`,
       constraints: { ...pin, width: { exact: rung.w }, height: { exact: rung.h } },
-      takeStills: true,
+      still: isCanvasRung ? "canvas-small" : "none",
+      stillNote: isCanvasRung
+        ? undefined
+        : `${NO_STILL_PREFIX} It is a measurement of what this camera granted, not a picture of it: the request ran in full and the granted settings on this row are complete.`,
     });
   }
 
@@ -574,7 +620,8 @@ export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: Step
       kind: "resolution",
       asked: `${portrait.name} portrait — exactly ${portrait.h}×${portrait.w} (the one portrait ask)`,
       constraints: { ...pin, width: { exact: portrait.h }, height: { exact: portrait.w } },
-      takeStills: false,
+      still: "none",
+      stillNote: `${NO_STILL_PREFIX} A portrait ask turns the track on its side; it does not change the pipeline that would photograph it, which the two photographs already show.`,
     });
   }
 
@@ -590,7 +637,8 @@ export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: Step
       kind: "aspect-ratio",
       asked: `aspect ratio ${aspect.name} (exact ${Math.round(aspect.ratio * 10000) / 10000})`,
       constraints: { ...pin, aspectRatio: { exact: Math.round(aspect.ratio * 10000) / 10000 } },
-      takeStills: true,
+      still: "none",
+      stillNote: `${NO_STILL_PREFIX} A ratio ask is answered by the size the track reports back, which is on this row; photographing it would produce the same encoder's output at a different crop.`,
     });
   }
 
@@ -609,7 +657,8 @@ export function planFor(deviceId: string, ceiling: CameraCeiling): { steps: Step
       kind: "frame-rate",
       asked: fps === fpsOverAsk ? `exactly ${fps} fps (above the rate this camera advertised)` : `exactly ${fps} fps`,
       constraints: { ...pin, frameRate: { exact: fps } },
-      takeStills: false,
+      still: "none",
+      stillNote: `${NO_STILL_PREFIX} A frame rate changes how the track behaves over time, not what a single photograph of it looks like.`,
     });
   }
 
@@ -793,6 +842,11 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
   const ledger = createShapeLedger();
   let stillsTaken = 0;
 
+  // The impossible round's answers, and the ids of the asks that are the same
+  // question on every camera and so are only sent once in the whole run.
+  const impossible: ImpossibleAnswer[] = [];
+  const impossibleSeen = new Set<string>();
+
   // Sizes already photographed, keyed by camera, path and granted size. This is
   // the cheaper half of the same idea as the ledger: the ledger compares bytes
   // AFTER a photograph has been taken, and this stops the photograph being
@@ -870,6 +924,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         slowestStep: null,
         perCameraBudgetMs: null,
         stillPolicy: STILL_POLICY,
+        impossible: [],
+        impossibleObservations: [],
         notes,
         aborted,
         stillsStoppedForMemory: null,
@@ -948,6 +1004,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     let cameraSteps = 0;
     let cameraUntried = 0;
     let hitBudget = false;
+    let impossibleDone = false;
     const outOfTime = (): boolean => perCameraBudgetMs != null && performance.now() - cameraStart >= perCameraBudgetMs;
 
     /**
@@ -955,7 +1012,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
      * these are not refusals, not limits the camera stated and not timeouts,
      * and they are kept out of `rows` so no count of refusals can pick them up.
      */
-    const leaveUntried = (steps: { kind: MatrixRow["kind"]; asked: string }[], reason: string): void => {
+    const leaveUntried = (steps: { kind: UntriedStep["kind"]; asked: string }[], reason: string): void => {
       for (const step of steps) {
         untried.push({ deviceId: device.deviceId, deviceLabel: name, kind: step.kind, asked: step.asked, reason });
         cameraUntried += 1;
@@ -973,6 +1030,13 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     let plan: StepPlan[] = [nativeMaxStep(device.deviceId)];
     let planned = false;
     let controlEstimate = 0;
+    let impossibleEstimate = 0;
+    const impossibleTarget = (): ImpossibleTarget => ({
+      deviceId: device.deviceId,
+      facingMode: device.facing === "front" ? "user" : device.facing === "back" ? "environment" : null,
+      label: name,
+      capabilities,
+    });
     const extendPlan = (): void => {
       if (planned) return;
       planned = true;
@@ -982,7 +1046,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       // Leaving those out was why the bar used to fill up and then sit at the
       // end through roughly a third of every camera.
       controlEstimate = controlStepsFor(capabilities, torchFiredOn == null).length;
-      knownSteps += 1 + built.steps.length + controlEstimate;
+      impossibleEstimate = impossibleAsksFor(impossibleTarget(), "full").length;
+      knownSteps += 1 + built.steps.length + controlEstimate + impossibleEstimate;
       plannedCameras += 1;
       for (const note of built.notes) notes.push(`${name}: ${note}`);
       if (!capabilities) {
@@ -1058,13 +1123,16 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         return key ? photographedSizes.get(key) ?? null : null;
       };
 
-      if (step.takeStills && track && stillsAllowed()) {
-        const priorPlatform = alreadyShot("image-capture");
-        const priorCanvas = step.platformOnly ? null : alreadyShot("canvas");
+      if (step.still !== "none" && track && stillsAllowed()) {
+        const priorPlatform = step.still === "platform-native-max" ? alreadyShot("image-capture") : null;
+        const priorCanvas = step.still === "canvas-small" ? alreadyShot("canvas") : null;
         const video = await attachVideo(stream);
         if (video) videoDims = { width: video.videoWidth, height: video.videoHeight };
 
-        if (priorPlatform != null) {
+        if (step.still !== "platform-native-max") {
+          // Nothing to say here: the platform photograph belongs to the native
+          // maximum, which is a different row on this same camera.
+        } else if (priorPlatform != null) {
           stepRow.duplicates.push({
             path: "image-capture",
             sameAsSlug: priorPlatform,
@@ -1101,14 +1169,14 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
           }
         }
 
-        if (step.platformOnly) {
+        if (step.still === "platform-native-max") {
           stepRow.duplicates.push({
             path: "canvas",
             sameAsSlug: "",
             shapeId: "(no file — none was taken)",
             taken: false,
             notTakenKind: "native-max-canvas",
-            reason: `No canvas frame was encoded at the native maximum, and no earlier file holds this size either — nothing in this run was ever encoded at it. At this size that file is several megabytes THIS APP would have produced from the video track rather than anything the camera made, and the canvas path is exercised at every smaller rung below, where the same pipeline is visible for a fraction of the memory.`,
+            reason: `No canvas frame was encoded at the native maximum, and no earlier file holds this size either — nothing in this run was ever encoded at it. At this size that file is several megabytes THIS APP would have produced from the video track rather than anything the camera made, and the one canvas frame this camera contributes is taken at its smallest rung instead, where the same encoder is visible for a fraction of the memory.`,
           });
         } else if (priorCanvas != null) {
           stepRow.duplicates.push({
@@ -1148,7 +1216,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
           }
         }
         if (video) detachVideo(video);
-      } else if (step.takeStills && track) {
+      } else if ((step.still !== "none" || step.kind === "native-max") && track) {
         // Read the video dimensions anyway: it is the one reading that costs no
         // memory, and losing it would make the row less complete than it needs
         // to be just because the photograph was skipped.
@@ -1173,6 +1241,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         durationMs: Math.round(performance.now() - stepStart),
         captureSlugs: stepRow.captureSlugs,
         duplicates: stepRow.duplicates,
+        stillNote: step.stillNote,
       });
 
       // Read the verbatim JS surface once per camera, on the track that is
@@ -1186,6 +1255,43 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       }
       stop(stream);
       stepTimer.recordLabelled(`${name} — ${step.asked}`, performance.now() - stepStart);
+
+      // The impossible round runs HERE, immediately after the camera has
+      // stated its own limits and before the ladder — first because "beyond
+      // the limit it just published" needs that reading to mean anything, and
+      // second because a camera that runs out of its share of the run's time
+      // should lose the near-identical size rows rather than the round that is
+      // hardest to imitate.
+      if (step.kind === "native-max" && !impossibleDone) {
+        impossibleDone = true;
+        extendPlan();
+        const answers = await runImpossibleRound(impossibleTarget(), {
+          scope: "full",
+          askedOnce: impossibleSeen,
+          shouldAbort: options.shouldAbort,
+          waitWhilePaused: options.waitWhilePaused,
+          outOfTime,
+          onLate: noteLate,
+          onNote: (note) => notes.push(note),
+          onUntried: (asks, reason) => {
+            hitBudget = hitBudget || outOfTime();
+            leaveUntried(
+              asks.map((ask) => ({ kind: "impossible" as const, asked: ask.asked })),
+              reason
+            );
+          },
+          onProgress: (message) => {
+            done += 1;
+            cameraSteps += 1;
+            report(message);
+          },
+        });
+        impossible.push(...answers);
+        if (options.shouldAbort()) {
+          aborted = true;
+          break;
+        }
+      }
     }
 
     if (aborted) {
@@ -1385,6 +1491,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       slowestStep: stepTimer.slowest(),
       perCameraBudgetMs,
       stillPolicy: STILL_POLICY,
+      impossible,
+      impossibleObservations: impossibleObservations(impossible),
       notes,
       aborted,
       stillsStoppedForMemory,
@@ -1465,6 +1573,7 @@ export function matrixText(report: CameraMatrixReport): string {
         row.ok ? `             got: ${row.granted}` : `             ${row.error}`
       );
       if (row.captureSlugs.length > 0) lines.push(`             stills: ${row.captureSlugs.join(", ")}`);
+      if (row.stillNote) lines.push(...wrap(row.stillNote, 62).map((line) => `             ${line}`));
       for (const duplicate of row.duplicates) {
         if (duplicate.taken) {
           lines.push(`             repeat: a ${duplicate.path} still was taken here and matched ${duplicate.sameAsSlug} exactly (shape ${duplicate.shapeId}), so it was not kept.`);
@@ -1568,6 +1677,10 @@ export function matrixText(report: CameraMatrixReport): string {
         "  run, leaving every other camera unmeasured."
       );
     }
+  }
+
+  if (report.impossible.length > 0) {
+    lines.push("", "", impossibleText(report.impossible, report.impossibleObservations));
   }
 
   if (report.notes.length > 0) {

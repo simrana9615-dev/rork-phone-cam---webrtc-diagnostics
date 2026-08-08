@@ -37,6 +37,7 @@ import { checksumsText, permissionLedgerText, sensorsText, stamp, VERIFY_HOW_TO,
 import { hexDumpBlob, structureText } from "./raw-bytes";
 import { TIER_INFO } from "./permissions";
 import { widthProbeText } from "./width-probe";
+import { impossibleText } from "./impossible-asks";
 
 export type { StageOmission } from "./sheets";
 
@@ -383,6 +384,30 @@ export async function buildRawPack(input: RawPackInput, facts: CaptureFacts[], s
     entries.push({
       path: "camera/width-640.json",
       data: JSON.stringify({ kind: "deep-probe-width-only", version: 1, ...input.widthProbe }, null, 2),
+      compress: true,
+    });
+  }
+
+  // The impossible round gets its own pair of files wherever it ran. It is not
+  // a measurement of what a camera CAN do, so filing it inside the matrix would
+  // put refusals-by-design in the same column as limits the hardware stated.
+  const impossibleAnswers = [...(input.matrix?.impossible ?? []), ...(input.widthProbe?.impossible ?? []), ...(input.impossible?.answers ?? [])];
+  const impossibleSeen = [...(input.matrix?.impossibleObservations ?? []), ...(input.widthProbe?.impossibleObservations ?? []), ...(input.impossible?.observations ?? [])];
+  if (impossibleAnswers.length > 0) {
+    entries.push({ path: "camera/impossible-asks.txt", data: impossibleText(impossibleAnswers, impossibleSeen, input.impossible?.notes ?? []), compress: true });
+    entries.push({
+      path: "camera/impossible-asks.json",
+      data: JSON.stringify(
+        {
+          kind: "deep-probe-impossible-asks",
+          version: 1,
+          note: "Requests designed to be unanswerable, and how this platform turned them down. A refusal here is the informative answer, not a failure: the error name, the constraint the platform blamed and the time it took are three separate things that all have to be right. No photograph was taken anywhere in this stage.",
+          answers: impossibleAnswers,
+          observations: impossibleSeen,
+        },
+        null,
+        2
+      ),
       compress: true,
     });
   }

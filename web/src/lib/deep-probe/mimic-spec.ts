@@ -32,6 +32,7 @@
 
 import type { PackOrigin } from "../evidence-pack";
 import type { CameraMatrixReport, MatrixRow } from "./camera-matrix";
+import type { ImpossibleAnswer } from "./impossible-asks";
 import type { PassiveGroup } from "./passive";
 import type { PermissionRecord, PermissionTier } from "./permissions";
 import type { StageOmission } from "./sheets";
@@ -97,6 +98,13 @@ export type MimicSpecInput = {
   permissions: PermissionRecord[];
   sensors: SensorSeries[];
   matrix: CameraMatrixReport | null;
+  /**
+   * Impossible-ask answers from a run that had no sweep around them. On a full
+   * run the same answers arrive inside `matrix` instead; both are folded into
+   * one section, because how a platform refuses does not change with the mode
+   * that asked.
+   */
+  impossible?: ImpossibleAnswer[];
   captures: MimicCaptureFact[];
   omissions: StageOmission[];
   /**
@@ -417,6 +425,82 @@ function uniq(values: string[]): string[] {
   return Array.from(new Set(values));
 }
 
+/**
+ * The impossible round, reduced to facts something imitating this device would
+ * have to reproduce.
+ *
+ * Every ask gets its own line, keyed by the ask rather than by the camera,
+ * because the answer is a property of the platform. Three things go into each
+ * value and all three matter: WHAT happened, WHICH setting the platform blamed,
+ * and roughly HOW LONG it took. A forgery that returns the right error at the
+ * wrong speed, or blames the wrong constraint, is caught by this section and by
+ * nothing else in the file.
+ *
+ * Timings are bucketed rather than quoted to the millisecond. A single reading
+ * is not a stable figure — it moves with load, thermal state and what else the
+ * phone is doing — and pinning a number that varies is exactly the mistake this
+ * file's stability marks exist to prevent.
+ */
+function impossibleFacts(answers: ImpossibleAnswer[]): SpecFact[] {
+  const facts: SpecFact[] = [];
+  const byAsk = new Map<string, ImpossibleAnswer[]>();
+  for (const answer of answers) {
+    const list = byAsk.get(answer.askId);
+    if (list) list.push(answer);
+    else byAsk.set(answer.askId, [answer]);
+  }
+
+  const band = (ms: number): string => (ms < 5 ? "under 5ms" : ms < 50 ? "5-50ms" : ms < 250 ? "50-250ms" : ms < 1000 ? "0.25-1s" : ms < 3000 ? "1-3s" : "over 3s");
+
+  for (const [askId, list] of byAsk) {
+    const shapes = uniq(
+      list.map((answer) => {
+        const blame = answer.blamedConstraint ? ` blaming ${answer.blamedConstraint}` : " naming no constraint";
+        const detail = answer.outcome === "granted" ? ` -> ${answer.granted ?? "no settings reported"}` : `${answer.errorName ? ` ${answer.errorName}` : ""}${blame}`;
+        return `${answer.outcome}${detail} in ${band(answer.durationMs)}`;
+      })
+    );
+    facts.push({
+      key: `refuses.${askId}`,
+      value: shapes.join(" · "),
+      stability: "OS",
+    });
+  }
+
+  const granted = answers.filter((answer) => answer.outcome === "granted");
+  facts.push({
+    key: "refuses.agreedToTheImpossible",
+    value: granted.length === 0 ? "nothing impossible was granted — every one of these asks was turned down or thrown out" : uniq(granted.map((answer) => answer.askId)).join(" · "),
+    stability: "OS",
+  });
+
+  const errorWords = uniq(answers.map((answer) => answer.errorName).filter((name): name is string => name != null));
+  facts.push({
+    key: "refuses.errorNames",
+    value: errorWords.length > 0 ? errorWords.join(" · ") : "no error name was produced anywhere in the round",
+    stability: "OS",
+  });
+
+  const blamed = uniq(answers.map((answer) => answer.blamedConstraint).filter((name): name is string => name != null));
+  facts.push({
+    key: "refuses.blamedConstraints",
+    value: blamed.length > 0 ? blamed.join(" · ") : "this platform never named the setting it objected to — an absence to reproduce, not a gap in the reading",
+    stability: "OS",
+  });
+
+  // The exact wording of a refusal is one of the least imitated things there
+  // is: engines phrase these differently and the phrasing is stable per
+  // version. Kept verbatim, and capped so the section stays readable.
+  const messages = uniq(answers.map((answer) => answer.errorMessage).filter((message): message is string => message != null && message.length > 0));
+  facts.push({
+    key: "refuses.wording",
+    value: messages.length > 0 ? messages.slice(0, 8).map((message) => `"${message}"`).join(" · ") + (messages.length > 8 ? ` · (+${messages.length - 8} more in the impossible-asks record)` : "") : "no refusal carried a message",
+    stability: "OS",
+  });
+
+  return facts;
+}
+
 function cameraFacts(matrix: CameraMatrixReport): SpecFact[] {
   const facts: SpecFact[] = [];
   const byDevice = new Map<string, MatrixRow[]>();
@@ -680,6 +764,16 @@ function buildSections(input: MimicSpecInput): BuiltSpec {
       title: "Cameras",
       note: "The capability envelope as the platform actually granted it, including where it silently substituted a different mode.",
       facts: cameraFacts(input.matrix),
+    });
+  }
+
+  const impossible = [...(input.matrix?.impossible ?? []), ...(input.impossible ?? [])];
+  if (impossible.length > 0) {
+    sections.push({
+      title: "How this platform refuses",
+      note:
+        "The awkward answers, not the tidy ones. Reproducing a camera that succeeds is easy; reproducing one that turns down the impossible with the RIGHT error, naming the RIGHT setting, in the right order of milliseconds, identically on every attempt, is the hard part — so it is here, in full.",
+      facts: impossibleFacts(impossible),
     });
   }
 

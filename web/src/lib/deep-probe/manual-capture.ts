@@ -27,21 +27,19 @@
  * answer, so the next one is offered. The way to leave the stage entirely is the
  * skip control, which drops the whole shot rather than moving to the next route.
  *
- * The stage also takes two LIBRARY picks, which are the opposite kind of
- * evidence and are filed as such. A pick cannot promise a fresh photo, so it is
- * never offered as one — but it is the only way to see what an ordinary upload
- * form receives from the photo library, and the brief's central comparison
- * (canvas path = no EXIF, file path = the full tag set) has no second half
- * without it.
+ * The stage also takes ONE library pick, which is the opposite kind of evidence
+ * and is filed as such. A pick cannot promise a fresh photo, so it is never
+ * offered as one — but it is the only way to see what an ordinary upload form
+ * receives from the photo library, and the brief's central comparison (canvas
+ * path = no EXIF, file path = the full tag set) has no second half without it.
  *
- * The two picks differ only in their `accept` attribute, and that difference is
- * the measurement. iOS transcodes HEIC to JPEG for an input that asks for
- * `image/*`, and hands over the stored bytes to one that names HEIC explicitly.
- * Asking twice for the same photo shows whether this device does that, which is
- * the only direct evidence available for the Photos storage setting — and it
- * separates "the library holds JPEG" from "the library holds HEIC and the
- * browser converted it on the way in", two situations that look identical from
- * a single upload.
+ * WHY ONE PICK AND NOT TWO. The pair used to differ only in its `accept`
+ * attribute: an ordinary `image/*` upload, then the same photo again with HEIC
+ * named explicitly. The second is the revealing half — it is the request that
+ * gives a phone no reason to convert — and it is the one kept. The plain
+ * `image/*` half is now covered by the multi-pick trip, which sends five photos
+ * down an ordinary picker in a single tap, so asking for a sixth by hand was
+ * spending one of your taps on an answer already in the archive.
  */
 
 import { CaptureCancelledError, capacitorCapturePhoto, inputAcceptAttr, inputCaptureAttr, type CaptureEngine } from "../capture-engine";
@@ -266,22 +264,14 @@ export async function runManualShot(spec: ManualShotSpec, onRoute?: (engine: Cap
 }
 
 /**
- * The two library picks. Same request, different `accept` — the first is what
- * an ordinary upload form asks for, the second names HEIC so the device has no
- * reason to convert. Picking the same photo twice is what makes the pair
- * readable, so the wording asks for exactly that.
+ * The one library pick: the request that names HEIC, so the phone has no reason
+ * to convert on the way in.
+ *
+ * This is the revealing half of what used to be a pair. The plain `image/*`
+ * half is exactly what the multi-pick trip sends, five photos at a time, so it
+ * is already answered elsewhere in the run and no longer costs a separate tap.
  */
 export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
-  {
-    id: "library-plain",
-    engine: "system-picker",
-    routes: ["system-picker"],
-    facing: null,
-    source: "library",
-    accept: "image/*",
-    purpose:
-      "Pick any existing photo from your library — one taken by this phone's camera app, ideally a recent one. This is the plain upload path every website uses, and unlike the sweep's frames the file arrives with whatever metadata the camera originally wrote. Nothing about it is treated as a fresh photo: it is filed as a library pick, because that is all it can be.",
-  },
   {
     id: "library-original",
     engine: "system-picker",
@@ -290,7 +280,9 @@ export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
     source: "library",
     accept: "image/*,image/heic,image/heif,.heic,.heif",
     purpose:
-      "Now pick the SAME photo again. The only difference is that this request names HEIC, so the phone has no reason to convert it on the way in. If the first file came back JPEG and this one comes back HEIC, you have just watched the browser transcode your photo — which is the one honest way to tell whether the library really holds JPEG or holds HEIC and hides it from ordinary upload forms.",
+      "Pick an existing photo from your library — one this phone's own camera app took, ideally a recent one. Unlike every frame the sweep produced, this file arrives with whatever metadata the camera originally wrote. " +
+      "This request names HEIC explicitly, which is the point of it: the phone has no reason to convert, so what comes back is what the library actually holds. If it hands over HEIC here while ordinary upload forms receive JPEG, you have just caught the browser transcoding your photos — the one honest way to separate \"the library holds JPEG\" from \"the library holds HEIC and hides it\". " +
+      "Nothing about it is treated as a fresh photo: it is filed as a library pick, because that is all it can be.",
   },
 ];
 
@@ -347,7 +339,8 @@ export function namedCameraShot(facing: "user" | "environment", becauseUnnamedGa
  * `namedCameraShot`, which the run calls once the first file is in hand.
  */
 export function buildManualShotList(): ManualShotSpec[] {
-  // Library picks lead: they need no camera, no permission and no good light,
-  // and they close the one requested item that nothing else in the run can.
+  // The library pick leads: it needs no camera, no permission and no good
+  // light, and it closes the one requested item that nothing else in the run
+  // can.
   return [...LIBRARY_PICK_SHOTS, UNNAMED_CAMERA_SHOT];
 }

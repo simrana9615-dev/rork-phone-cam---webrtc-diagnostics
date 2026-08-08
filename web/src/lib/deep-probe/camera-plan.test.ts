@@ -93,11 +93,27 @@ describe("the plan built for one camera", () => {
     }
   });
 
-  it("photographs the resolution and ratio steps and leaves the behaviour steps alone", () => {
+  it("photographs exactly one step per camera, the smallest rung, down the canvas path", () => {
     const { steps } = planFor("device-1", NO_CEILING);
-    expect(steps.filter((step) => step.kind === "frame-rate").every((step) => !step.takeStills)).toBe(true);
-    expect(steps.find((step) => step.asked.includes("portrait"))?.takeStills).toBe(false);
-    expect(steps.filter((step) => step.kind === "aspect-ratio").every((step) => step.takeStills)).toBe(true);
+    const photographed = steps.filter((step) => step.still !== "none");
+    expect(photographed).toHaveLength(1);
+    expect(photographed[0].still).toBe("canvas-small");
+    expect(photographed[0].asked).toContain("VGA");
+  });
+
+  it("says on every other step that no photograph was taken there, and why", () => {
+    const { steps } = planFor("device-1", NO_CEILING);
+    for (const step of steps.filter((entry) => entry.still === "none")) {
+      expect(step.stillNote).toContain("No photograph was taken at this step");
+      expect(step.stillNote).toContain("photographed exactly twice");
+    }
+  });
+
+  it("still asks every behaviour step in full, photograph or not", () => {
+    const { steps } = planFor("device-1", NO_CEILING);
+    expect(steps.filter((step) => step.kind === "frame-rate")).toHaveLength(4);
+    expect(steps.filter((step) => step.kind === "aspect-ratio")).toHaveLength(3);
+    expect(steps.filter((step) => step.kind === "frame-rate").every((step) => step.still === "none")).toBe(true);
   });
 });
 
@@ -110,7 +126,7 @@ describe("the step that opens every camera first", () => {
   });
 
   it("takes the platform photo and not the several-megabyte canvas copy of it", () => {
-    expect(step.takeStills).toBe(true);
-    expect(step.platformOnly).toBe(true);
+    expect(step.still).toBe("platform-native-max");
+    expect(step.stillNote).toBeUndefined();
   });
 });

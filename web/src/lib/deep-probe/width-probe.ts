@@ -25,6 +25,11 @@
  *     two paths are opposites — one may carry platform metadata, the other
  *     carries none by construction — so having both is what makes the files
  *     readable against each other.
+ *   • A SHORT round of impossible asks on each side, once that side's open has
+ *     already been paid for. Those asks are the opposite question again — not
+ *     what the phone falls back to, but how it refuses — and they cost two
+ *     opens that are already warm rather than a run of their own. The full
+ *     battery lives in the impossible-asks mode; this is its core.
  *   • No verdict. The report says what was asked, what arrived, and whether
  *     they match. Whether that is good behaviour is not this app's opinion to
  *     have.
@@ -37,6 +42,7 @@
 import { readPixelSize } from "./capture-memory";
 import { openMediaWithDeadline, withCameraDeadline } from "./camera-timeout";
 import { CANVAS_ENCODE_QUALITY, type ProbeCapture } from "./camera-matrix";
+import { impossibleAsksFor, impossibleObservations, runImpossibleRound, type ImpossibleAnswer, type ImpossibleTarget } from "./impossible-asks";
 import { PROBE_WIDTH } from "./run-mode";
 
 export type ProbeFacing = "environment" | "user";
@@ -109,6 +115,10 @@ export type WidthProbeReport = {
   durationMs: number;
   width: number;
   rows: WidthProbeRow[];
+  /** The short round of impossible asks sent down each side after its open. */
+  impossible: ImpossibleAnswer[];
+  /** Where those answers disagree with each other. Observations, never verdicts. */
+  impossibleObservations: string[];
   /** True when the run was stopped before both facings had been tried. */
   aborted: boolean;
   /** `enumerateDevices()` before and after, so the chosen device can be named. */
@@ -295,7 +305,14 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
   const devicesBefore = await enumerate();
   let aborted = false;
 
-  const total = PROBE_FACINGS.length;
+  // Each side is one open, its stills, and then the short impossible round.
+  // The total is built from the real ask list rather than a typed-in number, so
+  // the bar cannot promise a shape the round does not have.
+  const shortAskCount = impossibleAsksFor({ deviceId: null, facingMode: "environment", label: "x", capabilities: null }, "short").length;
+  const total = PROBE_FACINGS.length * (1 + shortAskCount);
+  let done = 0;
+  const targets: ImpossibleTarget[] = [];
+
   for (let i = 0; i < PROBE_FACINGS.length; i += 1) {
     const facing = PROBE_FACINGS[i];
     await options.waitWhilePaused?.();
@@ -303,7 +320,8 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
       aborted = true;
       break;
     }
-    options.onProgress?.(`Asking the ${FACING_LABEL[facing].toLowerCase()} for ${PROBE_WIDTH} wide, and nothing else`, i, total);
+    done += 1;
+    options.onProgress?.(`Asking the ${FACING_LABEL[facing].toLowerCase()} for ${PROBE_WIDTH} wide, and nothing else`, done, total);
 
     // The whole point of the mode. No height, no aspectRatio, no frameRate, no
     // deviceId — anything else here would be answering a different question.
@@ -324,9 +342,11 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
       }
 
       const settings = verbatim(track.getSettings?.() ?? null);
+      let rawCapabilities: MediaTrackCapabilities | null = null;
       let capabilities: Record<string, unknown> | null = null;
       try {
-        capabilities = track.getCapabilities ? verbatim(track.getCapabilities()) : null;
+        rawCapabilities = track.getCapabilities ? track.getCapabilities() : null;
+        capabilities = verbatim(rawCapabilities);
         if (!track.getCapabilities) rowNotes.push("track.getCapabilities is not implemented here, so no capability ranges could be read. That is an absence, not an empty range.");
       } catch (err) {
         rowNotes.push(`track.getCapabilities() threw: ${errorName(err)}`);
@@ -367,12 +387,12 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
       const stills: { path: ProbeCapture["path"]; shot: { blob: Blob; width: number; height: number } | null; origin: ProbeCapture["origin"]; how: string }[] = [];
       await options.waitWhilePaused?.();
       if (options.shouldAbort?.() !== true) {
-        options.onProgress?.(`${FACING_LABEL[facing]} — taking a still down the platform photo path`, i, total);
+        options.onProgress?.(`${FACING_LABEL[facing]} — taking a still down the platform photo path`, done, total);
         stills.push({ path: "image-capture", shot: await platformStill(track), origin: "platform-photo", how: "the browser's own photo pipeline (ImageCapture.takePhoto)" });
       }
       await options.waitWhilePaused?.();
       if (options.shouldAbort?.() !== true && video) {
-        options.onProgress?.(`${FACING_LABEL[facing]} — taking a still down the canvas path`, i, total);
+        options.onProgress?.(`${FACING_LABEL[facing]} — taking a still down the canvas path`, done, total);
         stills.push({ path: "canvas", shot: await canvasStill(video), origin: "app-encoded-frame", how: "a frame this app drew from the video track and encoded as JPEG" });
       }
 
@@ -423,6 +443,11 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
         notes: rowNotes,
         reading: widthReading(partial, PROBE_WIDTH),
       });
+      // Kept for the impossible round, which runs once both sides have been
+      // measured — pinning the camera the platform actually chose, so the round
+      // interrogates the same lens this row describes rather than re-rolling the
+      // dice on which one `facingMode` opens.
+      targets.push({ deviceId: chosenDeviceId, facingMode: facing, label: FACING_LABEL[facing], capabilities: rawCapabilities });
     } catch (err) {
       rows.push(emptyRow(facing, askedPlain, performance.now() - openStart, errorName(err), rowNotes));
     } finally {
@@ -437,8 +462,39 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
     }
   }
 
+  // The short impossible round, once both sides have answered the plain
+  // question. It is the core of the battery rather than the whole of it: this
+  // mode promises about a minute, and the full set lives in its own mode.
+  const impossible: ImpossibleAnswer[] = [];
+  const askedOnce = new Set<string>();
+  for (const target of targets) {
+    await options.waitWhilePaused?.();
+    if (options.shouldAbort?.() === true) {
+      aborted = true;
+      break;
+    }
+    const answers = await runImpossibleRound(target, {
+      scope: "short",
+      askedOnce,
+      shouldAbort: options.shouldAbort,
+      waitWhilePaused: options.waitWhilePaused,
+      onNote: (note) => notes.push(note),
+      onUntried: (asks, reason) => notes.push(`${target.label}: ${asks.length} impossible ask(s) were left untried. ${reason}`),
+      onProgress: (message) => {
+        done += 1;
+        options.onProgress?.(message, Math.min(done, total), total);
+      },
+    });
+    impossible.push(...answers);
+  }
+
   const devicesAfter = await enumerate();
   if (aborted) notes.push("You stopped the run before both cameras had been asked. The rows above really ran; the missing facing was never attempted and nothing has been guessed in its place.");
+  if (impossible.length > 0) {
+    notes.push(
+      `${impossible.length} impossible ask(s) were sent after the plain ones, on the same two sides: sizes that cannot exist, a self-contradicting shape, malformed numbers, invented setting names, a control pushed past its published limit and a camera id belonging to nothing. Succeeding is easy to imitate; refusing correctly is not, which is why they are here. This is the SHORT battery — the impossible-asks mode sends the rest, including the repeat-and-drift pair and the demand made of a camera already switched off.`
+    );
+  }
   notes.push(
     "Only ONE constraint was sent per open: a plain width. No height, no aspect ratio, no frame rate and no device were named, which is the whole point — this measures what the phone falls back to, not what it is capable of. The full run measures the second thing."
   );
@@ -452,6 +508,8 @@ export async function runWidthProbe(options: WidthProbeOptions = {}): Promise<Wi
     durationMs: Math.round(performance.now() - t0),
     width: PROBE_WIDTH,
     rows,
+    impossible,
+    impossibleObservations: impossibleObservations(impossible),
     aborted,
     devicesBefore,
     devicesAfter,

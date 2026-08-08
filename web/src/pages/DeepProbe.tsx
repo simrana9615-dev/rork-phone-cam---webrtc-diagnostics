@@ -34,8 +34,9 @@ import { Button } from "@/components/ui/button";
 import { downloadBlob, formatBytes, makeLog, type LogEntry, type LogLevel } from "@/lib/camera-diagnostics";
 import { CaptureCancelledError } from "@/lib/capture-engine";
 import { enumerateVideoInputs, type CameraDeviceInfo } from "@/lib/device-camera";
-import { fallbackReason, routesNotNeededReason, zoomNotAskedReason, type AdaptiveSkip, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
+import { fallbackReason, routesNotNeededReason, viewfinderNotAskedReason, zoomNotAskedReason, type AdaptiveSkip, type ManualFacing } from "@/lib/deep-probe/adaptive-manual";
 import { runCameraSweep, type CameraMatrixReport, type ProbeCapture } from "@/lib/deep-probe/camera-matrix";
+import { runImpossibleProbe, type ImpossibleReport } from "@/lib/deep-probe/impossible-asks";
 import { readCaptureFacts, type CaptureFacts } from "@/lib/deep-probe/capture-facts";
 import { readShape } from "@/lib/deep-probe/capture-signature";
 import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
@@ -45,6 +46,9 @@ import { buildManualShotList, ENGINE_NAME, namedCameraShot, RoutesExhaustedError
 import {
   capturePhotoForm,
   claimedExifText,
+  CONTRADICTION_PURPOSE,
+  contradictionReading,
+  pickContradictoryPhoto,
   MULTI_PICK_LIMIT,
   MULTI_PICK_PURPOSE,
   oppositeOf,
@@ -177,7 +181,7 @@ function levelFor(outcome: PermissionOutcome): LogLevel {
 
 type ManualStep = {
   id: string;
-  kind: "viewfinder" | "camera-app" | "library" | "multi-pick" | "photo-form";
+  kind: "viewfinder" | "camera-app" | "library" | "multi-pick" | "photo-form" | "contradiction";
   title: string;
   purpose: string;
   deviceId: string | null;
@@ -243,6 +247,7 @@ export default function DeepProbe() {
   const [sweepRemaining, setSweepRemaining] = useState<RemainingEstimate | null>(null);
   const [matrix, setMatrix] = useState<CameraMatrixReport | null>(null);
   const [widthProbe, setWidthProbe] = useState<WidthProbeReport | null>(null);
+  const [impossible, setImpossible] = useState<ImpossibleReport | null>(null);
   const [thermal, setThermal] = useState<string | null>(null);
 
   const [manualSteps, setManualSteps] = useState<ManualStep[]>([]);
@@ -284,6 +289,7 @@ export default function DeepProbe() {
   const adaptiveSkipsRef = useRef<AdaptiveSkip[]>([]);
   /** The 640-only investigation's report. Null on a full run, which is most runs. */
   const widthProbeRef = useRef<WidthProbeReport | null>(null);
+  const impossibleRef = useRef<ImpossibleReport | null>(null);
   const passiveRef = useRef<PassiveGroup[]>([]);
   const statesBeforeRef = useRef<{ name: string; state: string | null }[]>([]);
   const statesAfterRef = useRef<{ name: string; state: string | null }[]>([]);
@@ -401,6 +407,7 @@ export default function DeepProbe() {
       sensors,
       matrix,
       widthProbe: widthProbeRef.current,
+      impossible: impossibleRef.current,
       logs: suspensionLogs(logs, suspensionsRef.current),
       omissions: omissionsRef.current,
       devicesBeforePermission: devicesBeforeRef.current,
@@ -522,11 +529,15 @@ export default function DeepProbe() {
     setPhotoCount(0);
     setByteCount(0);
     widthProbeRef.current = null;
+    impossibleRef.current = null;
+    setImpossible(null);
     addLog(
       "info",
       mode === "width-640"
         ? `Deep Probe started in the ${PROBE_WIDTH}-only mode. One constraint per camera — a plain width — and nothing else.`
-        : `Deep Probe started at the ${TIER_INFO[tier].label} scope.`
+        : mode === "impossible"
+          ? "Deep Probe started in the impossible-asks mode. Each side of the phone is asked for things no camera can do, and how it refuses is the whole reading. No photograph is taken anywhere in this run."
+          : `Deep Probe started at the ${TIER_INFO[tier].label} scope.`
     );
     addLog("debug", "Reading everything available without a prompt first, so the passive baseline predates every request.");
     statesBeforeRef.current = await queryAllPermissions();
@@ -547,8 +558,8 @@ export default function DeepProbe() {
     // The 640-only mode has one thing to ask for. Walking the whole permission
     // tier to reach a camera would make a one-minute run cost twenty prompts,
     // and every one of them would be answering a question this mode never asks.
-    const requests = mode === "width-640" ? requestsForTier("standard").filter((r) => r.id === "camera") : requestsForTier(tier);
-    if (mode === "width-640") {
+    const requests = mode === "full" ? requestsForTier(tier) : requestsForTier("standard").filter((r) => r.id === "camera");
+    if (mode !== "full") {
       addLog("debug", "Only the camera is requested in this mode. The other permissions are not refused and not skipped by you — they are simply not part of the question being asked, and the omissions list says so.");
     }
     setQueue(requests);
@@ -622,14 +633,16 @@ export default function DeepProbe() {
     if (phase !== "sensors" || ranRef.current.has("sensors")) return;
     ranRef.current.add("sensors");
     void (async () => {
-      // The 640-only mode asks one question and asks it of the camera. Recording
-      // sensors here would be collecting data nobody asked for, so the stage is
-      // named as deliberately absent rather than left to look like a failure.
-      if (mode === "width-640") {
-        addLog("debug", `Sensor recordings are not part of the ${PROBE_WIDTH}-only investigation, so the stage was not run. Nothing was refused and nothing failed.`);
+      // The short modes ask one question each, and ask it of the camera.
+      // Recording sensors here would be collecting data nobody asked for, so
+      // the stage is named as deliberately absent rather than left to look
+      // like a failure.
+      if (mode !== "full") {
+        const which = mode === "width-640" ? `the ${PROBE_WIDTH}-only investigation` : "the impossible-asks run";
+        addLog("debug", `Sensor recordings are not part of ${which}, so the stage was not run. Nothing was refused and nothing failed.`);
         omissionsRef.current.push({
           stage: "Sensor recordings",
-          reason: `This run was the ${PROBE_WIDTH}-only investigation, which asks one question of the two cameras and nothing of the sensors. The stage was deliberately not run — it was not refused, and it did not fail. A full run records every granted sensor.`,
+          reason: `This run was ${which}, which asks its question of the two cameras and nothing of the sensors. The stage was deliberately not run — it was not refused, and it did not fail. A full run records every granted sensor.`,
         });
         markStage("sensors", "skipped");
         setPhase("camera");
@@ -782,6 +795,50 @@ export default function DeepProbe() {
         return;
       }
 
+      // The impossible-asks run replaces both camera stages. It photographs
+      // nothing at all: every ask in it is designed to be unanswerable, and
+      // what is being measured is the shape of the refusal.
+      if (mode === "impossible") {
+        addLog("info", "Asking each side of this phone for things no camera can do. Not one photograph is taken here — a refusal is the reading.");
+        const probe = await runImpossibleProbe({
+          scope: "full",
+          onProgress: (message, done, total) => {
+            setSweepMessage(message);
+            setSweepPct(Math.min(99, Math.round((done / Math.max(total, 1)) * 100)));
+          },
+          shouldAbort: () => abortRef.current,
+          waitWhilePaused,
+        });
+        impossibleRef.current = probe;
+        setImpossible(probe);
+        setSweepPct(100);
+        setSweepMessage("");
+        const refused = probe.answers.filter((answer) => answer.outcome === "refused").length;
+        const granted = probe.answers.filter((answer) => answer.outcome === "granted").length;
+        addLog(
+          "success",
+          `${probe.answers.length} impossible ask(s) sent in ${formatDuration(probe.durationMs)}: ${refused} refused, ${granted} granted. A refusal is the informative answer here, not a failure.`
+        );
+        for (const note of probe.notes) addLog("info", note);
+        for (const observation of probe.observations) addLog("warn", observation);
+        if (probe.observations.length === 0 && probe.answers.length > 0) {
+          addLog("debug", "Nothing in this round contradicted anything else in it. That is an observation about what was seen, not a pass mark.");
+        }
+        markStage("camera", probe.aborted ? "stopped" : probe.answers.length === 0 ? "skipped" : "done");
+        markStage("manual", "skipped");
+        omissionsRef.current.push({
+          stage: "Camera sweep, your own shots, and every photograph",
+          reason:
+            "This run was the impossible-asks mode, which asks each side of the phone for things no camera can do and records how it refuses. It photographs nothing on purpose — the sweep, the hand-shot list and every capture are absent by design, not refused and not failed. A full run does all three.",
+        });
+        if (probe.aborted) {
+          toExports({ stage: "The impossible asks (partially)", reason: "You stopped before the battery had finished. Every answer recorded really happened; the asks that never ran are absent, and none of them is recorded as a refusal." });
+        } else {
+          toExports();
+        }
+        return;
+      }
+
       addLog("info", "Camera sweep starting — every camera, at the sizes, ratios, frame rates and control modes it says it supports. Rungs above a camera's own stated ceiling are not asked for, apart from one deliberate over-ask.");
       // The bar and the clock are both fed the real plan. Step times come from
       // this phone, measured between progress callbacks, so the remaining
@@ -822,6 +879,15 @@ export default function DeepProbe() {
         "success",
         `Sweep finished in ${formatDuration(report.durationMs)}: ${granted} of ${report.rows.length} requests granted across ${report.inventory.length} camera(s), ${captures.length} photos taken.`
       );
+      if (report.impossible.length > 0) {
+        const refusedImpossible = report.impossible.filter((answer) => answer.outcome === "refused").length;
+        const grantedImpossible = report.impossible.filter((answer) => answer.outcome === "granted").length;
+        addLog(
+          "info",
+          `${report.impossible.length} impossible ask(s) were sent alongside the sweep: ${refusedImpossible} refused, ${grantedImpossible} granted. Refusing correctly — the right error, naming the right setting, in the right time — is the part of a camera that is hardest to imitate.`
+        );
+        for (const observation of report.impossibleObservations) addLog("warn", observation);
+      }
       if (report.untried.length > 0) {
         const budgeted = report.cameraCosts.filter((cost) => cost.hitBudget);
         for (const cost of budgeted) {
@@ -968,6 +1034,37 @@ export default function DeepProbe() {
             `You picked ${picked.length} of the ${MULTI_PICK_LIMIT} this asked for. That is recorded as what you chose, not as anything failing — fewer photos simply means a smaller sample of how metadata varies on this phone.`
           );
         }
+      } else if (step.kind === "contradiction") {
+        // One request naming the library and the back camera at once. Whatever
+        // comes back is filed as a SUPPLIED FILE: a self-contradicting request
+        // cannot promise whether the picker or the camera opened, and claiming
+        // freshness would invent the answer this step exists to look for.
+        const delivered = await pickContradictoryPhoto();
+        const bytes = new Uint8Array(await delivered.blob.arrayBuffer());
+        const hasExif = !readFacingFromExif(bytes).evidence.includes("no EXIF at all");
+        const reading = contradictionReading(delivered.blob.size, delivered.blob.type, hasExif);
+        const capture: ProbeCapture = {
+          slug: `manual-${String(manualIndex + 1).padStart(2, "0")}-${step.id}`,
+          label: step.title,
+          blob: delivered.blob,
+          origin: "supplied-file",
+          stage: "manual",
+          deviceLabel: null,
+          path: "picker-file",
+          width: 0,
+          height: 0,
+          fileName: delivered.fileName,
+          fileLastModified: null,
+          fileRelativePath: null,
+          asked: `Capacitor getPhoto — ${delivered.asked}. Quality 100, no editing, no orientation correction, nothing saved to your gallery.`,
+          granted: `${reading} ${claimedExifText(delivered.claimedExif)}`,
+          takenAt: new Date().toISOString(),
+        };
+        capturesRef.current.push(capture);
+        setPhotoCount(capturesRef.current.length);
+        setByteCount((b) => b + delivered.blob.size);
+        setManualNotes((prev) => [...prev, `${step.title}: ${reading}`]);
+        addLog("info", `${step.title}: ${reading}`);
       } else if (step.kind === "photo-form" && step.form) {
         const form = step.form;
         const delivered = await capturePhotoForm(form, "library");
@@ -2014,18 +2111,36 @@ function zoomFinding(deviceId: string, matrix: CameraMatrixReport | null): "move
 function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixReport | null): { steps: ManualStep[]; skips: AdaptiveSkip[] } {
   const steps: ManualStep[] = [];
   const skips: AdaptiveSkip[] = [];
-  for (const device of inventory) {
-    const label = device.label || `camera ${device.deviceId.slice(0, 8)}`;
+  // ONE viewfinder shot for the whole run, not one per camera. What it shows is
+  // a property of the getUserMedia path rather than of the lens — a frame this
+  // app encoded, carrying no camera metadata, which is true on every camera the
+  // phone has — and both sides are covered separately by the camera-app trips.
+  // The back camera is preferred because it is the one a phone photographs the
+  // world with; where none is classified, the first camera stands in.
+  const primary = inventory.find((device) => device.facing === "back") ?? inventory[0] ?? null;
+  const primaryLabel = primary ? primary.label || `camera ${primary.deviceId.slice(0, 8)}` : null;
+  if (primary && primaryLabel) {
     steps.push({
-      id: `vf-${device.deviceId.slice(0, 8)}-default`,
+      id: `vf-${primary.deviceId.slice(0, 8)}-default`,
       kind: "viewfinder",
-      title: `${label} — full frame`,
+      title: `${primaryLabel} — full frame`,
       purpose:
-        "Pinned to this exact camera at its own maximum resolution. This is the shot that shows what this specific lens sees. It will carry no camera metadata — no browser writes any on this path — which is itself the point of comparing it with the camera-app shots later.",
-      deviceId: device.deviceId,
-      deviceLabel: label,
+        "The one hand shot taken through the browser's own camera path, pinned to this exact camera at its maximum resolution. It will carry no camera metadata — no browser writes any on this path — which is precisely the point of holding it against the camera-app files later. " +
+        "One is enough: that absence is a property of the path, identical on every lens this phone has, and both sides of the phone are covered by the two trips to the camera app.",
+      deviceId: primary.deviceId,
+      deviceLabel: primaryLabel,
       zoom: null,
     });
+  }
+  for (const device of inventory) {
+    const label = device.label || `camera ${device.deviceId.slice(0, 8)}`;
+    if (device.deviceId !== primary?.deviceId) {
+      skips.push({
+        stepId: `vf-${device.deviceId.slice(0, 8)}-default`,
+        title: `${label} — full frame`,
+        reason: viewfinderNotAskedReason(label, primaryLabel ?? "the first camera this phone named"),
+      });
+    }
     const zoom = zoomFinding(device.deviceId, matrix);
     if (zoom === "moved") {
       steps.push({
@@ -2051,9 +2166,7 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
     steps.push({
       id: spec.id,
       kind: isLibrary ? "library" : "camera-app",
-      title: isLibrary
-        ? `Photo library — ${spec.id === "library-original" ? "the same photo, asking for the original bytes" : "an ordinary upload"}`
-        : "Camera app — no camera named, so the phone chooses",
+      title: isLibrary ? "Photo library — asking for the original bytes, HEIC and all" : "Camera app — no camera named, so the phone chooses",
       purpose: spec.purpose,
       deviceId: null,
       deviceLabel: isLibrary ? "the photo library" : "the phone's own camera app",
@@ -2073,6 +2186,16 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
     purpose: MULTI_PICK_PURPOSE,
     deviceId: null,
     deviceLabel: "the photo library",
+    zoom: null,
+  });
+
+  steps.push({
+    id: "capacitor-contradiction",
+    kind: "contradiction",
+    title: "One request that contradicts itself — the library and the back camera at once",
+    purpose: CONTRADICTION_PURPOSE,
+    deviceId: null,
+    deviceLabel: "the phone's own camera app and picker",
     zoom: null,
   });
 
@@ -2331,7 +2454,11 @@ function Setup({
   setChoice: (next: ExportChoice) => void;
   onStart: () => void;
 }) {
-  const short = mode === "width-640";
+  // Both short modes ask for the camera and nothing else, so the tier card and
+  // the cost figures behave the same way for either. Where they differ is what
+  // they DO with the camera, and that difference is stated separately.
+  const short = mode !== "full";
+  const impossibleOnly = mode === "impossible";
   const requestCount = useMemo(() => requestsForTier(tier).length, [tier]);
   /**
    * How many cameras this device names, read before the run rather than typed
@@ -2367,24 +2494,36 @@ function Setup({
       prompts: short ? 1 : requestCount,
       minutes: expected.text,
       derivedFrom: expected.derivedFrom,
-      photos: short
-        ? "4, taken for you"
-        : `${cameraCount != null ? `roughly ${cameraCount * 18}–${cameraCount * 40} automatic` : "60–150 automatic"}, plus up to ${cameraCount != null ? cameraCount * 2 + 9 : 13} you take yourself`,
-      size: cameraCount != null ? `roughly ${cameraCount * 70} MB – ${cameraCount * 180} MB, from the ${cameraCount} camera(s) this device names` : "250 MB – 700 MB, depending on how many cameras this device has",
+      photos: impossibleOnly
+        ? "none at all — this mode photographs nothing"
+        : short
+          ? "4, taken for you"
+          : `${cameraCount != null ? `${cameraCount * 2} automatic — exactly two per camera` : "two per camera, automatic"}, plus up to ${cameraCount != null ? Math.min(cameraCount, 2) + 11 : 12} you take yourself`,
+      size: impossibleOnly
+        ? "a few kilobytes of text. No photograph is taken, so there is nothing heavy in it."
+        : cameraCount != null
+          ? `roughly ${cameraCount * 12} MB – ${cameraCount * 40} MB, from the ${cameraCount} camera(s) this device names`
+          : "40 MB – 160 MB, depending on how many cameras this device has",
       hex: `Hex dumps add at most ${formatBytes(hexText)} on this device — capped on purpose, because rendering every byte of every photo would exhaust this browser's memory before the archive finished. Anything windowed says exactly which bytes it skipped, and the complete photo is always in the archive.`,
     };
-  }, [requestCount, cameraCount, short]);
+  }, [requestCount, cameraCount, short, impossibleOnly]);
 
   return (
     <div className="space-y-3">
       <div className="overflow-hidden rounded-2xl border border-fuchsia-500/35 bg-gradient-to-br from-fuchsia-500/12 via-card to-card p-4">
         <h2 className="text-[17px] font-semibold leading-tight">
-          {short ? `What does this phone do when a site asks for ${PROBE_WIDTH} wide?` : "Everything a website can ask you for, in one run"}
+          {impossibleOnly
+            ? "What does this phone do when you ask it for the impossible?"
+            : short
+              ? `What does this phone do when a site asks for ${PROBE_WIDTH} wide?`
+              : "Everything a website can ask you for, in one run"}
         </h2>
         <p className="mt-1.5 text-[12px] leading-relaxed text-muted-foreground">
-          {short
-            ? `One question, asked twice. The back camera and then the front camera are opened with a width of ${PROBE_WIDTH} as the only constraint — no height, no shape, no frame rate, no camera named — and the run records exactly what the phone decided on your behalf. That is the request most real websites actually send, and what a platform fills in around it is undocumented. Nothing is uploaded.`
-            : "This deliberately behaves like the most demanding site you will ever visit: it asks for every permission it knows how to ask for, records exactly what your device hands over, then photographs through every camera at every setting it supports. Nothing is uploaded — the whole run happens on this phone and the archive is assembled in the browser."}
+          {impossibleOnly
+            ? "Each side of the phone is asked for things no camera can do — one pixel wide, a thousand frames a second, a square that is also widescreen, a setting name that does not exist, a camera that does not exist — and the run records exactly how it refuses: which error, which setting it blames, how long it takes, and whether it answers the same way twice. Succeeding is easy to imitate; refusing correctly is not. No photograph is taken anywhere in this mode, and nothing is uploaded."
+            : short
+              ? `One question, asked twice. The back camera and then the front camera are opened with a width of ${PROBE_WIDTH} as the only constraint — no height, no shape, no frame rate, no camera named — and the run records exactly what the phone decided on your behalf. That is the request most real websites actually send, and what a platform fills in around it is undocumented. Nothing is uploaded.`
+              : "This deliberately behaves like the most demanding site you will ever visit: it asks for every permission it knows how to ask for, records exactly what your device hands over, then photographs through every camera — twice each, no more — while asking each of them for a battery of things no camera can do. Nothing is uploaded: the whole run happens on this phone and the archive is assembled in the browser."}
         </p>
       </div>
 
@@ -2417,6 +2556,7 @@ function Setup({
           <p className="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 p-2 text-[10px] leading-relaxed text-sky-200">
             This mode asks for the camera and nothing else. The sensor recordings, the full camera sweep and the shots you take by hand are not part of
             the question, so they are not run — and the sheets say that plainly rather than leaving them looking refused or failed.
+            {impossibleOnly ? " It also takes no photograph at all: every ask in it is one no camera can answer, and what is being measured is the refusal." : null}
           </p>
         ) : null}
       </div>
@@ -2425,7 +2565,7 @@ function Setup({
         <h3 className="text-[12.5px] font-semibold">How far should it reach?</h3>
         {short ? (
           <p className="mt-1 text-[10.5px] leading-relaxed text-muted-foreground">
-            Not used by the {PROBE_WIDTH}-only run, which asks for the camera and nothing else. Switch back to the full run to set this.
+            Not used by the {impossibleOnly ? "impossible-asks run" : `${PROBE_WIDTH}-only run`}, which asks for the camera and nothing else. Switch back to the full run to set this.
           </p>
         ) : null}
         <div className="mt-2 space-y-1.5">

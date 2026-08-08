@@ -676,20 +676,24 @@ that produced nothing says so, and does not guess whether the shot was skipped o
 EXIF while a file-input photo carries the full tag set — and the run had abundant evidence for the
 first half and none for the second. A library pick was the single `NOT RUN` item, excluded on the
 principle that a pick cannot promise a fresh photo. True of a pick dressed up as a camera handoff;
-irrelevant to one asked for as what it is. The manual stage now leads with two library picks,
-filed as library files and never as camera output, and the page no longer stamps every manual shot
+irrelevant to one asked for as what it is. The manual stage now leads with a library pick,
+filed as a library file and never as camera output, and the page no longer stamps every manual shot
 as a camera file — the shot itself decides, so a picker cannot inherit a camera's label by sharing
 a code path.
 
-The two picks differ only in what they say they accept, and that difference is the measurement:
-iOS converts HEIC to JPEG for an input asking for `image/*` and hands over the stored bytes to one
-that names HEIC. Asking twice for the same photo tells apart a library that genuinely holds JPEG
-from one holding HEIC that ordinary upload forms never see. What the run refuses to do is cash
-that in: the Photos storage setting is still reported as an inference, because it is never exposed
-to a web page and one photo's format is not a device-wide setting; the untouched-original item
-stays not-obtainable, because an unconverted HEIC is the nearest approximation and proves nothing
-about what happened before the library. Only the location question moved — a GPS directory in a
-picked photo answers it exactly as well as a camera file does.
+The pick that survives is the one naming HEIC explicitly, and that is the measurement: iOS converts
+HEIC to JPEG for an input asking for `image/*` and hands over the stored bytes to one that names
+HEIC, so a request giving the device no reason to convert shows what the library actually holds.
+The plain `image/*` half used to be a second tap; it is now covered by the multi-pick trip, which
+sends five photos down an ordinary picker in one go. That trip deliberately asks for photos which
+are DIFFERENT from each other, so it is a sample rather than a control and a format difference
+against the named-HEIC file is no longer read as a conversion — the brief says so instead of making
+the comparison anyway on files that cannot carry it. What the run still refuses to do is cash any
+of it in: the Photos storage setting is reported as an inference, because it is never exposed to a
+web page and one photo's format is not a device-wide setting; the untouched-original item stays
+not-obtainable, because an unconverted HEIC is the nearest approximation and proves nothing about
+what happened before the library. Only the location question moved — a GPS directory in a picked
+photo answers it exactly as well as a camera file does.
 
 **The options nobody could see.** A report of "I can't see the deep probe various final options"
 turned out to be exactly literal, and the export screen was not the problem — three routes never

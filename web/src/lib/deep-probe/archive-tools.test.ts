@@ -304,6 +304,8 @@ describe("buildMimicSpec", () => {
       slowestStep: null,
       perCameraBudgetMs: null,
       stillPolicy: "",
+      impossible: [],
+      impossibleObservations: [],
       notes: [],
       aborted: false,
       stillsStoppedForMemory: null,

@@ -68,6 +68,8 @@ function matrix(overrides: Partial<CameraMatrixReport> = {}): CameraMatrixReport
     slowestStep: { label: "Back Triple Camera — 3840×2160", ms: 410 },
     perCameraBudgetMs: 600_000,
     stillPolicy: "one still per granted row",
+    impossible: [],
+    impossibleObservations: [],
     notes: [],
     aborted: false,
     stillsStoppedForMemory: null,
@@ -173,6 +175,7 @@ function facts(overrides: Partial<CaptureFacts> = {}): CaptureFacts {
 function run(overrides: Partial<RunFacts> = {}): RunFacts {
   return {
     capacitor: null,
+    impossible: null,
     cost: {
       totalMs: 360_000,
       stages: [{ stage: "Camera sweep", ms: 240_000 }],

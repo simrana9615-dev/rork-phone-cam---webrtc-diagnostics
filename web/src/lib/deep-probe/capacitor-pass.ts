@@ -453,6 +453,51 @@ export async function pickSeveralPhotos(limit: number = MULTI_PICK_LIMIT): Promi
   return photos;
 }
 
+/**
+ * The hand-side contradiction: one request that names the LIBRARY as its source
+ * and the BACK CAMERA as its direction, in the same breath.
+ *
+ * A direction is a camera setting. A library has no direction, no lens and no
+ * side. The two halves of this request cannot both be honoured, and which half
+ * a platform acts on — opening the picker and ignoring the camera, opening the
+ * camera and ignoring the library, or refusing the pair outright — is the same
+ * kind of fingerprint the automatic side collects from contradictory
+ * constraints, taken on the route that reaches deepest into the phone.
+ *
+ * Whatever comes back is filed as a SUPPLIED FILE and never as a photograph
+ * taken just now. That is not caution for its own sake: a request that
+ * contradicts itself cannot promise which of the two it opened, so claiming
+ * freshness would be inventing the answer this step exists to look for.
+ */
+export async function pickContradictoryPhoto(): Promise<{ blob: Blob; fileName: string | null; format: string | null; claimedExif: unknown; asked: string }> {
+  const asked = "source = PHOTOS (the library) and direction = REAR (the back camera), sent together in one request";
+  try {
+    const photo = await Camera.getPhoto({
+      ...MAX_DATA_OPTIONS,
+      resultType: CameraResultType.Uri,
+      source: CameraSource.Photos,
+      direction: CameraDirection.Rear,
+      webUseInput: true,
+    });
+    const href = photo.webPath ?? photo.path;
+    if (!href) throw new Error("Capacitor returned nothing usable for the contradictory request.");
+    const blob = await fetch(href).then((response) => response.blob());
+    return { blob, fileName: null, format: photo.format ?? null, claimedExif: photo.exif ?? null, asked };
+  } catch (err) {
+    if (isCancellation(err)) throw new CaptureCancelledError();
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+}
+
+/** What the contradictory request produced, said without claiming which half was honoured. */
+export function contradictionReading(bytes: number, mime: string, hasExif: boolean): string {
+  return (
+    `The request named the library and the back camera at once, and ${bytes.toLocaleString("en-US")} bytes came back, declared ${mime || "(no type)"}. ` +
+    `${hasExif ? "The file carries camera metadata." : "The file carries no camera metadata."} ` +
+    "Which half of the contradiction this phone honoured is NOT stated here: a request that contradicts itself cannot promise whether the picker or the camera opened, so the file is filed as a supplied file rather than as a photograph taken just now. What the bytes themselves say is in the sheets, read independently."
+  );
+}
+
 /** Asks for the same photo in one of the three forms Capacitor offers. */
 export async function capturePhotoForm(form: PhotoForm, source: "camera" | "library"): Promise<{ blob: Blob; declaredMime: string; format: string | null; claimedExif: unknown }> {
   const resultType = form === "base64" ? CameraResultType.Base64 : form === "data-url" ? CameraResultType.DataUrl : CameraResultType.Uri;
@@ -506,6 +551,11 @@ export function claimedExifText(claimed: unknown): string {
 }
 
 /** The paragraph the archive uses to explain what this whole pass is. */
+export const CONTRADICTION_PURPOSE =
+  "One request that contradicts itself: it names your photo LIBRARY as the source and the BACK CAMERA as the direction, in the same breath. A library has no camera and no side, so the two halves cannot both be honoured. " +
+  "Whatever opens — the picker, the camera, or nothing at all — is this phone deciding for you which half of a contradictory instruction matters more, which is exactly what the automatic side of this run asks the cameras in a dozen other ways. " +
+  "Take or pick whatever it offers. The file is filed as a SUPPLIED FILE and never as a photograph taken just now, because a self-contradicting request cannot promise which of the two it opened.";
+
 export const CAPACITOR_PASS_POLICY = [
   "THE CAPACITOR PASS",
   "=".repeat(78),
