@@ -63,6 +63,10 @@ function matrix(overrides: Partial<CameraMatrixReport> = {}): CameraMatrixReport
         duplicates: [],
       },
     ],
+    untried: [],
+    cameraCosts: [{ label: "Back Triple Camera", ms: 240_000, steps: 2, untried: 0, hitBudget: false }],
+    slowestStep: { label: "Back Triple Camera — 3840×2160", ms: 410 },
+    perCameraBudgetMs: 600_000,
     stillPolicy: "one still per granted row",
     notes: [],
     aborted: false,
@@ -168,6 +172,15 @@ function facts(overrides: Partial<CaptureFacts> = {}): CaptureFacts {
 
 function run(overrides: Partial<RunFacts> = {}): RunFacts {
   return {
+    capacitor: null,
+    cost: {
+      totalMs: 360_000,
+      stages: [{ stage: "Camera sweep", ms: 240_000 }],
+      cameras: [{ label: "Back Triple Camera", ms: 240_000, steps: 2, untried: 0, hitBudget: false }],
+      slowestStep: { label: "Back Triple Camera — 3840×2160", ms: 410 },
+      cameraDeadlineMs: 10_000,
+      perCameraBudgetMs: 600_000,
+    },
     startedAt: "2026-08-07T10:00:00.000Z",
     finishedAt: "2026-08-07T10:06:00.000Z",
     tier: "extended",

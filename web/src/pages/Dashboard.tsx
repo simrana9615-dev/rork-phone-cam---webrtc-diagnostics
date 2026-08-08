@@ -136,7 +136,8 @@ function DeepProbeCard({ choice, setChoice, onOpen }: { choice: ExportChoice; se
           </div>
           <p className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
             Asks for every permission a website can ask you for, records what your device actually hands over, then photographs through every camera at
-            the sizes, shapes and modes it says it supports. 8–15 minutes; stop at any point and you still get everything gathered so far.
+            the sizes, shapes and modes it says it supports. It works out how long that will take from the cameras it finds, and tells you what it
+            actually took at the end. Stop at any point and you still get everything gathered so far.
           </p>
         </div>
         <ChevronRight className="h-4 w-4 shrink-0 text-fuchsia-300/80" />

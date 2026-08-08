@@ -455,7 +455,7 @@ export async function fsPickerCapturePhoto(onStep?: (step: string, note?: string
  * CaptureCancelledError.
  */
 export async function capacitorCapturePhoto(
-  facing: "user" | "environment",
+  facing: "user" | "environment" | null,
   onStep?: (step: string, note?: string) => void
 ): Promise<CapacitorCaptureResult> {
   let intercepted: { file: File | null; trusted: boolean; filesApiNative: boolean; observed: string } | null = null;
@@ -477,15 +477,20 @@ export async function capacitorCapturePhoto(
   document.addEventListener("change", onChange, true);
   onStep?.(
     "Capacitor Camera.getPhoto() invoked",
-    `webUseInput=true · direction=${facing === "user" ? "FRONT" : "REAR"} · source=CAMERA · resultType=uri`
+    `webUseInput=true · direction=${facing == null ? "NOT SENT — the phone chooses" : facing === "user" ? "FRONT" : "REAR"} · source=CAMERA · resultType=uri`
   );
   try {
+    // A null facing omits `direction` entirely rather than defaulting to the
+    // rear. Sending a default here would silently answer the question the
+    // unnamed shot exists to ask — which camera this phone opens when a page
+    // asks for none.
     const photo = await Camera.getPhoto({
       quality: 100,
       allowEditing: false,
+      correctOrientation: false,
       resultType: CameraResultType.Uri,
       source: CameraSource.Camera,
-      direction: facing === "user" ? CameraDirection.Front : CameraDirection.Rear,
+      ...(facing == null ? {} : { direction: facing === "user" ? CameraDirection.Front : CameraDirection.Rear }),
       webUseInput: true,
       saveToGallery: false,
     });

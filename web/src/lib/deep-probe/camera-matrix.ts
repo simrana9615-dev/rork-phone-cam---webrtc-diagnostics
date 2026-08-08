@@ -30,6 +30,7 @@ import { CAMERA_DEADLINE_POLICY, CAMERA_OPEN_TIMEOUT_MS, isCameraTimeout, openMe
 import { drawVideoStill, heldBytesCeiling, readPixelSize, releaseScratchCanvas } from "./capture-memory";
 import { CONSOLIDATION_POLICY, createShapeLedger, shapeScope, type ShapeGroup } from "./capture-signature";
 import { readMemoryHints } from "./hex-budget";
+import { budgetReachedText, cameraBudgetMs, createStepTimer, formatDuration, type CameraCost } from "./run-cost";
 
 /**
  * Quality passed to `toBlob` for the frames this app encodes. Recorded as a
@@ -102,8 +103,21 @@ export type MatrixRow = {
    *
    * A row with entries here is always a row where the camera answered — never
    * one where it failed.
+   *
+   * `notTakenKind` separates the two reasons a photograph was never made,
+   * because they are not the same claim. `already-photographed` names a file
+   * that already holds that size; `native-max-canvas` names nothing, because
+   * nothing was ever encoded at that size — counting them together let the
+   * summary promise a file that does not exist.
    */
-  duplicates: { path: ProbeCapture["path"]; sameAsSlug: string; shapeId: string; reason: string; taken: boolean }[];
+  duplicates: {
+    path: ProbeCapture["path"];
+    sameAsSlug: string;
+    shapeId: string;
+    reason: string;
+    taken: boolean;
+    notTakenKind?: "already-photographed" | "native-max-canvas";
+  }[];
 };
 
 /**
@@ -143,12 +157,36 @@ export type CameraSurfaceRecord = {
   notes: string[];
 };
 
+/**
+ * A step that never ran because its camera reached its share of the run's time.
+ *
+ * Kept apart from `rows` on purpose. A row is a request that was made; this is a
+ * request that was not. Filing these as rows with `ok: false` would put them in
+ * the same column as `OverconstrainedError` — which is a camera stating a real
+ * limit — and every count of refusals in the archive would be wrong.
+ */
+export type UntriedStep = {
+  deviceId: string;
+  deviceLabel: string;
+  kind: MatrixRow["kind"];
+  asked: string;
+  reason: string;
+};
+
 export type CameraMatrixReport = {
   startedAt: string;
   finishedAt: string;
   durationMs: number;
   inventory: CameraDeviceInfo[];
   rows: MatrixRow[];
+  /** Steps a camera never reached, by name. Never counted as refusals. */
+  untried: UntriedStep[];
+  /** What each camera spent, and whether it ran out of its share. */
+  cameraCosts: CameraCost[];
+  /** The single longest request in the sweep, measured against the camera deadline. */
+  slowestStep: { label: string; ms: number } | null;
+  /** The per-camera ceiling this run used, or null when there were no cameras to share it out between. */
+  perCameraBudgetMs: number | null;
   /** Steps at which a still was deliberately taken. */
   stillPolicy: string;
   notes: string[];
@@ -176,7 +214,13 @@ export type CameraMatrixReport = {
   devicesAfter: { kind: string; deviceId: string; groupId: string; label: string }[];
 };
 
-export type MatrixProgress = (message: string, done: number, total: number) => void;
+/**
+ * `totalIsExact` is false while any camera's plan is still unread. The bar used
+ * to be drawn from a fixed guess that left the control steps out altogether, so
+ * it filled up and then sat at the end through roughly a third of each camera;
+ * the total is now the real plan, and the flag says when it can be trusted.
+ */
+export type MatrixProgress = (message: string, done: number, total: number, totalIsExact?: boolean) => void;
 
 /**
  * The resolution ladder, largest first.
@@ -623,6 +667,28 @@ function controlSignature(caps: MediaTrackCapabilities | null): string | null {
 }
 
 /**
+ * The zoom steps for one camera, on their own.
+ *
+ * Separated out because zoom is the one control that is never skipped. When a
+ * camera advertises the same control surface as an earlier one, the rest of its
+ * block is left unwalked as a repeat — but the hand-shot stage READS the zoom
+ * rows to decide whether to ask for a zoom photograph, and a camera with no
+ * zoom rows was being written up as a camera that showed no zoom range. It
+ * showed nothing, because nothing was asked. Two lenses that describe
+ * themselves identically are also exactly the pair whose zoom behaviour is most
+ * worth having separately, so these rows run on every camera.
+ */
+export function zoomStepsFor(caps: MediaTrackCapabilities | null): ControlStep[] {
+  const ext = caps as ControlCaps | null;
+  const range = ext?.zoom;
+  if (range?.min == null || range.max == null || range.max <= range.min) return [];
+  return [
+    { kind: "zoom", asked: `zoom at minimum (${range.min})`, constraints: advanced({ zoom: range.min }) },
+    { kind: "zoom", asked: `zoom at maximum (${range.max})`, constraints: advanced({ zoom: range.max }) },
+  ];
+}
+
+/**
  * Builds the control steps for one camera.
  *
  * `allowTorch` is false once the flash has already been fired somewhere in this
@@ -630,7 +696,7 @@ function controlSignature(caps: MediaTrackCapabilities | null): string | null {
  * on each of them is one demonstration repeated into the user's face — and the
  * second camera to claim a torch is claiming the first camera's torch.
  */
-function controlStepsFor(caps: MediaTrackCapabilities | null, allowTorch: boolean): ControlStep[] {
+export function controlStepsFor(caps: MediaTrackCapabilities | null, allowTorch: boolean): ControlStep[] {
   if (!caps) return [];
   const ext = caps as ControlCaps;
   const steps: ControlStep[] = [];
@@ -646,15 +712,25 @@ function controlStepsFor(caps: MediaTrackCapabilities | null, allowTorch: boolea
   for (const mode of ext.resizeMode ?? []) {
     steps.push({ kind: "resize-mode", asked: `resizeMode "${mode}"`, constraints: { resizeMode: { exact: mode } } as MediaTrackConstraints });
   }
-  if (ext.zoom?.min != null && ext.zoom.max != null && ext.zoom.max > ext.zoom.min) {
-    steps.push({ kind: "zoom", asked: `zoom at minimum (${ext.zoom.min})`, constraints: advanced({ zoom: ext.zoom.min }) });
-    steps.push({ kind: "zoom", asked: `zoom at maximum (${ext.zoom.max})`, constraints: advanced({ zoom: ext.zoom.max }) });
-  }
+  steps.push(...zoomStepsFor(caps));
   if (ext.torch === true && allowTorch) {
     steps.push({ kind: "torch", asked: "torch on", constraints: advanced({ torch: true }) });
     steps.push({ kind: "torch", asked: "torch off", constraints: advanced({ torch: false }) });
   }
   return steps;
+}
+
+/**
+ * True when this camera advertises no control of any kind.
+ *
+ * Distinct from "nothing was asked of it": a camera whose only control is a
+ * torch that has already been fired elsewhere has an empty step list and is NOT
+ * a camera without controls. Saying so put two contradictory lines next to each
+ * other in the notes — one explaining why the flash was not fired again, and one
+ * claiming there was no flash to fire.
+ */
+function advertisesNoControls(caps: MediaTrackCapabilities | null): boolean {
+  return controlStepsFor(caps, true).length === 0;
 }
 
 export type SweepOptions = {
@@ -789,6 +865,10 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         durationMs: 0,
         inventory: [],
         rows,
+        untried: [],
+        cameraCosts: [],
+        slowestStep: null,
+        perCameraBudgetMs: null,
         stillPolicy: STILL_POLICY,
         notes,
         aborted,
@@ -834,11 +914,27 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       "per camera rather than once per rung. Where any of this shortened a camera's plan, the camera's own figures are quoted in a note beside it."
   );
 
-  // An estimate for the progress bar only. The real plan is built per camera
-  // from what that camera advertises, so it is shorter than this on most of
-  // them; the bar is clamped rather than allowed to overrun.
-  const total = Math.max(1, inventory.length * (LADDER.length + ASPECTS.length + FRAME_RATES.length + 8));
+  // The progress total is the REAL plan, not a guess. Each camera contributes
+  // an exact step count — rungs, ratios, frame rates AND control steps — the
+  // moment it has stated its limits on the first open. Cameras not yet reached
+  // contribute a placeholder that is REPLACED rather than added to, and until
+  // every camera has been planned the total is flagged inexact so the page can
+  // say so instead of implying a precision it does not have.
+  const PLACEHOLDER_STEPS_PER_CAMERA = LADDER.length + ASPECTS.length + FRAME_RATES.length + 10;
+  let plannedCameras = 0;
+  let knownSteps = 0;
+  const totalNow = (): number => Math.max(1, knownSteps + Math.max(0, inventory.length - plannedCameras) * PLACEHOLDER_STEPS_PER_CAMERA);
+  const totalIsExact = (): boolean => plannedCameras >= inventory.length;
   let done = 0;
+  const report = (message: string): void => options.onProgress(message, done, Math.max(totalNow(), done), totalIsExact());
+
+  // Every camera gets a share of the run's time. Generous on purpose: this is
+  // not a performance target, it is a stop on the one camera that takes fifteen
+  // seconds to open and would otherwise consume the whole run on its own.
+  const perCameraBudgetMs = inventory.length > 0 ? cameraBudgetMs(inventory.length) : null;
+  const stepTimer = createStepTimer();
+  const cameraCosts: CameraCost[] = [];
+  const untried: UntriedStep[] = [];
 
   for (const device of inventory) {
     await options.waitWhilePaused?.();
@@ -848,6 +944,26 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     }
     const name = device.label || `camera ${device.deviceId.slice(0, 8)}`;
     let capabilities: MediaTrackCapabilities | null = null;
+    const cameraStart = performance.now();
+    let cameraSteps = 0;
+    let cameraUntried = 0;
+    let hitBudget = false;
+    const outOfTime = (): boolean => perCameraBudgetMs != null && performance.now() - cameraStart >= perCameraBudgetMs;
+
+    /**
+     * Records the steps this camera never reached. UNTRIED is its own word:
+     * these are not refusals, not limits the camera stated and not timeouts,
+     * and they are kept out of `rows` so no count of refusals can pick them up.
+     */
+    const leaveUntried = (steps: { kind: MatrixRow["kind"]; asked: string }[], reason: string): void => {
+      for (const step of steps) {
+        untried.push({ deviceId: device.deviceId, deviceLabel: name, kind: step.kind, asked: step.asked, reason });
+        cameraUntried += 1;
+        // The plan total shrinks with them, so the bar reflects what will
+        // actually run rather than stalling short of the end.
+        knownSteps = Math.max(done, knownSteps - 1);
+      }
+    };
 
     // The plan starts as one step — the native maximum — and the rest is
     // appended once that step has read the camera's capabilities. Extending the
@@ -856,11 +972,18 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
     // from an assumption about what this camera can do.
     let plan: StepPlan[] = [nativeMaxStep(device.deviceId)];
     let planned = false;
+    let controlEstimate = 0;
     const extendPlan = (): void => {
       if (planned) return;
       planned = true;
       const built = planFor(device.deviceId, ceilingFrom(capabilities));
       plan = plan.concat(built.steps);
+      // The plan is now known exactly for this camera, control steps included.
+      // Leaving those out was why the bar used to fill up and then sit at the
+      // end through roughly a third of every camera.
+      controlEstimate = controlStepsFor(capabilities, torchFiredOn == null).length;
+      knownSteps += 1 + built.steps.length + controlEstimate;
+      plannedCameras += 1;
       for (const note of built.notes) notes.push(`${name}: ${note}`);
       if (!capabilities) {
         notes.push(
@@ -876,8 +999,14 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         aborted = true;
         break;
       }
+      if (outOfTime()) {
+        hitBudget = true;
+        leaveUntried(plan.slice(index), budgetReachedText(name, perCameraBudgetMs ?? 0, plan.length - index));
+        break;
+      }
       done += 1;
-      options.onProgress(`${name} — ${step.asked}`, done, Math.max(total, done));
+      cameraSteps += 1;
+      report(`${name} — ${step.asked}`);
 
       const stepStart = performance.now();
       let stream: MediaStream | null = null;
@@ -941,6 +1070,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             sameAsSlug: priorPlatform,
             shapeId: "(no file — none was taken)",
             taken: false,
+            notTakenKind: "already-photographed",
             reason: `This camera had already been photographed at ${grantedSize} down the platform photo pipeline, and this request was granted that same size, so no second photograph was taken. The request itself ran and its granted settings are on this row; what was skipped is a file that would have been the same picture at the same size.`,
           });
         } else {
@@ -977,7 +1107,8 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             sameAsSlug: "",
             shapeId: "(no file — none was taken)",
             taken: false,
-            reason: `No canvas frame was encoded at the native maximum. At this size that file is several megabytes THIS APP produced from the video track rather than anything the camera made, and the canvas path is exercised at every smaller rung below, where the same pipeline is visible for a fraction of the memory.`,
+            notTakenKind: "native-max-canvas",
+            reason: `No canvas frame was encoded at the native maximum, and no earlier file holds this size either — nothing in this run was ever encoded at it. At this size that file is several megabytes THIS APP would have produced from the video track rather than anything the camera made, and the canvas path is exercised at every smaller rung below, where the same pipeline is visible for a fraction of the memory.`,
           });
         } else if (priorCanvas != null) {
           stepRow.duplicates.push({
@@ -985,6 +1116,7 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
             sameAsSlug: priorCanvas,
             shapeId: "(no file — none was taken)",
             taken: false,
+            notTakenKind: "already-photographed",
             reason: `This camera had already been photographed at ${grantedSize} down the canvas path, and this request was granted that same size, so no second frame was encoded.`,
           });
         } else if (video) {
@@ -1053,30 +1185,44 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         }
       }
       stop(stream);
+      stepTimer.recordLabelled(`${name} — ${step.asked}`, performance.now() - stepStart);
     }
 
-    if (aborted) break;
+    if (aborted) {
+      cameraCosts.push({ label: name, ms: Math.round(performance.now() - cameraStart), steps: cameraSteps, untried: cameraUntried, hitBudget });
+      break;
+    }
 
     // Control modes need one open track they can be applied to in sequence.
     const signature = controlSignature(capabilities);
     const walkedOn = signature ? controlSurfaces.get(signature) : undefined;
-    const controls = walkedOn ? [] : controlStepsFor(capabilities, torchFiredOn == null);
-    if (torchAdvertised(capabilities) && torchFiredOn != null && torchFiredOn !== name && !walkedOn) {
+    // Zoom is exempt from the repeat rule. The hand-shot stage reads the zoom
+    // rows to decide whether to ask for a zoom photograph, so a camera with no
+    // zoom rows was being written up as one that showed no zoom range — a
+    // statement about a question nobody asked it.
+    const zoomOnly = zoomStepsFor(capabilities);
+    const controls = walkedOn ? zoomOnly : controlStepsFor(capabilities, torchFiredOn == null);
+    const torchHeldBack = torchAdvertised(capabilities) && torchFiredOn != null;
+    if (torchHeldBack && !walkedOn) {
       notes.push(
         `${name}: advertises a torch, and the flash was not fired again. It was fired once already, on ${torchFiredOn}, and that row is above. Every rear camera on a phone drives the same physical LED, so a second firing is one demonstration repeated into the room — the torch rows for this camera are absent for that reason and for no other. Nothing is claimed here about whether this camera's torch constraint would have been granted.`
       );
     }
     if (walkedOn && signature) {
       notes.push(
-        `${name}: advertises exactly the same control surface as ${walkedOn} — the same focus, exposure, white-balance and resize lists, the same zoom range and the same torch flag — so the mode-by-mode rows were not walked a second time. They were walked once, on ${walkedOn}, and those rows are above. ` +
-          `This is a decision about where the run spends its time, NOT a claim that this camera would have answered the same way: nothing about its control behaviour beyond the surface it advertises was recorded, and that absence is stated here rather than filled in.`
+        `${name}: advertises exactly the same control surface as ${walkedOn} — the same focus, exposure, white-balance and resize lists, the same zoom range and the same torch flag — so the focus, exposure, white-balance, resize and torch rows were not walked a second time. They were walked once, on ${walkedOn}, and those rows are above. ` +
+          `The ZOOM rows are the exception and were walked here in full: zoom is the one control that genuinely differs lens to lens, two lenses that describe themselves identically are exactly the pair worth measuring separately, and the hand-shot stage reads these rows to decide what to ask you for. ` +
+          `The rest is a decision about where the run spends its time, NOT a claim that this camera would have answered the same way: nothing about its focus, exposure, white-balance, resize or torch behaviour beyond the surface it advertises was recorded, and that absence is stated here rather than filled in.`
       );
-    } else if (controls.length === 0) {
-      notes.push(`${name}: the platform advertised no focus, exposure, white-balance, resize, zoom or torch controls, so there was nothing to apply.`);
+    } else if (controls.length === 0 && advertisesNoControls(capabilities)) {
+      notes.push(
+        capabilities
+          ? `${name}: the platform advertised no focus, exposure, white-balance, resize, zoom or torch controls, so there was nothing to apply.`
+          : `${name}: no capability object could be read for this camera, so no control was asked of it. Nothing here is a statement that the camera has no controls — it is a statement that this browser did not say, and no zoom range was read either, so the hand-shot stage treats its zoom as unknown rather than as absent.`
+      );
     }
     if (controls.length > 0) {
-      if (signature) controlSurfaces.set(signature, name);
-      if (torchAdvertised(capabilities) && torchFiredOn == null) torchFiredOn = name;
+      if (signature && !walkedOn) controlSurfaces.set(signature, name);
       let stream: MediaStream | null = null;
       try {
         stream = await openMediaWithDeadline({ audio: false, video: { deviceId: { exact: device.deviceId } } }, { what: `${name} (control-mode reopen)`, onLate: noteLate });
@@ -1085,14 +1231,24 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         notes.push(`${name}: could not reopen for control-mode testing (${errorName(err)}).`);
       }
       const track = stream?.getVideoTracks()[0] ?? null;
-      for (const control of controls) {
+      // The plan was costed with the estimate taken at extendPlan time; the
+      // real list is known now, so the total is corrected rather than left to
+      // drift.
+      knownSteps += controls.length - controlEstimate;
+      for (const [controlIndex, control] of controls.entries()) {
         await options.waitWhilePaused?.();
         if (options.shouldAbort()) {
           aborted = true;
           break;
         }
+        if (outOfTime()) {
+          hitBudget = true;
+          leaveUntried(controls.slice(controlIndex), budgetReachedText(name, perCameraBudgetMs ?? 0, controls.length - controlIndex));
+          break;
+        }
         done += 1;
-        options.onProgress(`${name} — ${control.asked}`, done, Math.max(total, done));
+        cameraSteps += 1;
+        report(`${name} — ${control.asked}`);
         const stepStart = performance.now();
         if (!track) {
           rows.push({
@@ -1115,6 +1271,12 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         try {
           await track.applyConstraints(control.constraints);
           const after = track.getSettings?.() ?? null;
+          // The flash counts as fired only here, once the constraint has
+          // actually been applied. Marking it before the attempt meant a camera
+          // that failed to reopen still told every later camera the flash "was
+          // fired already, and that row is above" — pointing at a row that
+          // failed, or at no row at all.
+          if (control.kind === "torch" && control.asked === "torch on" && torchFiredOn == null) torchFiredOn = name;
           rows.push({
             deviceId: device.deviceId,
             deviceLabel: name,
@@ -1156,6 +1318,9 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       }
       stop(stream);
     }
+
+    if (hitBudget) notes.push(budgetReachedText(name, perCameraBudgetMs ?? 0, cameraUntried));
+    cameraCosts.push({ label: name, ms: Math.round(performance.now() - cameraStart), steps: cameraSteps, untried: cameraUntried, hitBudget });
   }
 
   if (aborted) notes.push("You stopped the sweep before it finished. Every row above really ran; the rows that never ran are simply absent, and the archive is marked partial.");
@@ -1165,11 +1330,23 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
         `Each one is named on its own row with the file it matched. Those requests all succeeded; nothing here is a camera failing, and nothing that was dropped is counted as a photograph taken.`
     );
   }
-  const notTaken = rows.reduce((sum, row) => sum + row.duplicates.filter((duplicate) => !duplicate.taken).length, 0);
-  if (notTaken > 0) {
+  // Counted apart, because they are not the same claim. One names a file that
+  // already holds the size; the other names nothing at all, and counting them
+  // together promised a file that does not exist.
+  const countNotTaken = (kind: "already-photographed" | "native-max-canvas"): number =>
+    rows.reduce((sum, row) => sum + row.duplicates.filter((duplicate) => !duplicate.taken && duplicate.notTakenKind === kind).length, 0);
+  const notTakenRepeat = countNotTaken("already-photographed");
+  const notTakenNativeMax = countNotTaken("native-max-canvas");
+  if (notTakenRepeat > 0) {
     notes.push(
-      `${notTaken} photograph(s) were never taken, on rows where the camera had already been photographed at the size that row was granted. Those rows say so individually, and each one names the file that already holds that size. ` +
+      `${notTakenRepeat} photograph(s) were never taken, on rows where the camera had already been photographed at the size that row was granted. Those rows say so individually, and each one names the file that already holds that size. ` +
         `This is the cheaper half of the same rule as the shapes above: the ledger compares bytes after a photograph exists, and this stops the photograph being made when the size is already answered. Every one of those requests still ran and every asked-versus-granted row is complete.`
+    );
+  }
+  if (notTakenNativeMax > 0) {
+    notes.push(
+      `${notTakenNativeMax} canvas frame(s) were never encoded at a camera's native maximum, which is a different reason from the one above and names no file: nothing in this run holds that size, because nothing was ever encoded at it. ` +
+        `A canvas frame at a 4K-and-above native maximum is several megabytes THIS APP would have produced from the video track rather than anything the camera made, and the canvas path is exercised at every smaller rung on the same camera. The platform photo pipeline still ran at the native maximum, so those rows are not empty.`
     );
   }
   for (const shared of ledger.sharedShapes()) {
@@ -1203,6 +1380,10 @@ export async function runCameraSweep(options: SweepOptions): Promise<{ report: C
       durationMs: Math.round(performance.now() - t0),
       inventory,
       rows,
+      untried,
+      cameraCosts,
+      slowestStep: stepTimer.slowest(),
+      perCameraBudgetMs,
       stillPolicy: STILL_POLICY,
       notes,
       aborted,
@@ -1322,6 +1503,70 @@ export function matrixText(report: CameraMatrixReport): string {
         if (shape.repeats.length > 12) lines.push(`                · … and ${shape.repeats.length - 12} more`);
       }
       lines.push("");
+    }
+  }
+
+  if (report.untried.length > 0) {
+    lines.push(
+      "",
+      "=".repeat(78),
+      `UNTRIED (${report.untried.length})`,
+      "=".repeat(78),
+      "",
+      "Requests that were never made, because their camera reached its share of the run's time first.",
+      "",
+      "UNTRIED is its own word here and means exactly one thing: this was not asked. It is NOT a refusal",
+      "(the camera never got the chance to state a limit), NOT a timeout (nothing was waited on), and NOT a",
+      "capability claim of any kind. Those three exist separately above and mean different things. Nothing",
+      "whatsoever is inferred about what any of these would have returned.",
+      ""
+    );
+    const byCamera = new Map<string, UntriedStep[]>();
+    for (const step of report.untried) {
+      const list = byCamera.get(step.deviceLabel) ?? [];
+      list.push(step);
+      byCamera.set(step.deviceLabel, list);
+    }
+    for (const [camera, steps] of byCamera) {
+      lines.push(`  ${camera} — ${steps.length} untried`, `      ${steps[0].reason}`, "");
+      for (const step of steps) lines.push(`      · [${step.kind}] ${step.asked}`);
+      lines.push("");
+    }
+  }
+
+  if (report.cameraCosts.length > 0) {
+    lines.push(
+      "",
+      "=".repeat(78),
+      "WHAT THE SWEEP COST, PER CAMERA",
+      "=".repeat(78),
+      "",
+      "Wall clock readings from this run on this phone. A slow camera is not a fault — it is one of the more",
+      "useful facts in this archive, and it is measured rather than assumed.",
+      ""
+    );
+    for (const cost of report.cameraCosts) {
+      lines.push(
+        `  ${cost.label}`,
+        `      ${formatDuration(cost.ms)} across ${cost.steps} request(s)` +
+          (cost.untried > 0 ? `, ${cost.untried} left untried` : "") +
+          (cost.hitBudget ? "  ← reached its share of the run's time" : "")
+      );
+    }
+    if (report.slowestStep) {
+      lines.push(
+        "",
+        `  Slowest single request: ${formatDuration(report.slowestStep.ms)} — ${report.slowestStep.label}`,
+        `  Measured against the ${(CAMERA_OPEN_TIMEOUT_MS / 1000).toFixed(0)}-second camera deadline, past which a request is abandoned rather than waited on.`
+      );
+    }
+    if (report.perCameraBudgetMs != null) {
+      lines.push(
+        "",
+        `  Each camera was allowed ${formatDuration(report.perCameraBudgetMs)} of its own. The ceiling is generous on purpose: it exists for`,
+        "  the one camera on a phone that takes fifteen seconds to open and would otherwise consume the entire",
+        "  run, leaving every other camera unmeasured."
+      );
     }
   }
 

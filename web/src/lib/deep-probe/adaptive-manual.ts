@@ -80,13 +80,27 @@ export function fallbackReason(facing: ManualFacing, attempts: { engine: string;
 /**
  * Why a camera was not asked for a zoom shot at all.
  *
- * Called only where the SWEEP already asked this camera for zoom at its minimum
- * and at its maximum and the settings came back the same both times, or where
- * it advertised no zoom range to ask about. Either way the camera has answered
- * the question the shot exists to ask, and answered it in the run the user is
- * already looking at.
+ * Two different situations end in the same absent shot, and they are NOT the
+ * same statement, so they do not share wording.
+ *
+ *   • ANSWERED. The sweep asked this camera for zoom at its minimum and at its
+ *     maximum and the settings came back the same both times, or it advertised
+ *     no range to ask about. The camera answered the question the shot exists
+ *     to ask, in the run the user is already looking at.
+ *
+ *   • NEVER ASKED. No zoom row exists for this camera at all — its capability
+ *     object could not be read, so there was no range to ask against. Writing
+ *     that up as "showed no zoom range" would report an answer nobody
+ *     collected, which is the one thing this app must not do.
  */
-export function zoomNotAskedReason(deviceLabel: string): string {
+export function zoomNotAskedReason(deviceLabel: string, asked: boolean = true): string {
+  if (!asked) {
+    return (
+      `${deviceLabel} was never asked about zoom, so nothing is known about it either way. Its capability object could not be read on this browser, which means there was no ` +
+      `advertised range to ask against — and a zoom shot with no range to aim at would be an ordinary frame dressed up as a measurement. This is an ABSENCE, not an answer: ` +
+      `the camera did not say it has no zoom, and this run did not find out.`
+    );
+  }
   return (
     `${deviceLabel} showed no zoom range in the sweep — it either advertised none, or was asked for its minimum and its maximum and reported the same value both ` +
     `times. A zoom shot from it would be an ordinary unzoomed frame with a note saying the zoom did not move, which is a fact the sweep rows already hold. Nothing ` +
@@ -117,6 +131,10 @@ export const ADAPTIVE_POLICY: string[] = [
   "zoom range. Three of those asked one question, and the middle of a range is answered by its two ends. One",
   "zoom shot is taken now, at the maximum, and only on cameras the SWEEP already showed to have a range — a",
   "camera that reported the same zoom at both ends of its own range is not asked to demonstrate that by hand.",
+  "Every camera is asked the zoom questions in the sweep, including one whose other control rows were skipped",
+  "as a repeat of an earlier camera's: zoom is the one control that genuinely differs lens to lens, and it is",
+  "the one this stage reads. Where a camera could not be asked at all, the skip says it was never asked — not",
+  "that it answered \"none\".",
   "",
   "Every one of these is a PROVEN redundancy, never a prediction, and each is listed below with the",
   "observation that caused it. A shot that was skipped is never counted as a shot that was taken, and no",

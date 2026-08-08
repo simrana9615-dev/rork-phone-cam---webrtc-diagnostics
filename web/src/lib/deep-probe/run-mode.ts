@@ -84,8 +84,8 @@ export const RUN_MODE_INFO: Record<RunMode, { label: string; blurb: string; cost
   full: {
     label: "The full run",
     blurb:
-      "Every permission this app knows how to ask for, real recordings from every sensor that was granted, then every camera photographed at the sizes, shapes, frame rates and control modes it says it supports — plus the two shots you take through the phone's own camera app. Nothing is asked twice: sizes a camera has already been photographed at are not photographed again, and limits it has already stated are not tested against.",
-    cost: "Eight to fifteen minutes, and your attention for the shots you take by hand.",
+      "Every permission this app knows how to ask for, real recordings from every sensor that was granted, then every camera photographed at the sizes, shapes, frame rates and control modes it says it supports. Then the shots you take yourself: two through the phone's own camera app — the first naming NO camera, so you find out which one this phone opens when a page asks for none, and the second asking for the opposite — plus up to five photos from a single trip to your library, and the same photo handed back in three different shapes so the run can say what each one loses. Nothing is asked twice: sizes a camera has already been photographed at are not photographed again, and limits it has already stated are not tested against.",
+    cost: "Two trips to the camera and five to the picker. The length depends on how many cameras this phone has — the run works it out before it starts and tells you what it actually took at the end.",
   },
   "width-640": {
     label: "640 wide, and nothing else",
@@ -99,6 +99,21 @@ export const RUN_MODE_INFO: Record<RunMode, { label: string; blurb: string; cost
 export function summariseMode(mode: RunMode): string {
   return mode === "width-640" ? "640-wide investigation · two opens, about a minute" : "the full run · every permission, every camera, every setting";
 }
+
+/**
+ * How much of the user's attention the hand-shot stage wants, itemised.
+ *
+ * Written out rather than summarised because the shape of this stage changed:
+ * it is no longer one shot per named side, and a card that still described it
+ * that way would be describing a stage that no longer exists.
+ */
+export const MANUAL_STAGE_COST: string[] = [
+  "2 trips to the camera app — the first names no camera, the second asks for the opposite of whatever the first turned out to be.",
+  "2 picker taps for the library pair, which is the same photo asked for twice with different wording.",
+  "1 picker tap that brings back up to 5 photos at once.",
+  "2 more picker taps for the same photo in its other two shapes.",
+  "1 viewfinder shot per camera, plus one more on any camera the sweep watched actually zoom.",
+];
 
 /**
  * The mode, shared. Reads the stored value on mount rather than at module load

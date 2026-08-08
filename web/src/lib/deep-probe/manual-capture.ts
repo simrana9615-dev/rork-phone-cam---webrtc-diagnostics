@@ -92,6 +92,14 @@ export type ManualShotResult = {
   engine: CaptureEngine;
   /** Every route tried, in order, including the one that answered. */
   attempts: RouteAttempt[];
+  /**
+   * Only meaningful on the Capacitor route. True when the original File was
+   * taken from Capacitor's own input before Capacitor could rewrite it; false
+   * when that interception missed and the bytes were rebuilt from a blob URL,
+   * in which case the name and timestamp are synthesised and this run says so
+   * rather than passing the copy off as the original.
+   */
+  interceptedOriginal?: boolean;
 };
 
 /**
@@ -204,7 +212,10 @@ function fileInputCapture(spec: ManualShotSpec, engine: CaptureEngine): Promise<
 /** Runs one shot through one named route, with no fallback of its own. */
 async function runOneRoute(spec: ManualShotSpec, engine: CaptureEngine): Promise<ManualShotResult> {
   if (engine === "capacitor" && spec.source === "camera-app") {
-    const result = await capacitorCapturePhoto(spec.facing ?? "environment");
+    // A null facing is passed straight through as null: this is the shot that
+    // names no camera, and substituting a default here would silently answer
+    // the question it exists to ask.
+    const result = await capacitorCapturePhoto(spec.facing);
     return {
       file: result.file,
       origin: "camera-file",
@@ -212,6 +223,7 @@ async function runOneRoute(spec: ManualShotSpec, engine: CaptureEngine): Promise
       changeIsTrusted: result.changeIsTrusted,
       engine,
       attempts: [],
+      interceptedOriginal: result.interceptedOriginal,
     };
   }
   return fileInputCapture(spec, engine);
@@ -283,31 +295,59 @@ export const LIBRARY_PICK_SHOTS: ManualShotSpec[] = [
 ];
 
 /**
- * Builds the full manual shot list for the run: the two library picks, then one
- * camera-app shot for each side of the phone.
+ * The camera-app shot that names NO camera at all.
  *
- * Two camera-app shots, not six. Each carries every route as a spare rather
- * than as a separate trip, so the stage costs two visits to the camera app on a
- * device where the first route works — which is every device seen so far — and
- * still gets its file on one where it does not.
+ * Whatever this opens is the phone's own choice, which is a real fact about the
+ * device that nothing else in the run measures. Its `facing` is null for the
+ * same reason a library pick's is: claiming a side before the file has been
+ * read would be inventing the answer this shot exists to find.
+ */
+export const UNNAMED_CAMERA_SHOT: ManualShotSpec = {
+  id: "camera-app-unnamed",
+  engine: "capacitor",
+  routes: ["capacitor", ...CAMERA_APP_ENGINES.filter((engine) => engine !== "capacitor")],
+  facing: null,
+  source: "camera-app",
+  purpose:
+    "Your phone's own camera app, opened WITHOUT naming which camera to use. Whatever opens is this phone's choice, not this app's — and which camera a device picks when a page asks for none is a fact about the device that nothing else in this run measures. " +
+    "Take the photo however it opens; do not switch cameras yourself, because the point is what the phone chose. This file is also one of the two in the whole run that the CAMERA wrote, with its own quantisation tables, its own maker note, its own colour profile and its own EXIF. " +
+    "To leave this out altogether use skip — closing the camera moves on to the next route into it, skip drops the shot.",
+};
+
+/**
+ * The second camera-app shot, which asks for a specific side.
+ *
+ * `facing` is decided by what the FIRST shot's own metadata turned out to say,
+ * so the pair covers both sides of the phone and tests the request at the same
+ * time. When the first file names no side, the front is asked for: a phone that
+ * ignores the request opens the back, so asking for the front is the request
+ * most likely to reveal that it was ignored.
+ */
+export function namedCameraShot(facing: "user" | "environment", becauseUnnamedGave: string): ManualShotSpec {
+  const side = facing === "environment" ? "Back" : "Front";
+  return {
+    id: `camera-app-${facing}`,
+    engine: "capacitor",
+    routes: ["capacitor", ...CAMERA_APP_ENGINES.filter((engine) => engine !== "capacitor")],
+    facing,
+    source: "camera-app",
+    purpose:
+      `${side} camera — and this time the camera IS named. ${becauseUnnamedGave} ` +
+      `Asking for the opposite side does two things at once: you end up with one back photo and one front photo, and the run finds out whether this phone actually honours a page's request for a particular camera or accepts it and opens whatever it likes. ` +
+      `Again: take the photo however it opens, and do not switch cameras yourself. If the phone gives you the wrong side, that IS the finding, and swapping it by hand would erase it.`,
+  };
+}
+
+/**
+ * Builds the full manual shot list for the run: the two library picks, then the
+ * two camera-app shots.
+ *
+ * The second camera shot is not in this list. It cannot be, because which side
+ * it asks for is decided by reading the first shot's own metadata — see
+ * `namedCameraShot`, which the run calls once the first file is in hand.
  */
 export function buildManualShotList(): ManualShotSpec[] {
   // Library picks lead: they need no camera, no permission and no good light,
   // and they close the one requested item that nothing else in the run can.
-  const shots: ManualShotSpec[] = [...LIBRARY_PICK_SHOTS];
-  for (const facing of ["environment", "user"] as const) {
-    const side = facing === "environment" ? "Back" : "Front";
-    shots.push({
-      id: `camera-app-${facing}`,
-      engine: CAMERA_APP_ENGINES[0],
-      routes: [...CAMERA_APP_ENGINES],
-      facing,
-      source: "camera-app",
-      purpose:
-        `${side} camera, through the phone's own camera app. This is the one shot in the entire run that produces a file the CAMERA wrote — its own quantisation tables, its own maker note, its own colour profile, its own EXIF — which is why it is worth taking by hand. ` +
-        `It opens by ${ENGINE_NAME[CAMERA_APP_ENGINES[0]]}. If that route fails or you close the camera without taking anything, the next route is offered for this same side, so the ${side.toLowerCase()} camera still ends up with its one file. ` +
-        `To leave this shot out altogether, use skip rather than closing the camera — skip drops the whole shot, closing it moves on to the next route.`,
-    });
-  }
-  return shots;
+  return [...LIBRARY_PICK_SHOTS, UNNAMED_CAMERA_SHOT];
 }

@@ -78,6 +78,14 @@ describe("the zoom shot that was not asked for", () => {
     expect(reason).toContain("Nothing");
     expect(reason).toContain("about the lens is assumed here");
   });
+
+  it("never claims an answer for a camera that was not asked", () => {
+    const unasked = zoomNotAskedReason("Back Telephoto Camera", false);
+    expect(unasked).toContain("was never asked about zoom");
+    expect(unasked).toContain("This is an ABSENCE, not an answer");
+    expect(unasked).toContain("did not say it has no zoom");
+    expect(unasked).not.toContain("showed no zoom range");
+  });
 });
 
 describe("the policy note the archive carries", () => {
@@ -86,5 +94,12 @@ describe("the policy note the archive carries", () => {
     const text = ADAPTIVE_POLICY.join("\n");
     expect(text).toContain("exactly TWO files");
     expect(text).toContain("as spares, tried in turn, not as three separate trips");
+  });
+
+  it("states that zoom is asked of every camera, repeat control surface or not", async () => {
+    const { ADAPTIVE_POLICY } = await import("./adaptive-manual");
+    const text = ADAPTIVE_POLICY.join("\n");
+    expect(text).toContain("Every camera is asked the zoom questions in the sweep");
+    expect(text).toContain("it was never asked");
   });
 });

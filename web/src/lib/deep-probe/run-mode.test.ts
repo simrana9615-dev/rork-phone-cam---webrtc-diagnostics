@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clearRunMode, DEFAULT_RUN_MODE, PROBE_WIDTH, readRunMode, RUN_MODE_INFO, summariseMode, writeRunMode } from "./run-mode";
+import { clearRunMode, DEFAULT_RUN_MODE, MANUAL_STAGE_COST, PROBE_WIDTH, readRunMode, RUN_MODE_INFO, summariseMode, writeRunMode } from "./run-mode";
 
 /** A minimal synchronous localStorage, which is all the mode needs. */
 function installStorage(): void {
@@ -79,12 +79,22 @@ describe("how each mode describes itself", () => {
 
   it("states the cost of each up front", () => {
     expect(RUN_MODE_INFO["width-640"].cost).toContain("about a minute");
-    expect(RUN_MODE_INFO.full.cost).toContain("minutes");
+    expect(RUN_MODE_INFO.full.cost).toContain("Two trips to the camera");
   });
 
-  it("does not promise the full run is longer than it now is", () => {
-    expect(RUN_MODE_INFO.full.cost).not.toContain("Twenty minutes");
-    expect(RUN_MODE_INFO.full.cost).not.toContain("hundred");
+  it("never states a fixed length for the full run, because it depends on the phone", () => {
+    expect(RUN_MODE_INFO.full.cost).not.toMatch(/\d+\s*–\s*\d+\s*min/);
+    expect(RUN_MODE_INFO.full.cost).not.toContain("Eight to fifteen");
+    expect(RUN_MODE_INFO.full.cost).toContain("depends on how many cameras this phone has");
+    expect(RUN_MODE_INFO.full.cost).toContain("tells you what it actually took at the end");
+  });
+
+  it("describes the hand-shot stage as it now is, not as it was", () => {
+    expect(RUN_MODE_INFO.full.blurb).toContain("naming NO camera");
+    expect(RUN_MODE_INFO.full.blurb).toContain("five photos from a single trip");
+    const itemised = MANUAL_STAGE_COST.join(" ");
+    expect(itemised).toContain("2 trips to the camera app");
+    expect(itemised).toContain("up to 5 photos at once");
   });
 
   it("says plainly that the short run sends one constraint and nothing else", () => {

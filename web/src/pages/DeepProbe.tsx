@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 
 import { CrashBanner } from "@/components/deep-probe/CrashBanner";
+import { CAMERA_OPEN_TIMEOUT_MS } from "@/lib/deep-probe/camera-timeout";
 import { probeManualShot, type ZoomTarget } from "@/components/deep-probe/ProbeViewfinder";
 import { SheetViewer } from "@/components/deep-probe/SheetViewer";
 import { Button } from "@/components/ui/button";
@@ -40,7 +41,25 @@ import { readShape } from "@/lib/deep-probe/capture-signature";
 import { finishTrail, mark, markLeft, setHeldBytes, startTrail, stopHeartbeat, takeCrashReport, type CrashReport } from "@/lib/deep-probe/crash-trail";
 import { useExportChoice, type ExportChoice } from "@/lib/deep-probe/export-choice";
 import { hexBudgetForDevice, hexTextBytesFor, readMemoryHints } from "@/lib/deep-probe/hex-budget";
-import { buildManualShotList, ENGINE_NAME, RoutesExhaustedError, runManualShot, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
+import { buildManualShotList, ENGINE_NAME, namedCameraShot, RoutesExhaustedError, runManualShot, UNNAMED_CAMERA_SHOT, type ManualShotSpec } from "@/lib/deep-probe/manual-capture";
+import {
+  capturePhotoForm,
+  claimedExifText,
+  MULTI_PICK_LIMIT,
+  MULTI_PICK_PURPOSE,
+  oppositeOf,
+  PHOTO_FORM_LABEL,
+  pickSeveralPhotos,
+  readCameraRequestFinding,
+  readCapacitorSelfReport,
+  readFacingFromExif,
+  readForm,
+  type CameraRequestFinding,
+  type CapacitorSelfReport,
+  type FacingReading,
+  type FormReading,
+  type PhotoForm,
+} from "@/lib/deep-probe/capacitor-pass";
 import {
   collectOriginals,
   FACING_LABEL,
@@ -67,6 +86,7 @@ import {
 } from "@/lib/deep-probe/permissions";
 import { buildRawPack, downloadRawPack, type RawPackResult } from "@/lib/deep-probe/raw-pack";
 import { PROBE_WIDTH, RUN_MODE_INFO, useRunMode, type RunMode } from "@/lib/deep-probe/run-mode";
+import { createStepTimer, expectedMinutes, formatDuration, remainingEstimate, type RemainingEstimate } from "@/lib/deep-probe/run-cost";
 import { FACING_LABEL as WIDTH_FACING_LABEL, runWidthProbe, type WidthProbeReport } from "@/lib/deep-probe/width-probe";
 import { buildSheets, type RunFacts, type SheetSet, type StageOmission } from "@/lib/deep-probe/sheets";
 import {
@@ -157,13 +177,15 @@ function levelFor(outcome: PermissionOutcome): LogLevel {
 
 type ManualStep = {
   id: string;
-  kind: "viewfinder" | "camera-app" | "library";
+  kind: "viewfinder" | "camera-app" | "library" | "multi-pick" | "photo-form";
   title: string;
   purpose: string;
   deviceId: string | null;
   deviceLabel: string;
   zoom: ZoomTarget;
   spec?: ManualShotSpec;
+  /** Set on the alternate-form steps only — which of Capacitor's three shapes to ask for. */
+  form?: PhotoForm;
 };
 
 /**
@@ -212,6 +234,13 @@ export default function DeepProbe() {
 
   const [sweepMessage, setSweepMessage] = useState<string>("");
   const [sweepPct, setSweepPct] = useState<number>(0);
+  /**
+   * How much longer, from this phone's own step times rather than an average of
+   * other phones. Null until there are enough samples for the figure to mean
+   * anything, which the page says out loud instead of showing a confident
+   * number derived from four steps.
+   */
+  const [sweepRemaining, setSweepRemaining] = useState<RemainingEstimate | null>(null);
   const [matrix, setMatrix] = useState<CameraMatrixReport | null>(null);
   const [widthProbe, setWidthProbe] = useState<WidthProbeReport | null>(null);
   const [thermal, setThermal] = useState<string | null>(null);
@@ -267,6 +296,22 @@ export default function DeepProbe() {
   const omissionsRef = useRef<StageOmission[]>([]);
   const startedAtRef = useRef<string>("");
   const startedMsRef = useRef<number>(0);
+  /** Stage boundaries, so the cost section is a measurement rather than a guess. */
+  const stageCostsRef = useRef<{ stage: string; ms: number }[]>([]);
+  const stageClockRef = useRef<number | null>(null);
+  /**
+   * The untouched original the alternate forms are measured against, taken
+   * before Capacitor could rewrite anything. Null when the interception missed,
+   * which the readings then state rather than estimate around.
+   */
+  const formBaselineRef = useRef<{ bytes: number; mime: string; hasExif: boolean } | null>(null);
+  const formReadingsRef = useRef<FormReading[]>([]);
+  /** What the camera itself said about the shot that named no camera. */
+  const unnamedFacingRef = useRef<FacingReading | null>(null);
+  /** Everything Capacitor will say about itself, read once and kept. */
+  const capacitorReportRef = useRef<CapacitorSelfReport | null>(null);
+  /** Whether this phone honours a page's request for a particular camera. */
+  const cameraRequestRef = useRef<CameraRequestFinding | null>(null);
   const abortRef = useRef<boolean>(false);
   const pausedRef = useRef<boolean>(false);
   const suspensionsRef = useRef<{ phase: Phase; seconds: number; at: string }[]>([]);
@@ -283,6 +328,19 @@ export default function DeepProbe() {
 
   const markStage = useCallback((stage: Phase, mark: StageMark): void => {
     setStageMarks((prev) => (prev[stage] ? prev : { ...prev, [stage]: mark }));
+  }, []);
+
+  /**
+   * Wall clock per stage, closed as each stage hands over. Measured rather than
+   * estimated: a run that describes its own cost from a constant is making a
+   * claim it never took a reading for.
+   */
+  const closeStageCost = useCallback((stage: string): void => {
+    const now = performance.now();
+    const from = stageClockRef.current;
+    stageClockRef.current = now;
+    if (from == null) return;
+    stageCostsRef.current.push({ stage, ms: Math.max(0, Math.round(now - from)) });
   }, []);
 
   /**
@@ -346,6 +404,18 @@ export default function DeepProbe() {
       logs: suspensionLogs(logs, suspensionsRef.current),
       omissions: omissionsRef.current,
       devicesBeforePermission: devicesBeforeRef.current,
+      capacitor:
+        capacitorReportRef.current || formReadingsRef.current.length > 0 || cameraRequestRef.current
+          ? { selfReport: capacitorReportRef.current, cameraRequest: cameraRequestRef.current, forms: formReadingsRef.current }
+          : null,
+      cost: {
+        totalMs: Math.max(0, performance.now() - startedMsRef.current),
+        stages: stageCostsRef.current.map((entry) => ({ stage: entry.stage, ms: entry.ms })),
+        cameras: matrix?.cameraCosts ?? [],
+        slowestStep: matrix?.slowestStep ?? null,
+        cameraDeadlineMs: CAMERA_OPEN_TIMEOUT_MS,
+        perCameraBudgetMs: matrix?.perCameraBudgetMs ?? null,
+      },
     }),
     [tier, records, sensors, matrix, logs]
   );
@@ -713,10 +783,19 @@ export default function DeepProbe() {
       }
 
       addLog("info", "Camera sweep starting — every camera, at the sizes, ratios, frame rates and control modes it says it supports. Rungs above a camera's own stated ceiling are not asked for, apart from one deliberate over-ask.");
+      // The bar and the clock are both fed the real plan. Step times come from
+      // this phone, measured between progress callbacks, so the remaining
+      // figure is never an average of other devices.
+      const sweepTimer = createStepTimer();
+      let lastTick = performance.now();
       const { report, captures } = await runCameraSweep({
-        onProgress: (message, done, total) => {
+        onProgress: (message, done, total, totalIsExact) => {
+          const now = performance.now();
+          if (done > 0) sweepTimer.record(now - lastTick);
+          lastTick = now;
           setSweepMessage(message);
           setSweepPct(Math.min(99, Math.round((done / Math.max(total, 1)) * 100)));
+          setSweepRemaining(remainingEstimate(done, total, sweepTimer, totalIsExact === true));
         },
         onCapture: (capture) => {
           capturesRef.current.push(capture);
@@ -737,11 +816,29 @@ export default function DeepProbe() {
       }
       setSweepPct(100);
       setSweepMessage("");
+      setSweepRemaining(null);
       const granted = report.rows.filter((r) => r.ok).length;
       addLog(
         "success",
-        `Sweep finished: ${granted} of ${report.rows.length} requests granted across ${report.inventory.length} camera(s), ${captures.length} photos taken.`
+        `Sweep finished in ${formatDuration(report.durationMs)}: ${granted} of ${report.rows.length} requests granted across ${report.inventory.length} camera(s), ${captures.length} photos taken.`
       );
+      if (report.untried.length > 0) {
+        const budgeted = report.cameraCosts.filter((cost) => cost.hitBudget);
+        for (const cost of budgeted) {
+          addLog("warn", `${cost.label} used its full ${formatDuration(report.perCameraBudgetMs ?? 0)} share and stopped with ${cost.untried} request(s) untried.`);
+        }
+        addLog(
+          "info",
+          `${report.untried.length} request(s) are recorded as UNTRIED — never asked, so nothing is known about them. That is not a refusal, not a limit any camera stated and not a timeout; all three exist separately in the sheets.`
+        );
+        omissionsRef.current.push({
+          stage: "Camera sweep (some requests)",
+          reason: `${report.untried.length} request(s) were never made, because their camera reached its ${formatDuration(report.perCameraBudgetMs ?? 0)} share of the run's time first. Each one is listed by name in the camera matrix as UNTRIED. Nothing is inferred about what they would have returned — untried is not a refusal, not a stated limit and not a timeout.`,
+        });
+      }
+      if (report.slowestStep) {
+        addLog("debug", `Slowest single request: ${formatDuration(report.slowestStep.ms)} — ${report.slowestStep.label}.`);
+      }
       if (report.rows.length > granted) {
         addLog("debug", `${report.rows.length - granted} requests were refused. Those are results — they map where the hardware's limits actually are.`);
       }
@@ -757,6 +854,7 @@ export default function DeepProbe() {
       }
 
       markStage("camera", "done");
+      closeStageCost("Camera sweep");
       const inventory = await enumerateVideoInputs();
       const manual = buildManualSteps(inventory, report);
       setManualSteps(manual.steps);
@@ -767,10 +865,22 @@ export default function DeepProbe() {
         setAdaptiveSkips([...adaptiveSkipsRef.current]);
         addLog("info", `${manual.skips.length} zoom shot(s) are not on the list: the sweep already watched those cameras refuse to zoom.`);
       }
+
+      // Everything Capacitor will say about itself, read once and for nothing:
+      // no prompt, no picker, no camera. Its opinion about your permissions is
+      // its own and can disagree with the browser's, which is worth having.
+      const selfReport = await readCapacitorSelfReport(statesAfterRef.current.length > 0 ? statesAfterRef.current : statesBeforeRef.current);
+      capacitorReportRef.current = selfReport;
+      for (const note of selfReport.notes) addLog("info", note);
+      for (const error of selfReport.errors) addLog("debug", error);
+      for (const pair of selfReport.permissions) {
+        if (pair.disagreement) addLog("warn", pair.disagreement);
+      }
+
       setManualIndex(0);
       setPhase("manual");
     })();
-  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports, mode]);
+  }, [phase, grantedIds, addLog, waitWhilePaused, markStage, toExports, mode, closeStageCost]);
 
   /* ---------------- stage four: manual shots ---------------- */
   const manualStep = phase === "manual" ? manualSteps[manualIndex] : undefined;
@@ -821,6 +931,73 @@ export default function DeepProbe() {
         setByteCount((b) => b + shot.blob.size);
         addLog("success", `${step.title}: ${shot.width}×${shot.height}, ${formatBytes(shot.blob.size)} via ${shot.path === "image-capture" ? "the platform photo pipeline" : "a canvas encode by this app"}.`);
         if (shot.zoomNote) addLog("debug", shot.zoomNote);
+      } else if (step.kind === "multi-pick") {
+        // The one request in the run that returns several files from a single
+        // trip. Every one is filed as a library pick, however rich its
+        // metadata: "came from a camera at some point" is not "taken just now".
+        const picked = await pickSeveralPhotos();
+        for (const photo of picked) {
+          const capture: ProbeCapture = {
+            slug: `manual-${String(manualIndex + 1).padStart(2, "0")}-pick-${String(photo.index + 1).padStart(2, "0")}`,
+            label: `${step.title} — photo ${photo.index + 1} of ${picked.length}`,
+            blob: photo.blob,
+            origin: "supplied-file",
+            stage: "manual",
+            deviceLabel: null,
+            path: "picker-file",
+            width: 0,
+            height: 0,
+            fileName: photo.fileName,
+            fileLastModified: null,
+            fileRelativePath: null,
+            asked: `Capacitor multi-pick, limit ${MULTI_PICK_LIMIT}, quality 100, no orientation correction — a library pick, never a fresh photo`,
+            granted: `${photo.blob.size.toLocaleString("en-US")} bytes, type "${photo.blob.type || "(none declared)"}", format "${photo.format ?? "(not stated)"}". ${claimedExifText(photo.claimedExif)}`,
+            takenAt: new Date().toISOString(),
+          };
+          capturesRef.current.push(capture);
+          setByteCount((b) => b + photo.blob.size);
+        }
+        setPhotoCount(capturesRef.current.length);
+        addLog(
+          "success",
+          `${picked.length} photo(s) came back from ONE picker trip — nothing else in this run can do that. Every one is filed as a library pick and none is offered as a photo taken just now.`
+        );
+        if (picked.length < MULTI_PICK_LIMIT) {
+          addLog(
+            "info",
+            `You picked ${picked.length} of the ${MULTI_PICK_LIMIT} this asked for. That is recorded as what you chose, not as anything failing — fewer photos simply means a smaller sample of how metadata varies on this phone.`
+          );
+        }
+      } else if (step.kind === "photo-form" && step.form) {
+        const form = step.form;
+        const delivered = await capturePhotoForm(form, "library");
+        const bytes = new Uint8Array(await delivered.blob.arrayBuffer());
+        const hasExif = readFacingFromExif(bytes).evidence.includes("no EXIF at all") === false;
+        const baseline = formBaselineRef.current;
+        const reading = readForm(form, { bytes: delivered.blob.size, mime: delivered.declaredMime, hasExif }, baseline);
+        formReadingsRef.current.push(reading);
+        const capture: ProbeCapture = {
+          slug: `manual-${String(manualIndex + 1).padStart(2, "0")}-${step.id}`,
+          label: step.title,
+          blob: delivered.blob,
+          origin: "supplied-file",
+          stage: "manual",
+          deviceLabel: null,
+          path: "picker-file",
+          width: 0,
+          height: 0,
+          fileName: null,
+          fileLastModified: null,
+          fileRelativePath: null,
+          asked: `Capacitor getPhoto, resultType ${PHOTO_FORM_LABEL[form]}, quality 100, no editing, no orientation correction, nothing saved to your gallery`,
+          granted: `${reading.reading} ${claimedExifText(delivered.claimedExif)}`,
+          takenAt: new Date().toISOString(),
+        };
+        capturesRef.current.push(capture);
+        setPhotoCount(capturesRef.current.length);
+        setByteCount((b) => b + delivered.blob.size);
+        setManualNotes((prev) => [...prev, `${step.title}: ${reading.reading}`]);
+        addLog(reading.identical === false ? "warn" : "success", `${step.title}: ${reading.reading}`);
       } else if (step.spec) {
         const spec = step.spec;
         const result = await runManualShot(spec, (engine, at, total) => {
@@ -851,16 +1028,105 @@ export default function DeepProbe() {
           takenAt: new Date().toISOString(),
         };
         capturesRef.current.push(capture);
+
+        // The camera's own word on which side fired, read from the file rather
+        // than taken from the request. Reading it back out of the request would
+        // make the whole measurement circular.
+        let readFacing: FacingReading | null = null;
+        if (!isLibrary) {
+          readFacing = readFacingFromExif(new Uint8Array(await result.file.arrayBuffer()));
+          addLog(readFacing.side === "unknown" ? "warn" : "info", `${step.title}: ${readFacing.evidence}`);
+          if (result.interceptedOriginal === false) {
+            addLog(
+              "warn",
+              `${step.title}: the original File could not be intercepted before Capacitor rewrote it, so these bytes are Capacitor's copy and the name and timestamp are synthesised. Labelled as a rebuilt copy rather than passed off as the original.`
+            );
+          }
+          // The untouched original the alternate forms are measured against.
+          if (formBaselineRef.current == null) {
+            formBaselineRef.current = { bytes: result.file.size, mime: result.file.type, hasExif: readFacing.side !== "unknown" || !readFacing.evidence.includes("no EXIF at all") };
+          }
+        }
+
         // Declared here, where the facing and the production path are both known
         // for certain. A library pick never qualifies, however rich its metadata.
-        if (!isLibrary && spec.facing != null) {
-          originalCandidatesRef.current.push({ slug: capture.slug, facing: spec.facing, path: capture.path, origin: capture.origin });
+        // The unnamed shot's side comes from the FILE, so an ignored request can
+        // never file a front photo as a back one.
+        const settledFacing: ManualFacing | null = spec.facing ?? (readFacing?.side === "unknown" ? null : (readFacing?.side ?? null));
+        if (!isLibrary && settledFacing != null) {
+          originalCandidatesRef.current.push({ slug: capture.slug, facing: settledFacing, path: capture.path, origin: capture.origin });
+        }
+
+        // The second camera shot is built here, from what the first one turned
+        // out to be, and inserted directly after it.
+        if (spec.id === UNNAMED_CAMERA_SHOT.id && readFacing) {
+          unnamedFacingRef.current = readFacing;
+          const next = oppositeOf(readFacing);
+          const because =
+            readFacing.side === "unknown"
+              ? `The shot that named no camera does not say which one took it — ${readFacing.evidence} So the front is asked for here, because a phone that ignores the request opens the back, which makes the front the ask most likely to reveal it.`
+              : `The shot that named no camera turned out to be the ${readFacing.side === "user" ? "front" : "back"} one — ${readFacing.evidence}`;
+          const nextSpec = namedCameraShot(next, because);
+          const nextStep: ManualStep = {
+            id: nextSpec.id,
+            kind: "camera-app",
+            title: `Camera app — ${next === "environment" ? "back" : "front"} camera, named this time`,
+            purpose: nextSpec.purpose,
+            deviceId: null,
+            deviceLabel: "the phone's own camera app",
+            zoom: null,
+            spec: nextSpec,
+          };
+          setManualSteps((prev) => (prev.some((candidate) => candidate.id === nextStep.id) ? prev : [...prev.slice(0, manualIndex + 1), nextStep, ...prev.slice(manualIndex + 1)]));
+          addLog("info", because);
+        }
+
+        // Both camera shots are in: say whether the request was honoured.
+        if (spec.facing != null && readFacing && unnamedFacingRef.current && cameraRequestRef.current == null) {
+          const finding = readCameraRequestFinding(unnamedFacingRef.current, spec.facing, readFacing);
+          cameraRequestRef.current = finding;
+          setManualNotes((prev) => [...prev, finding.verdict]);
+          addLog(finding.honoured === "no" ? "warn" : finding.honoured === "yes" ? "success" : "info", finding.verdict);
+          // Both shots landed on the same camera, so one side of the phone has
+          // no original. The missing side is offered once more down the plain
+          // path — a different pipeline, which is the only thing left to try —
+          // and the ignored request stays on the record as the finding it is.
+          if (finding.honoured === "no") {
+            const missing = spec.facing;
+            const retryId = `camera-app-${missing}-plain-retry`;
+            const retryStep: ManualStep = {
+              id: retryId,
+              kind: "camera-app",
+              title: `Camera app — ${missing === "environment" ? "back" : "front"} camera, one more try down a different path`,
+              purpose:
+                `Both shots so far have come back from the same camera, so this phone has given you two of one side and none of the other. ${finding.verdict} ` +
+                `This asks once more, down the plain capture attribute instead of Capacitor — a genuinely different pipeline, and the only thing left to try. ` +
+                `If it comes back from the same camera again, that is the answer and the run stops asking: the missing side is recorded as missing, with the reason, and nothing is substituted for it.`,
+              deviceId: null,
+              deviceLabel: "the phone's own camera app",
+              zoom: null,
+              spec: {
+                id: retryId,
+                engine: "native-camera",
+                routes: ["native-camera", "capture-boolean"],
+                facing: missing,
+                source: "camera-app",
+                purpose: "",
+              },
+            };
+            setManualSteps((prev) => (prev.some((candidate) => candidate.id === retryId) ? prev : [...prev.slice(0, manualIndex + 1), retryStep, ...prev.slice(manualIndex + 1)]));
+            addLog("info", `The ${missing === "environment" ? "back" : "front"} side has no original yet, so it is offered once more down a different pipeline. One retry, not a loop.`);
+            omissionsRef.current.push({
+              stage: `Camera app — the ${missing === "environment" ? "back" : "front"} camera original`,
+              reason: finding.verdict,
+            });
+          }
         }
         // Each side needs exactly one file the camera itself wrote, and it now
         // has one. The routes that were never opened are recorded as spares
         // that went unused, which is a different thing from a shot skipped.
-        if (!isLibrary && spec.facing != null) {
-          const facing: ManualFacing = spec.facing;
+        if (!isLibrary && settledFacing != null) {
+          const facing: ManualFacing = settledFacing;
           const tried = new Set(result.attempts.map((attempt) => String(attempt.engine)));
           const unused = spec.routes.map((engine) => String(engine)).filter((engine) => !tried.has(engine));
           if (unused.length > 0) {
@@ -927,9 +1193,17 @@ export default function DeepProbe() {
   useEffect(() => {
     if (phase !== "manual" || manualSteps.length === 0 || manualIndex < manualSteps.length) return;
     addLog("success", "Manual shots finished.");
+    if (cameraRequestRef.current == null) {
+      omissionsRef.current.push({
+        stage: "Whether this phone honours a camera request",
+        reason:
+          "Both camera-app shots were needed to answer this and both did not complete, so it is recorded as unmeasured. One shot on its own cannot tell an honoured request from an ignored one, and guessing between them from a single file would be an inference dressed up as a measurement.",
+      });
+    }
     markStage("manual", "done");
+    closeStageCost("Your own shots");
     toExports();
-  }, [phase, manualIndex, manualSteps.length, addLog, markStage, toExports]);
+  }, [phase, manualIndex, manualSteps.length, addLog, markStage, toExports, closeStageCost]);
 
   /* ---------------- stage five: the facts, then the sheets ---------------- */
   useEffect(() => {
@@ -1365,7 +1639,18 @@ export default function DeepProbe() {
                 style={{ width: `${sweepPct}%` }}
               />
             </div>
-            <p className="mono mt-2 text-[10.5px] leading-relaxed text-muted-foreground">{sweepMessage || "Starting…"}</p>
+            <div className="mono mt-2 flex items-baseline justify-between gap-3 text-[10.5px] text-muted-foreground">
+              <span>{sweepPct}% of the plan</span>
+              <span className={cn(sweepRemaining?.confident ? "text-cyan-300" : undefined)}>
+                {formatDuration(elapsed * 1000)} in · {sweepRemaining ? sweepRemaining.text : "too early to say"}
+              </span>
+            </div>
+            <p className="mono mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground">{sweepMessage || "Starting…"}</p>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+              The bar is the real plan, not a guess — each camera contributes its exact step count once it has stated its own limits, control steps
+              included. The time left comes from how long this phone&rsquo;s steps have actually been taking; until there are enough of them it says so
+              rather than showing a confident number.
+            </p>
             {paused ? (
               <p className="mt-2 flex items-start gap-2 rounded-xl border border-amber-500/45 bg-amber-500/10 p-2.5 text-[11.5px] leading-relaxed text-amber-200">
                 <Pause className="mt-0.5 h-4 w-4 shrink-0" />
@@ -1402,12 +1687,20 @@ export default function DeepProbe() {
                   >
                     {manualBusy ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : manualStep.kind === "library" ? (
+                    ) : manualStep.kind === "library" || manualStep.kind === "multi-pick" || manualStep.kind === "photo-form" ? (
                       <Images className="mr-1.5 h-4 w-4" />
                     ) : (
                       <Camera className="mr-1.5 h-4 w-4" />
                     )}
-                    {manualBusy ? "" : manualStep.kind === "library" ? "Pick one" : "Take it"}
+                    {manualBusy
+                      ? ""
+                      : manualStep.kind === "multi-pick"
+                        ? `Pick up to ${MULTI_PICK_LIMIT}`
+                        : manualStep.kind === "photo-form"
+                          ? "Pick the same one"
+                          : manualStep.kind === "library"
+                            ? "Pick one"
+                            : "Take it"}
                   </Button>
                   <Button variant="outline" disabled={manualBusy || paused} className="h-12" onClick={skipManual}>
                     Skip
@@ -1681,23 +1974,30 @@ export default function DeepProbe() {
 }
 
 /**
- * True when the SWEEP already saw this camera's zoom actually move.
+ * What the SWEEP found out about this camera's zoom.
  *
- * The sweep asks every camera that advertises a range for its minimum and its
- * maximum, and writes what the settings object said afterwards. Two distinct
- * values there is the camera demonstrating a real range; one value, or no zoom
- * rows at all, is the camera saying it has none. Either way the answer comes
- * from this run rather than from an expectation about the lens.
+ * Three outcomes, not two. `moved` is the camera demonstrating a real range;
+ * `flat` is the camera asked at both ends of its own range and answering with
+ * the same value; `never-asked` is no zoom row existing for this camera at all.
+ *
+ * That third case has to be separate. A camera with no zoom rows used to be
+ * written up as one that "showed no zoom range", which reports an answer nobody
+ * collected — and it happened routinely, because a camera whose control block
+ * was skipped as a repeat of an earlier camera's had no zoom rows to read. The
+ * sweep now always asks, so this is rare; when it does happen, it says so.
  */
-function zoomWasObserved(deviceId: string, matrix: CameraMatrixReport | null): boolean {
-  if (!matrix) return false;
+function zoomFinding(deviceId: string, matrix: CameraMatrixReport | null): "moved" | "flat" | "never-asked" {
+  if (!matrix) return "never-asked";
+  const zoomRows = matrix.rows.filter((row) => row.deviceId === deviceId && row.kind === "zoom");
+  const untriedZoom = matrix.untried.some((step) => step.deviceId === deviceId && step.kind === "zoom");
+  if (zoomRows.length === 0) return untriedZoom ? "never-asked" : "flat";
   const seen = new Set<number>();
-  for (const row of matrix.rows) {
-    if (row.deviceId !== deviceId || row.kind !== "zoom" || !row.ok) continue;
+  for (const row of zoomRows) {
+    if (!row.ok) continue;
     const zoom = (row.grantedSettings as { zoom?: unknown } | null)?.zoom;
     if (typeof zoom === "number" && Number.isFinite(zoom)) seen.add(zoom);
   }
-  return seen.size > 1;
+  return seen.size > 1 ? "moved" : "flat";
 }
 
 /**
@@ -1726,7 +2026,8 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
       deviceLabel: label,
       zoom: null,
     });
-    if (zoomWasObserved(device.deviceId, matrix)) {
+    const zoom = zoomFinding(device.deviceId, matrix);
+    if (zoom === "moved") {
       steps.push({
         id: `vf-${device.deviceId.slice(0, 8)}-max`,
         kind: "viewfinder",
@@ -1741,7 +2042,7 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
       skips.push({
         stepId: `vf-${device.deviceId.slice(0, 8)}-max`,
         title: `${label} — zoom max`,
-        reason: zoomNotAskedReason(label),
+        reason: zoomNotAskedReason(label, zoom === "flat"),
       });
     }
   }
@@ -1752,7 +2053,7 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
       kind: isLibrary ? "library" : "camera-app",
       title: isLibrary
         ? `Photo library — ${spec.id === "library-original" ? "the same photo, asking for the original bytes" : "an ordinary upload"}`
-        : `Camera app — ${spec.facing === "environment" ? "back" : "front"} camera original`,
+        : "Camera app — no camera named, so the phone chooses",
       purpose: spec.purpose,
       deviceId: null,
       deviceLabel: isLibrary ? "the photo library" : "the phone's own camera app",
@@ -1760,6 +2061,37 @@ function buildManualSteps(inventory: CameraDeviceInfo[], matrix: CameraMatrixRep
       spec,
     });
   }
+
+  // The second camera shot is NOT here. Which side it asks for is decided by
+  // reading the first shot's own metadata, so it is inserted once that file is
+  // in hand — see `takeManual`.
+
+  steps.push({
+    id: "capacitor-multi-pick",
+    kind: "multi-pick",
+    title: `Photo library — up to ${MULTI_PICK_LIMIT} photos in one trip`,
+    purpose: MULTI_PICK_PURPOSE,
+    deviceId: null,
+    deviceLabel: "the photo library",
+    zoom: null,
+  });
+
+  for (const form of ["base64", "data-url"] as PhotoForm[]) {
+    steps.push({
+      id: `capacitor-form-${form}`,
+      kind: "photo-form",
+      title: `The same photo again — as ${PHOTO_FORM_LABEL[form]}`,
+      purpose:
+        `Pick the SAME photo you picked a moment ago. The only thing that changes is the shape the file is handed back in: ${PHOTO_FORM_LABEL[form]} rather than a link to it. ` +
+        `Every form is compared against the untouched original taken before anything could rewrite it, so the archive can say exactly what this one adds, loses, re-labels or inflates — including whether the camera's own metadata survives the trip. ` +
+        `Picking a different photo does not break anything, but it makes the comparison meaningless, so the same one is worth the effort.`,
+      deviceId: null,
+      deviceLabel: "the photo library",
+      zoom: null,
+      form,
+    });
+  }
+
   return { steps, skips };
 }
 
@@ -2001,20 +2333,47 @@ function Setup({
 }) {
   const short = mode === "width-640";
   const requestCount = useMemo(() => requestsForTier(tier).length, [tier]);
+  /**
+   * How many cameras this device names, read before the run rather than typed
+   * in. Browsers withhold the list until a camera grant exists, so this is often
+   * a count with the labels blanked — and sometimes nothing at all, which the
+   * estimate then says out loud instead of pretending to a number.
+   */
+  const [cameraCount, setCameraCount] = useState<number | null>(null);
+  useEffect(() => {
+    let live = true;
+    void enumerateVideoInputs()
+      .then((devices) => {
+        if (live) setCameraCount(devices.length > 0 ? devices.length : null);
+      })
+      .catch(() => {
+        if (live) setCameraCount(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
   const estimate = useMemo(() => {
-    const promptMinutes = Math.ceil(requestCount * 0.2);
+    // Derived from the camera count, because that is the one figure that
+    // actually drives the length of a run. The old "12–22" was typed in and
+    // stayed put whether the phone had one camera or five.
+    const expected = expectedMinutes(short ? 2 : cameraCount, short ? 1 : requestCount);
     // Photos dominate the archive; hex text is capped by the device budget rather
     // than scaling with the number of captures, which is what keeps the total
     // predictable instead of open-ended.
     const hexText = hexTextBytesFor(HEX_BUDGET);
     return {
-      prompts: requestCount,
-      minutes: `${promptMinutes + 12}–${promptMinutes + 22}`,
-      photos: "60–150 automatic, plus up to 22 you take yourself",
-      size: `250 MB – 700 MB, depending on how many cameras this device has`,
+      prompts: short ? 1 : requestCount,
+      minutes: expected.text,
+      derivedFrom: expected.derivedFrom,
+      photos: short
+        ? "4, taken for you"
+        : `${cameraCount != null ? `roughly ${cameraCount * 18}–${cameraCount * 40} automatic` : "60–150 automatic"}, plus up to ${cameraCount != null ? cameraCount * 2 + 9 : 13} you take yourself`,
+      size: cameraCount != null ? `roughly ${cameraCount * 70} MB – ${cameraCount * 180} MB, from the ${cameraCount} camera(s) this device names` : "250 MB – 700 MB, depending on how many cameras this device has",
       hex: `Hex dumps add at most ${formatBytes(hexText)} on this device — capped on purpose, because rendering every byte of every photo would exhaust this browser's memory before the archive finished. Anything windowed says exactly which bytes it skipped, and the complete photo is always in the archive.`,
     };
-  }, [requestCount]);
+  }, [requestCount, cameraCount, short]);
 
   return (
     <div className="space-y-3">
@@ -2144,6 +2503,9 @@ function Setup({
           <div className="rounded-xl border border-border/60 bg-background/40 p-2.5">
             <div className="mono text-[15px] font-semibold">{estimate.minutes} min</div>
             <div className="mt-0.5 text-[9.5px] uppercase tracking-wide text-muted-foreground">of your attention</div>
+          </div>
+          <div className="col-span-2 rounded-xl border border-border/60 bg-background/40 p-2.5">
+            <p className="text-[10px] leading-relaxed text-muted-foreground">{estimate.derivedFrom}</p>
           </div>
           <div className="col-span-2 rounded-xl border border-border/60 bg-background/40 p-2.5">
             <div className="text-[11.5px] font-semibold">{estimate.photos}</div>

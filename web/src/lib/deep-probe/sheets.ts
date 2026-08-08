@@ -24,7 +24,9 @@ import { buildConstancy } from "./constancy";
 import { briefChecklist, buildCorrelationBrief, type CorrelationInput } from "./correlation-brief";
 import { buildMimicSpec } from "./mimic-spec";
 import type { PassiveGroup } from "./passive";
+import { CAPACITOR_PASS_POLICY, MAX_DATA_POLICY, PHOTO_FORM_LABEL, type CameraRequestFinding, type CapacitorSelfReport, type FormReading } from "./capacitor-pass";
 import { OUTCOME_LABEL, TIER_INFO, type PermissionRecord, type PermissionTier } from "./permissions";
+import { formatDuration, type RunCost } from "./run-cost";
 import type { SensorSeries } from "./sensors";
 import { statsText } from "./sensor-stats";
 import { FACING_LABEL as WIDTH_FACING_LABEL, widthProbeText, type WidthProbeReport } from "./width-probe";
@@ -60,6 +62,28 @@ export type RunFacts = {
    * sweep" are different moments and only one shows the pre-grant state.
    */
   devicesBeforePermission: { kind: string; deviceId: string; groupId: string; label: string }[];
+  /**
+   * What the run actually cost, measured. Null only when nothing was timed.
+   *
+   * Recorded because the page used to promise a range typed in by hand and draw
+   * a bar from a fixed guess. A run that describes its own cost from a constant
+   * is making a claim it did not measure, which is the one thing this app is
+   * not allowed to do.
+   */
+  cost: RunCost | null;
+  /**
+   * The Capacitor pass. Null when it never ran at all.
+   *
+   * Kept together rather than scattered because the three things it produces
+   * only mean something next to each other: what the plugin claims about
+   * itself, what the two camera shots proved about the camera request, and what
+   * each alternate form did to the same photo.
+   */
+  capacitor: {
+    selfReport: CapacitorSelfReport | null;
+    cameraRequest: CameraRequestFinding | null;
+    forms: FormReading[];
+  } | null;
 };
 
 /* ------------------------------------------------------------------ *
@@ -633,6 +657,120 @@ function buildSections(run: RunFacts, facts: CaptureFacts[], checklist: string):
             },
           ],
   });
+
+  if (run.capacitor) {
+    const pass = run.capacitor;
+    const blocks: SheetBlock[] = [{ kind: "mono", text: CAPACITOR_PASS_POLICY }];
+    if (pass.cameraRequest) {
+      blocks.push({
+        kind: "prose",
+        text: `DOES THIS PHONE HONOUR A CAMERA REQUEST? ${pass.cameraRequest.verdict}`,
+      });
+    } else {
+      blocks.push({
+        kind: "prose",
+        text: "The camera request was not measured: the pair of shots that measures it did not both complete. Stated as unmeasured rather than answered — one shot on its own cannot tell an honoured request from an ignored one.",
+      });
+    }
+    if (pass.selfReport) {
+      const report = pass.selfReport;
+      blocks.push(
+        {
+          kind: "rows",
+          rows: [
+            { label: "Platform Capacitor believes it is on", value: report.platform },
+            { label: "Running natively?", value: report.isNativePlatform ? "yes" : "no — this is a website, so most native-only abilities do not exist here" },
+            { label: "Plugin present", value: report.pluginPresent ? "yes" : "no" },
+            ...report.permissions.map((pair) => ({
+              label: `Permission “${pair.what}”`,
+              value: `Capacitor says ${pair.capacitor ?? "nothing — the call is unimplemented here, which is UNAVAILABLE and not denied"} · the browser says ${pair.browser ?? "nothing — this browser has no entry for it"}`,
+              tone: pair.disagreement ? ("warn" as const) : undefined,
+            })),
+          ],
+        },
+        {
+          kind: "table",
+          head: ["Ability", "Present here", "What it is"],
+          rows: report.abilities.map((ability) => [ability.name, ability.present ? "yes" : "absent — never asked, nothing claimed", ability.note]),
+        }
+      );
+      for (const pair of report.permissions) {
+        if (pair.disagreement) blocks.push({ kind: "prose", text: pair.disagreement });
+      }
+      for (const note of report.notes) blocks.push({ kind: "prose", text: note });
+      for (const error of report.errors) blocks.push({ kind: "prose", text: error });
+    }
+    if (pass.forms.length > 0) {
+      blocks.push({
+        kind: "table",
+        head: ["Form", "What came back"],
+        rows: pass.forms.map((form) => [PHOTO_FORM_LABEL[form.form], form.reading]),
+      });
+    } else {
+      blocks.push({
+        kind: "prose",
+        text: "No alternate form was collected, so nothing is said about what any of them would have done to the file. That is an absence, not a result.",
+      });
+    }
+    blocks.push({ kind: "mono", text: MAX_DATA_POLICY });
+    sections.push({
+      id: "capacitor",
+      title: "The Capacitor pass",
+      blurb:
+        "The one route in the run that returns several files from a single trip, hands the same photo back in three shapes, and has its own opinion about your permissions. Every pick here is a library pick and none is offered as a photo taken just now.",
+      blocks,
+    });
+  }
+
+  if (run.cost) {
+    const cost = run.cost;
+    sections.push({
+      id: "cost",
+      title: "What this run cost",
+      blurb:
+        "Wall clock readings from this run on this phone, not an average of other devices and not a target. A slow camera is a fact about the hardware, and one of the more useful ones here.",
+      blocks: [
+        {
+          kind: "rows",
+          rows: [
+            { label: "Total", value: formatDuration(cost.totalMs) },
+            ...cost.stages.map((stage) => ({
+              label: stage.stage,
+              value: `${formatDuration(stage.ms)}${cost.totalMs > 0 ? ` · ${Math.round((stage.ms / cost.totalMs) * 100)}%` : ""}`,
+            })),
+          ],
+        },
+        ...(cost.cameras.length > 0
+          ? ([
+              {
+                kind: "table",
+                head: ["Camera", "Time", "Requests", "Untried"],
+                rows: cost.cameras.map((camera) => [
+                  camera.label + (camera.hitBudget ? "  (reached its share of the run's time)" : ""),
+                  formatDuration(camera.ms),
+                  String(camera.steps),
+                  camera.untried > 0 ? String(camera.untried) : "none",
+                ]),
+              },
+            ] as SheetBlock[])
+          : []),
+        {
+          kind: "prose",
+          text: cost.slowestStep
+            ? `Slowest single request: ${formatDuration(cost.slowestStep.ms)} — ${cost.slowestStep.label}. Measured against the ${(cost.cameraDeadlineMs / 1000).toFixed(0)}-second camera deadline, past which a request is abandoned rather than waited on. A request close to that line is a camera that very nearly did not answer at all.`
+            : "No camera request was timed, so there is no slowest one to name. That is an absence, not a zero.",
+        },
+        ...(cost.perCameraBudgetMs != null
+          ? ([
+              {
+                kind: "prose",
+                text: `Each camera was allowed ${formatDuration(cost.perCameraBudgetMs)} of its own. A camera that reaches it stops where it is and every step it never got to is listed as UNTRIED — which is its own word here. It is NOT a refusal, NOT a limit the camera stated and NOT a timeout: those three exist separately, they mean different things, and nothing whatsoever is inferred about a step that never ran. The ceiling is generous on purpose; it exists for the one camera on a phone that takes fifteen seconds to open and would otherwise consume the entire run.`,
+              },
+            ] as SheetBlock[])
+          : []),
+      ],
+    });
+  }
 
   sections.push({
     id: "verify",

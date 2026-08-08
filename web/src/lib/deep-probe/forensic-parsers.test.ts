@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { briefChecklist, briefItems, buildCorrelationBrief, imageFamily, type BriefCapture, type CorrelationInput } from "./correlation-brief";
 import { readExifIfds } from "./exif-ifd";
 import { readJpegEncoderBytes } from "./jpeg-encoder";
-import { buildManualShotList, LIBRARY_PICK_SHOTS } from "./manual-capture";
+import { buildManualShotList, LIBRARY_PICK_SHOTS, namedCameraShot, UNNAMED_CAMERA_SHOT } from "./manual-capture";
 import { analyseSeries } from "./sensor-stats";
 
 /* ------------------------------------------------------------------ *
@@ -409,9 +409,11 @@ describe("library pick shots", () => {
   it("leads the manual stage, because it needs no camera and closes the one gap nothing else can", () => {
     const list = buildManualShotList();
     expect(list.slice(0, 2).map((s) => s.id)).toEqual(["library-plain", "library-original"]);
-    // Two camera-app shots, not six: one per side, each carrying the other
-    // routes as spares rather than as separate trips to the camera.
-    expect(list.length).toBe(LIBRARY_PICK_SHOTS.length + 2);
+    // One camera-app shot up front, not two. The second cannot be built until
+    // the first file has been read, because which side it asks for is decided
+    // by what the first one turned out to be.
+    expect(list.length).toBe(LIBRARY_PICK_SHOTS.length + 1);
+    expect(list[list.length - 1].id).toBe("camera-app-unnamed");
   });
 
   it("never claims a facing or a camera it did not use", () => {
@@ -420,9 +422,27 @@ describe("library pick shots", () => {
       expect(shot.facing).toBeNull();
       expect(shot.purpose).not.toMatch(/fresh photo\b(?!:)/);
     }
-    for (const shot of buildManualShotList().filter((s) => s.source === "camera-app")) {
-      expect(shot.facing).not.toBeNull();
-    }
+    // The unnamed shot's facing is null for the same reason a library pick's
+    // is: claiming a side before the file has been read would invent the
+    // answer this shot exists to find.
+    expect(UNNAMED_CAMERA_SHOT.facing).toBeNull();
+    expect(UNNAMED_CAMERA_SHOT.purpose).toContain("WITHOUT naming which camera");
+    // The named shot is built from what the first one turned out to be, and it
+    // does state a side, because by then one has been read.
+    expect(namedCameraShot("user", "because the first shot was the back one").facing).toBe("user");
+  });
+
+  it("opens by Capacitor, which is the only route that can name no camera at all", () => {
+    expect(UNNAMED_CAMERA_SHOT.engine).toBe("capacitor");
+    expect(UNNAMED_CAMERA_SHOT.routes[0]).toBe("capacitor");
+    // The other routes stay on as spares, so a phone where Capacitor fails
+    // still ends up with its file.
+    expect(UNNAMED_CAMERA_SHOT.routes.length).toBeGreaterThan(1);
+  });
+
+  it("tells you not to switch cameras yourself, because the phone's choice is the measurement", () => {
+    expect(UNNAMED_CAMERA_SHOT.purpose).toContain("do not switch cameras yourself");
+    expect(namedCameraShot("environment", "x").purpose).toContain("that IS the finding");
   });
 
   it("differs only in the accept attribute — that difference is the whole measurement", () => {
